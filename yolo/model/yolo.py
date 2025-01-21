@@ -1,6 +1,6 @@
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 from omegaconf import ListConfig, OmegaConf
@@ -68,15 +68,18 @@ class YOLO(nn.Module):
                 setattr(layer, "out_c", out_channels)
             layer_idx += 1
 
-    def forward(self, x):
-        y = {0: x}
+    def forward(self, x, external: Optional[Dict] = None):
+        y = {0: x, **(external or {})}
         output = dict()
         for index, layer in enumerate(self.model, start=1):
             if isinstance(layer.source, list):
                 model_input = [y[idx] for idx in layer.source]
             else:
                 model_input = y[layer.source]
-            x = layer(model_input)
+
+            external_input = {source_name: y[source_name] for source_name in layer.external}
+
+            x = layer(model_input, **external_input)
             y[-1] = x
             if layer.usable:
                 y[index] = x
@@ -113,6 +116,7 @@ class YOLO(nn.Module):
             setattr(layer, "in_c", kwargs.get("in_channels", None))
             setattr(layer, "output", layer_info.get("output", False))
             setattr(layer, "tags", layer_info.get("tags", None))
+            setattr(layer, "external", layer_info.get("external", []))
             setattr(layer, "usable", 0)
             return layer
         else:
