@@ -126,10 +126,10 @@ Contributions to the YOLO project are welcome! See [CONTRIBUTING](docs/CONTRIBUT
       booktitle={Proceedings of the European Conference on Computer Vision (ECCV)},
 }
 @inproceedings{tsui2024yolord,
-      author = {Tsui, Hao-Tang and Wang, Chien-Yao and Liao, Hong-Yuan Mark},
-      title = {YOLO-RD: Introducing Relevant and Compact Explicit Knowledge to YOLO by Retriever-Dictionary},
-      booktitle = {Proceedings of the International Conference on Learning Representations (ICLR)},
-      year = {2025},
+      author={Tsui, Hao-Tang and Wang, Chien-Yao and Liao, Hong-Yuan Mark},
+      title={{YOLO-RD}: Introducing Relevant and Compact Explicit Knowledge to YOLO by Retriever-Dictionary},
+      booktitle={Proceedings of the International Conference on Learning Representations (ICLR)},
+      year={2025},
 }
 
 ```
