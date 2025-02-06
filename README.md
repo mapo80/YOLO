@@ -107,7 +107,7 @@ Contributions to the YOLO project are welcome! See [CONTRIBUTING](docs/CONTRIBUT
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=WongKinYiu/YOLO&type=Date)](https://star-history.com/#WongKinYiu/YOLO&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=MultimediaTechLab/YOLO&type=Date)](https://star-history.com/#MultimediaTechLab/YOLO&Date)
 
 ## Citations
 
