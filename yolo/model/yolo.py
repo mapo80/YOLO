@@ -68,7 +68,7 @@ class YOLO(nn.Module):
                 setattr(layer, "out_c", out_channels)
             layer_idx += 1
 
-    def forward(self, x, external: Optional[Dict] = None):
+    def forward(self, x, external: Optional[Dict] = None, shortcut: Optional[str] = None):
         y = {0: x, **(external or {})}
         output = dict()
         for index, layer in enumerate(self.model, start=1):
@@ -85,6 +85,8 @@ class YOLO(nn.Module):
                 y[index] = x
             if layer.output:
                 output[layer.tags] = x
+                if layer.tags == shortcut:
+                    return output
         return output
 
     def get_out_channels(self, layer_type: str, layer_args: dict, output_dim: list, source: Union[int, list]):
