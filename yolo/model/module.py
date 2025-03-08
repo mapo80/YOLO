@@ -498,7 +498,7 @@ class ImplicitM(nn.Module):
 
 
 class DConv(nn.Module):
-    def __init__(self, in_channels=512, alpha=0.8, atoms=4096):
+    def __init__(self, in_channels=512, alpha=0.8, atoms=512):
         super().__init__()
         self.alpha = alpha
 
@@ -521,9 +521,9 @@ class DConv(nn.Module):
 
 
 class RepNCSPELAND(RepNCSPELAN):
-    def __init__(self, *args, rd_args={}, **kwargs):
+    def __init__(self, *args, atoms: 512, rd_args={}, **kwargs):
         super().__init__(*args, **kwargs)
-        self.dconv = DConv(**rd_args)
+        self.dconv = DConv(atoms=atoms, **rd_args)
 
     def forward(self, x):
         x = super().forward(x)
