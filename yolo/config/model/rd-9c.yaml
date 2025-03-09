@@ -17,7 +17,7 @@ model:
     - ADown:
         args: {out_channels: 256}
     - RepNCSPELAND:
-        args: {out_channels: 512, part_channels: 256}
+        args: {out_channels: 512, part_channels: 256, atoms: 512}
         tags: B3
 
     - ADown:
