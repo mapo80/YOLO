@@ -133,9 +133,8 @@ class YOLO(nn.Module):
         """
         if isinstance(weights, Path):
             weights = torch.load(weights, map_location=torch.device("cpu"), weights_only=False)
-        if "model_state_dict" in weights:
-            weights = weights["model_state_dict"]
-
+        if "state_dict" in weights:
+            weights = {name.removeprefix("model.model."): key for name, key in weights["state_dict"].items()}
         model_state_dict = self.model.state_dict()
 
         # TODO1: autoload old version weight
