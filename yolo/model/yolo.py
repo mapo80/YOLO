@@ -158,6 +158,7 @@ class YOLO(nn.Module):
                 else:
                     error_dict[layer_idx].append(".".join(layer_name))
             for layer_idx, layer_name in error_dict.items():
+                layer_name.sort()
                 logger.warning(f":warning: Weight {error_name} for Layer {layer_idx}: {', '.join(layer_name)}")
 
         self.model.load_state_dict(model_state_dict)
