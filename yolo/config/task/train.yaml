@@ -51,4 +51,4 @@ scheduler:
 
 ema:
   enable: true
-  decay: 0.995
+  decay: 0.9999
