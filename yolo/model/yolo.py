@@ -133,9 +133,8 @@ class YOLO(nn.Module):
         """
         if isinstance(weights, Path):
             weights = torch.load(weights, map_location=torch.device("cpu"), weights_only=False)
-        if "model_state_dict" in weights:
-            weights = weights["model_state_dict"]
-
+        if "state_dict" in weights:
+            weights = {name.removeprefix("model.model."): key for name, key in weights["state_dict"].items()}
         model_state_dict = self.model.state_dict()
 
         # TODO1: autoload old version weight
@@ -152,8 +151,15 @@ class YOLO(nn.Module):
             model_state_dict[model_key] = weights[model_key]
 
         for error_name, error_set in error_dict.items():
-            for weight_name in error_set:
-                logger.warning(f":warning: Weight {error_name} for key: {'.'.join(weight_name)}")
+            error_dict = dict()
+            for layer_idx, *layer_name in error_set:
+                if layer_idx not in error_dict:
+                    error_dict[layer_idx] = [".".join(layer_name)]
+                else:
+                    error_dict[layer_idx].append(".".join(layer_name))
+            for layer_idx, layer_name in error_dict.items():
+                layer_name.sort()
+                logger.warning(f":warning: Weight {error_name} for Layer {layer_idx}: {', '.join(layer_name)}")
 
         self.model.load_state_dict(model_state_dict)
 
