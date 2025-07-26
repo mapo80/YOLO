@@ -44,7 +44,7 @@ jobs:
 
     - name: Cache model weights
       id: cache-weights
-      uses: actions/cache@v2
+      uses: actions/cache@v4
       with:
         path: weights
         key: ${{ runner.os }}-weights
