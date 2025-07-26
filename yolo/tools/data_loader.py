@@ -49,7 +49,7 @@ class YoloDataset(Dataset):
         Returns:
             dict: The loaded data from the cache for the specified phase.
         """
-        cache_path = dataset_path / f"{phase_name}.cache"
+        cache_path = dataset_path / f"{phase_name}.pache"
 
         if not cache_path.exists():
             logger.info(f":factory: Generating {phase_name} cache")
@@ -65,7 +65,7 @@ class YoloDataset(Dataset):
                     ":rotating_light: Please clean the cache and try running again."
                 )
                 raise e
-            logger.info(f":package: Loaded {phase_name} cache")
+            logger.info(f":package: Loaded {phase_name} cache, there are {len(data)} data in total.")
         return data
 
     def filter_data(self, dataset_path: Path, phase_name: str, sort_image: bool = False) -> list:
@@ -82,14 +82,25 @@ class YoloDataset(Dataset):
         """
         images_path = dataset_path / "images" / phase_name
         labels_path, data_type = locate_label_paths(dataset_path, phase_name)
-        images_list = sorted([p.name for p in Path(images_path).iterdir() if p.is_file()])
+        file_list, adjust_path = dataset_path / f"{phase_name}.txt", False
+        if file_list.exists():
+            data_type, adjust_path = "txt", True
+            # TODO: should i sort by name?
+            with open(file_list, "r") as file:
+                images_list = [dataset_path / line.rstrip() for line in file]
+            labels_list = [
+                Path(str(image_path).replace("images", "labels")).with_suffix(".txt") for image_path in images_list
+            ]
+        else:
+            images_list = sorted([p.name for p in Path(images_path).iterdir() if p.is_file()])
+
         if data_type == "json":
             annotations_index, image_info_dict = create_image_metadata(labels_path)
 
         data = []
         valid_inputs = 0
-        for image_name in track(images_list, description="Filtering data"):
-            if not image_name.lower().endswith((".jpg", ".jpeg", ".png")):
+        for idx, image_name in enumerate(track(images_list, description="Filtering data")):
+            if not adjust_path and not image_name.lower().endswith((".jpg", ".jpeg", ".png")):
                 continue
             image_id = Path(image_name).stem
 
@@ -100,24 +111,25 @@ class YoloDataset(Dataset):
                 annotations = annotations_index.get(image_info["id"], [])
                 image_seg_annotations = scale_segmentation(annotations, image_info)
             elif data_type == "txt":
-                label_path = labels_path / f"{image_id}.txt"
+                label_path = labels_list[idx] if adjust_path else labels_path / f"{image_id}.txt"
                 if not label_path.is_file():
-                    continue
-                with open(label_path, "r") as file:
-                    image_seg_annotations = [list(map(float, line.strip().split())) for line in file]
+                    image_seg_annotations = []
+                else:
+                    with open(label_path, "r") as file:
+                        image_seg_annotations = [list(map(float, line.strip().split())) for line in file]
             else:
                 image_seg_annotations = []
 
             labels = self.load_valid_labels(image_id, image_seg_annotations)
-
-            img_path = images_path / image_name
+            img_path = image_name if adjust_path else images_path / image_name
             if sort_image:
                 with Image.open(img_path) as img:
                     width, height = img.size
             else:
                 width, height = 0, 1
             data.append((img_path, labels, width / height))
-            valid_inputs += 1
+            if len(image_seg_annotations) != 0:
+                valid_inputs += 1
 
         data = sorted(data, key=lambda x: x[2], reverse=True)
 
@@ -139,7 +151,7 @@ class YoloDataset(Dataset):
         bboxes = []
         for seg_data in seg_data_one_img:
             cls = seg_data[0]
-            points = np.array(seg_data[1:]).reshape(-1, 2)
+            points = np.array(seg_data[1:]).reshape(-1, 2).clip(0, 1)
             valid_points = points[(points >= 0) & (points <= 1)].reshape(-1, 2)
             if valid_points.size > 1:
                 bbox = torch.tensor([cls, *valid_points.min(axis=0), *valid_points.max(axis=0)])
