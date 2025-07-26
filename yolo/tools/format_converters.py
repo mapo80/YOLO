@@ -27,7 +27,7 @@ def convert_weight(old_state_dict, new_state_dict, model_size: int = 38):
                 if old_name in weight_name:
                     weight_name = weight_name.replace(old_name, new_name)
         if weight_name in new_weight_set:
-            assert new_state_dict[weight_name].shape == weight_value.shape, "shape miss match"
+            assert new_state_dict[weight_name].shape == weight_value.shape, f"shape miss match {weight_name}"
             new_state_dict[weight_name] = weight_value
             new_weight_set.remove(weight_name)
 
@@ -136,3 +136,35 @@ def convert_weight_seg(old_state_dict, new_state_dict):
             print(f"{new_state_dict[new_weight_name].shape} {old_state_dict[old_weight_name].shape}")
         new_state_dict[new_weight_name] = old_state_dict[old_weight_name]
     return new_state_dict
+
+
+import sys
+from pathlib import Path
+
+import hydra
+import torch
+
+project_root = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(project_root))
+
+from yolo.config.config import Config
+from yolo.tools.solver import BaseModel
+
+
+@hydra.main(config_path="../config", config_name="config", version_base=None)
+def main(cfg: Config):
+    old_weight_path = getattr(cfg, "old_weight", "v9t.pt")
+    new_weight_path = getattr(cfg, "new_weight", "ait.pt")
+    print(f"Changing {old_weight_path} -> {new_weight_path}")
+    cfg.weight = None
+    model = BaseModel(cfg)
+    old_weight = torch.load(old_weight_path, weights_only=False)
+    new_weight = convert_weight(old_weight, model.model.state_dict())
+    model.model.load_state_dict(new_weight)
+    torch.save(model.model.model.state_dict(), new_weight_path)
+    cfg.weight = new_weight_path
+    BaseModel(cfg)
+
+
+if __name__ == "__main__":
+    main()
