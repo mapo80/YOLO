@@ -25,7 +25,7 @@ from lightning.pytorch.callbacks import Callback, RichModelSummary, RichProgress
 from lightning.pytorch.callbacks.progress.rich_progress import CustomProgress
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from lightning.pytorch.utilities import rank_zero_only
-from omegaconf import ListConfig
+from omegaconf import ListConfig, OmegaConf
 from rich import get_console, reconfigure
 from rich.console import Console, Group
 from rich.logging import RichHandler
@@ -285,7 +285,8 @@ def setup(cfg: Config):
     if cfg.use_tensorboard:
         loggers.append(TensorBoardLogger(log_graph="all", save_dir=save_path))
     if cfg.use_wandb:
-        loggers.append(WandbLogger(project="YOLO", name=cfg.name, save_dir=save_path, id=None))
+        wandb_cfg = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+        loggers.append(WandbLogger(project="YOLO", name=cfg.name, save_dir=save_path, id=None, config=wandb_cfg))
 
     return progress, loggers, save_path
 
