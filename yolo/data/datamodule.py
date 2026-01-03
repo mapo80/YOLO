@@ -4,6 +4,7 @@ YOLODataModule - PyTorch Lightning data module for COCO format datasets.
 Uses torchvision.datasets.CocoDetection for standard COCO format.
 """
 
+import os
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -13,12 +14,14 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import CocoDetection
 from torchvision.transforms import v2
 
+from yolo.data.loaders import DefaultImageLoader, ImageLoader
 from yolo.data.transforms import (
     LetterBox,
     YOLOTargetTransform,
     create_train_transforms,
     create_val_transforms,
 )
+from yolo.utils.logger import logger
 
 
 class YOLODataModule(L.LightningDataModule):
@@ -47,6 +50,8 @@ class YOLODataModule(L.LightningDataModule):
         num_workers: Number of data loading workers
         image_size: Target image size [width, height]
         pin_memory: Whether to pin memory for faster GPU transfer
+        image_loader: Custom image loader (e.g., for encrypted images).
+            Can be configured via YAML class_path or CLI.
         # Augmentation parameters
         mosaic_prob: Probability of applying mosaic augmentation
         mixup_prob: Probability of applying mixup augmentation
@@ -76,6 +81,8 @@ class YOLODataModule(L.LightningDataModule):
         num_workers: int = 8,
         image_size: List[int] = [640, 640],
         pin_memory: bool = True,
+        # Custom image loader (e.g., for encrypted images)
+        image_loader: Optional[ImageLoader] = None,
         # Augmentation parameters
         mosaic_prob: float = 1.0,
         mixup_prob: float = 0.15,
@@ -92,11 +99,17 @@ class YOLODataModule(L.LightningDataModule):
         close_mosaic_epochs: int = 15,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        # Exclude image_loader from hyperparameters (not serializable)
+        self.save_hyperparameters(ignore=["image_loader"])
 
         self.train_dataset: Optional[CocoDetection] = None
         self.val_dataset: Optional[CocoDetection] = None
         self._mosaic_enabled = True
+        self._image_loader = image_loader
+
+        # Log if using custom loader
+        if image_loader is not None:
+            logger.info(f"📷 Using custom image loader: {type(image_loader).__name__}")
 
     def setup(self, stage: Optional[str] = None) -> None:
         """Setup datasets for training and validation."""
@@ -124,6 +137,7 @@ class YOLODataModule(L.LightningDataModule):
                 annFile=str(root / self.hparams.train_ann),
                 transforms=train_transforms,
                 image_size=image_size,
+                image_loader=self._image_loader,
             )
 
         if stage == "fit" or stage == "validate" or stage is None:
@@ -135,6 +149,7 @@ class YOLODataModule(L.LightningDataModule):
                 annFile=str(root / self.hparams.val_ann),
                 transforms=val_transforms,
                 image_size=image_size,
+                image_loader=self._image_loader,
             )
 
     def train_dataloader(self) -> DataLoader:
@@ -199,6 +214,15 @@ class CocoDetectionWrapper(CocoDetection):
     Converts COCO annotations to the format expected by YOLOModule:
         - boxes: [N, 4] in xyxy format
         - labels: [N] class indices
+
+    Supports custom image loaders for special use cases (e.g., encrypted images).
+
+    Args:
+        root: Root directory containing images
+        annFile: Path to COCO annotations JSON
+        transforms: Optional transform to apply to images and targets
+        image_size: Target image size (width, height)
+        image_loader: Optional custom image loader (e.g., for encrypted images)
     """
 
     def __init__(
@@ -207,18 +231,34 @@ class CocoDetectionWrapper(CocoDetection):
         annFile: str,
         transforms: Optional[Callable] = None,
         image_size: tuple = (640, 640),
+        image_loader: Optional[ImageLoader] = None,
     ):
         super().__init__(root, annFile)
         self._transforms = transforms
         self.image_size = image_size
         self.target_transform = YOLOTargetTransform()
+        # Use provided loader or default PIL loader
+        self._image_loader = image_loader or DefaultImageLoader()
+
+    def _load_image(self, id: int):
+        """Override parent's _load_image to use custom loader."""
+        path = self.coco.loadImgs(id)[0]["file_name"]
+        full_path = os.path.join(self.root, path)
+        return self._image_loader(full_path)
 
     def __getitem__(self, index: int):
         """Get image and target at index."""
-        image, coco_target = super().__getitem__(index)
+        # Get image id
+        id = self.ids[index]
+
+        # Load image using custom loader
+        image = self._load_image(id)
+
+        # Get annotations
+        target = self._load_target(id)
 
         # Convert COCO annotations to YOLO format
-        target = self.target_transform(coco_target, image.size)
+        target = self.target_transform(target, image.size)
 
         # Apply transforms
         if self._transforms is not None:
