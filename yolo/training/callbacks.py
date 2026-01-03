@@ -256,11 +256,12 @@ class MetricsTableCallback(Callback):
         # Top border
         lines.append(f"┌{'─' * (table_width - 2)}┐")
 
-        # Title with best indicator
+        # Title with best indicator (display 1-indexed epochs)
+        display_epoch = epoch + 1
         if is_best:
-            title = f"Epoch {epoch} - Validation Metrics ★ NEW BEST"
+            title = f"Epoch {display_epoch} - Validation Metrics ★ NEW BEST"
         else:
-            title = f"Epoch {epoch} - Validation Metrics"
+            title = f"Epoch {display_epoch} - Validation Metrics"
         lines.append(center_text(title))
 
         # Show improvement/comparison line
@@ -269,7 +270,8 @@ class MetricsTableCallback(Callback):
                 delta_str = f"mAP: {current_score:.4f} (best)"
             elif best_score is not None and best_epoch is not None:
                 delta_from_best = current_score - best_score
-                delta_str = f"mAP: {current_score:.4f} ({delta_from_best:+.4f} vs best @ ep{best_epoch})"
+                # Display best_epoch as 1-indexed too
+                delta_str = f"mAP: {current_score:.4f} ({delta_from_best:+.4f} vs best @ ep{best_epoch + 1})"
             elif best_score is not None:
                 delta_from_best = current_score - best_score
                 delta_str = f"mAP: {current_score:.4f} ({delta_from_best:+.4f} vs best)"

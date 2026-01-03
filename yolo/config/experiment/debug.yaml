@@ -19,6 +19,16 @@ trainer:
   limit_val_batches: 20
 
   callbacks:
+    # Save best model with fixed name
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: val/mAP
+        mode: max
+        save_top_k: 1
+        save_last: true
+        filename: "best"
+        auto_insert_metric_name: false
+
     - class_path: lightning.pytorch.callbacks.RichProgressBar
 
   logger:
