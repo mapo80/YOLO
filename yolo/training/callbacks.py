@@ -5,7 +5,7 @@ Custom Lightning callbacks for YOLO training.
 from typing import Any, Dict, Optional, Union
 
 import lightning as L
-from lightning.pytorch.callbacks import Callback, RichProgressBar
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
 from rich.console import Console
 from rich.table import Table
@@ -63,17 +63,25 @@ class MetricsTableCallback(Callback):
     """
     Callback that prints a clean, formatted metrics table after each validation epoch.
     Dynamically adapts to show only the metrics that are being logged.
+    Shows if current epoch is best (synchronized with ModelCheckpoint).
 
-    Example output:
-    ┌──────────────────────────────────────────────────────────────────────────────────────┐
-    │                            Epoch 5 - Validation Metrics                              │
-    ├──────────────┬──────────────┬──────────────┬──────────────┬──────────────────────────┤
-    │     mAP      │    mAP50     │    mAP75     │    mAP95     │          mAR100          │
-    │    0.4523    │    0.6821    │    0.4912    │    0.2134    │          0.5234          │
-    ├──────────────┼──────────────┼──────────────┼──────────────┼──────────────────────────┤
-    │   mAP_small  │  mAP_medium  │   mAP_large  │  train/loss  │                          │
-    │    0.2134    │    0.4521    │    0.5823    │    2.3456    │                          │
-    └──────────────┴──────────────┴──────────────┴──────────────┴──────────────────────────┘
+    Example output (best epoch):
+    ┌─────────────────────────────────────────────────────────────────┐
+    │              Epoch 5 - Validation Metrics ★ NEW BEST           │
+    │                        mAP: 0.4523 (best)                       │
+    ├────────────┬────────────┬────────────┬────────────┬────────────┤
+    │    mAP     │   mAP50    │   mAP75    │   mAP95    │   mAR100   │
+    │   0.4523   │   0.6821   │   0.4912   │   0.2134   │   0.5234   │
+    └────────────┴────────────┴────────────┴────────────┴────────────┘
+
+    Example output (not best):
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                  Epoch 8 - Validation Metrics                   │
+    │                mAP: 0.4312 (-0.0211 vs best @ ep5)              │
+    ├────────────┬────────────┬────────────┬────────────┬────────────┤
+    │    mAP     │   mAP50    │   mAP75    │   mAP95    │   mAR100   │
+    │   0.4312   │   0.6512   │   0.4701   │   0.1998   │   0.5012   │
+    └────────────┴────────────┴────────────┴────────────┴────────────┘
     """
 
     def __init__(self):
@@ -113,10 +121,54 @@ class MetricsTableCallback(Callback):
         metrics = trainer.callback_metrics
         epoch = trainer.current_epoch
 
-        # Build and print the table
-        print(self._build_table(epoch, metrics))
+        # Get best info from ModelCheckpoint (synchronized with actual checkpointing)
+        current_score = None
+        best_score = None
+        best_epoch = None
+        is_best = False
 
-    def _build_table(self, epoch: int, metrics: Dict[str, Any]) -> str:
+        # Find ModelCheckpoint callback that monitors val/mAP
+        ckpt_callback = None
+        for cb in trainer.callbacks:
+            if isinstance(cb, ModelCheckpoint) and cb.monitor == "val/mAP":
+                ckpt_callback = cb
+                break
+
+        if ckpt_callback is not None and "val/mAP" in metrics:
+            val = metrics["val/mAP"]
+            current_score = val.item() if hasattr(val, "item") else val
+
+            if current_score != -1:  # -1 means metric not available
+                # Get best from checkpoint callback
+                if ckpt_callback.best_model_score is not None:
+                    best_score = ckpt_callback.best_model_score.item() if hasattr(ckpt_callback.best_model_score, "item") else ckpt_callback.best_model_score
+
+                    # Check if current is best (within floating point tolerance)
+                    is_best = abs(current_score - best_score) < 1e-6
+
+                    # Extract best epoch from best_model_path if available
+                    if ckpt_callback.best_model_path:
+                        import re
+                        match = re.search(r'epoch=(\d+)', ckpt_callback.best_model_path)
+                        if match:
+                            best_epoch = int(match.group(1))
+                else:
+                    # First validation, no best yet - this will be best
+                    is_best = True
+                    best_score = current_score
+
+        # Build and print the table
+        print(self._build_table(epoch, metrics, is_best, current_score, best_score, best_epoch))
+
+    def _build_table(
+        self,
+        epoch: int,
+        metrics: Dict[str, Any],
+        is_best: bool = False,
+        current_score: Optional[float] = None,
+        best_score: Optional[float] = None,
+        best_epoch: Optional[int] = None,
+    ) -> str:
         """Build a formatted metrics table dynamically based on available metrics."""
         col_width = 12
 
@@ -203,7 +255,27 @@ class MetricsTableCallback(Callback):
 
         # Top border
         lines.append(f"┌{'─' * (table_width - 2)}┐")
-        lines.append(center_text(f"Epoch {epoch} - Validation Metrics"))
+
+        # Title with best indicator
+        if is_best:
+            title = f"Epoch {epoch} - Validation Metrics ★ NEW BEST"
+        else:
+            title = f"Epoch {epoch} - Validation Metrics"
+        lines.append(center_text(title))
+
+        # Show improvement/comparison line
+        if current_score is not None:
+            if is_best:
+                delta_str = f"mAP: {current_score:.4f} (best)"
+            elif best_score is not None and best_epoch is not None:
+                delta_from_best = current_score - best_score
+                delta_str = f"mAP: {current_score:.4f} ({delta_from_best:+.4f} vs best @ ep{best_epoch})"
+            elif best_score is not None:
+                delta_from_best = current_score - best_score
+                delta_str = f"mAP: {current_score:.4f} ({delta_from_best:+.4f} vs best)"
+            else:
+                delta_str = f"mAP: {current_score:.4f}"
+            lines.append(center_text(delta_str))
 
         # Primary metrics row
         if primary_metrics:
