@@ -3,7 +3,7 @@ YOLOModule - PyTorch Lightning module for YOLO training.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import lightning as L
 import torch
@@ -12,8 +12,10 @@ from torch import Tensor
 from torchmetrics.detection import MeanAveragePrecision
 
 from yolo.model.yolo import YOLO
+from yolo.tools.dataset_preparation import prepare_weight
 from yolo.training.loss import YOLOLoss
 from yolo.utils.bounding_box_utils import Vec2Box, bbox_nms
+from yolo.utils.logger import logger
 
 
 class YOLOModule(L.LightningModule):
@@ -33,7 +35,7 @@ class YOLOModule(L.LightningModule):
         box_loss_weight: Weight for box regression loss
         cls_loss_weight: Weight for classification loss
         dfl_loss_weight: Weight for distribution focal loss
-        weight_path: Path to pretrained weights (None to train from scratch)
+        weight_path: Path to pretrained weights, or True to auto-download based on model_config
         nms_conf_threshold: NMS confidence threshold
         nms_iou_threshold: NMS IoU threshold
         nms_max_detections: Maximum detections per image
@@ -57,8 +59,8 @@ class YOLOModule(L.LightningModule):
         box_loss_weight: float = 7.5,
         cls_loss_weight: float = 0.5,
         dfl_loss_weight: float = 1.5,
-        # Weights
-        weight_path: Optional[str] = None,
+        # Weights: None = from scratch, True = auto-download, str = path to weights
+        weight_path: Optional[Union[str, bool]] = None,
         # NMS
         nms_conf_threshold: float = 0.25,
         nms_iou_threshold: float = 0.65,
@@ -88,11 +90,14 @@ class YOLOModule(L.LightningModule):
             model_cfg.anchor.strides = [8, 16, 32]
 
         # Build model
+        logger.info(f"🏗️  Building model: {model_config} ({num_classes} classes)")
         self.model = YOLO(model_cfg, class_num=num_classes)
 
         # Load pretrained weights if provided
         if weight_path:
-            self.model.save_load_weights(Path(weight_path))
+            self._load_weights(weight_path, model_config)
+        else:
+            logger.info("🎲 Training from scratch (no pretrained weights)")
 
         # Store config for loss/converter setup
         self._model_cfg = model_cfg
@@ -112,6 +117,16 @@ class YOLOModule(L.LightningModule):
             iou_type="bbox",
             iou_thresholds=[0.5, 0.75, 0.95],  # Include 0.5, 0.75 to avoid errors
         ) if log_map_95 else None
+
+        # Track if we're resuming from a checkpoint
+        self._resumed_from_checkpoint = False
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """Called when loading from checkpoint - log resume info."""
+        self._resumed_from_checkpoint = True
+        epoch = checkpoint.get("epoch", 0)
+        global_step = checkpoint.get("global_step", 0)
+        logger.info(f"🔄 Resuming from checkpoint (epoch {epoch + 1}, step {global_step})")
 
     def setup(self, stage: str) -> None:
         """Setup loss function and converter after model is on device."""
@@ -314,6 +329,44 @@ class YOLOModule(L.LightningModule):
             steps_per_epoch = len(self.trainer.train_dataloader)
             self._cached_warmup_steps = self.hparams.warmup_epochs * steps_per_epoch
         return self._cached_warmup_steps
+
+    def _load_weights(self, weight_path: Union[str, bool], model_config: str) -> None:
+        """
+        Load pretrained weights.
+
+        Args:
+            weight_path: True for auto-download, or path to weights file
+            model_config: Model config name (e.g., "v9-c") for auto-download
+        """
+        if weight_path is True:
+            # Auto-download: derive weight path from model config
+            weights_dir = Path("weights")
+            weight_file = weights_dir / f"{model_config}.pt"
+
+            if not weight_file.exists():
+                logger.info(f"🌐 Weight {weight_file} not found, downloading...")
+                prepare_weight(weight_path=weight_file)
+
+            if weight_file.exists():
+                self.model.save_load_weights(weight_file)
+                logger.info(f"✅ Loaded pretrained weights: {weight_file}")
+            else:
+                logger.warning(f"⚠️ Could not download weights for {model_config}")
+        else:
+            # Explicit path provided
+            weight_file = Path(weight_path)
+            if weight_file.exists():
+                self.model.save_load_weights(weight_file)
+                logger.info(f"✅ Loaded pretrained weights: {weight_file}")
+            else:
+                # Try to download if it looks like a model name
+                logger.info(f"🌐 Weight {weight_file} not found, attempting download...")
+                prepare_weight(weight_path=weight_file)
+                if weight_file.exists():
+                    self.model.save_load_weights(weight_file)
+                    logger.info(f"✅ Loaded pretrained weights: {weight_file}")
+                else:
+                    logger.warning(f"⚠️ Weight file not found: {weight_file}")
 
     def _create_nms_config(self):
         """Create NMS configuration object."""
