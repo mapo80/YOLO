@@ -258,6 +258,121 @@ onnx2tf -i model.onnx -o tflite_output -oiqt -cind images calibration_data.npy
 | **Checkpointing** | Automatic best/last model saving (see [Checkpoints](#checkpoints)) |
 | **Early Stopping** | Stop on validation plateau |
 | **Logging** | TensorBoard, WandB support |
+| **Custom Image Loader** | Support for encrypted or custom image formats |
+
+## Custom Image Loader
+
+For datasets with special image formats (e.g., encrypted images), you can provide a custom image loader.
+
+### Creating a Custom Loader
+
+```python
+# my_loaders.py
+import io
+from PIL import Image
+from yolo.data.loaders import ImageLoader
+
+class EncryptedImageLoader(ImageLoader):
+    """Loader for AES-encrypted images."""
+
+    def __init__(self, key: str):
+        self.key = key
+
+    def __call__(self, path: str) -> Image.Image:
+        with open(path, 'rb') as f:
+            encrypted_data = f.read()
+
+        # Your decryption logic here
+        decrypted_data = my_decrypt(encrypted_data, self.key)
+        return Image.open(io.BytesIO(decrypted_data)).convert("RGB")
+```
+
+### Configuration via YAML
+
+```yaml
+data:
+  root: data/encrypted-dataset
+  image_loader:
+    class_path: my_loaders.EncryptedImageLoader
+    init_args:
+      key: "my-secret-key"
+```
+
+### Configuration via CLI
+
+```shell
+# Full configuration via CLI
+python -m yolo.cli fit --config config.yaml \
+    --data.image_loader.class_path=my_loaders.EncryptedImageLoader \
+    --data.image_loader.init_args.key="my-secret-key"
+
+# Override just the key (if loader is already in YAML)
+python -m yolo.cli fit --config config.yaml \
+    --data.image_loader.init_args.key="different-key"
+```
+
+### Notes
+
+- Custom loaders must return a PIL Image in RGB mode
+- The loader must be picklable for multi-worker data loading (`num_workers > 0`)
+- When using a custom loader, a log message will confirm: `📷 Using custom image loader: EncryptedImageLoader`
+
+## Data Loading Performance
+
+Best practices for optimizing data loading performance during training.
+
+### DataLoader Settings
+
+```yaml
+data:
+  num_workers: 8      # Increase for faster loading (default: 8)
+  pin_memory: true    # Faster GPU transfer (default: true)
+  batch_size: 16      # Adjust based on GPU memory
+```
+
+**Guidelines:**
+- `num_workers`: Set to number of CPU cores, or 2x for I/O-bound workloads
+- `pin_memory`: Keep `true` for GPU training
+- `batch_size`: Larger batches improve throughput but require more VRAM
+
+### Storage Optimization
+
+| Method | Use Case | Speedup |
+|--------|----------|---------|
+| **SSD** | Standard training | Baseline |
+| **NVMe SSD** | Large datasets | 2-3x vs HDD |
+| **RAM disk** | Small datasets (<32GB) | 5-10x |
+
+**RAM disk setup (Linux):**
+```shell
+# Copy dataset to RAM disk
+cp -r data/coco /dev/shm/coco
+
+# Update config
+python -m yolo.cli fit --config config.yaml --data.root=/dev/shm/coco
+```
+
+### Why Not Image Caching?
+
+We intentionally don't implement built-in image caching because:
+
+1. **Multi-worker isolation**: With `num_workers > 0`, each worker process has separate memory. A shared cache would require complex inter-process communication
+2. **Memory constraints**: COCO dataset (~120k images) would require 100GB+ RAM for caching
+3. **Augmentation invalidation**: Images are transformed differently each epoch, making raw image caching less useful
+4. **Disk I/O is fast**: Modern SSDs provide sufficient throughput for typical training
+
+**For custom caching needs**, implement it in your [custom image loader](#custom-image-loader):
+
+```python
+class CachedImageLoader(ImageLoader):
+    def __init__(self, cache_size: int = 1000):
+        self.cache = LRUCache(cache_size)
+
+    def __call__(self, path: str) -> Image.Image:
+        if path not in self.cache:
+            self.cache[path] = Image.open(path).convert("RGB")
+        return self.cache[path].copy()  # Return copy to avoid mutation
+```
 
 ## Configuration
 
