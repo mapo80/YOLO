@@ -56,6 +56,33 @@ python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
 python -m yolo.cli fit --config yolo/config/experiment/debug.yaml
 ```
 
+### Training Example
+
+For a complete end-to-end training example, see the [Simpsons Character Detection Training Guide](training-experiment/TRAINING_GUIDE.md).
+
+This example demonstrates:
+- Dataset preparation (COCO format conversion)
+- Configuration file setup
+- Training with pretrained weights (transfer learning)
+- Checkpoint management and resume training
+- Inference on custom images
+
+**Quick start with the example:**
+
+```shell
+# Train on Simpsons dataset with pretrained weights
+python -m yolo.cli fit --config training-experiment/simpsons-train.yaml
+
+# Resume training from checkpoint
+python -m yolo.cli fit --config training-experiment/simpsons-train.yaml \
+    --ckpt_path=training-experiment/checkpoints/last.ckpt
+
+# Run inference on trained model
+python -m yolo.cli predict \
+    --checkpoint training-experiment/checkpoints/best.ckpt \
+    --source path/to/image.jpg
+```
+
 ### Pretrained Weights
 
 Use official YOLOv9 pretrained weights (trained on COCO, 80 classes) for transfer learning on custom datasets.
