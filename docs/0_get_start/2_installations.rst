@@ -62,12 +62,7 @@ Next, install the required packages:
 
 .. code-block:: bash
 
-    # For the minimal requirements, use:
     pip install -r requirements.txt
-    # For a full installation, use:
-    pip install -r requirements-dev.txt
-
-Moreover, if you plan to utilize ONNX or TensorRT, please follow :ref:`ONNX`, :ref:`TensorRT` for more installation details.
 
 PyPI (pip install)
 ------------------
@@ -82,20 +77,3 @@ To install YOLO via GitHub:
 
    pip install git+https://github.com/WongKinYiu/YOLO.git
 
-Docker
-------
-
-To run YOLO using NVIDIA Docker, you can pull the Docker image and run it with GPU support:
-
-.. code-block:: bash
-
-   docker pull henrytsui000/yolo
-   docker run --gpus all -it henrytsui000/yolo
-
-Make sure you have the NVIDIA Docker toolkit installed. For more details on setting up NVIDIA Docker, refer to the `NVIDIA Docker documentation <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html>`_.
-
-
-Conda
------
-
-We will publish it in the near future!

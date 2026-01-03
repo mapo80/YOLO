@@ -1,4 +1,0 @@
-.. _DataAugment:
-
-Data Augment
-============

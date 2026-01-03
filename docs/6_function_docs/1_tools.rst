@@ -1,4 +1,0 @@
-.. _Tools:
-
-Useful Tools
-============

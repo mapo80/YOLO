@@ -148,3 +148,9 @@ node_modules/
 
 # Not ignore image for demo
 !demo/images/*/*.png
+
+# Training experiments (datasets, checkpoints, logs)
+training-experiment/*
+!training-experiment/simpsons-train.yaml
+!training-experiment/TRAINING_GUIDE.md
+!yolo/data

@@ -1,15 +1,30 @@
-einops
+# Core
+torch>=2.0
+torchvision>=0.15
+lightning>=2.0
+jsonargparse[signatures]>=4.27.7
+
+# Metrics
+torchmetrics[detection]>=1.0
 faster-coco-eval
-graphviz
-hydra-core
-lightning
-loguru
-numpy
-opencv-python
-Pillow
 pycocotools
-requests
+
+# Config
+omegaconf
+
+# Utilities
+einops
+numpy
+Pillow
+opencv-python
+
+# Logging
+loguru
 rich
-torch
-torchvision
 wandb
+
+# Visualization (optional)
+graphviz
+
+# HTTP requests (for weight download)
+requests

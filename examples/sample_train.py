@@ -1,36 +1,74 @@
+"""
+Sample training script using the new Lightning-based training pipeline.
+
+Usage:
+    python examples/sample_train.py
+
+Or use the CLI directly:
+    python -m yolo.cli fit --config yolo/config/experiment/default.yaml
+"""
+
 import sys
 from pathlib import Path
 
-import hydra
-
+# Add project root to path
 project_root = Path(__file__).resolve().parent.parent
-sys.path.append(str(project_root))
+sys.path.insert(0, str(project_root))
+
+from lightning.pytorch import Trainer
+from lightning.pytorch.callbacks import ModelCheckpoint, RichProgressBar
+
+from yolo.data.datamodule import YOLODataModule
+from yolo.training.module import YOLOModule
 
 
-from yolo import (
-    Config,
-    ModelTrainer,
-    ProgressLogger,
-    create_converter,
-    create_dataloader,
-    create_model,
-)
-from yolo.utils.model_utils import get_device
+def main():
+    # Create model
+    model = YOLOModule(
+        model_config="v9-c",
+        num_classes=80,
+        image_size=[640, 640],
+        learning_rate=0.01,
+        momentum=0.937,
+        weight_decay=0.0005,
+        warmup_epochs=3,
+        box_loss_weight=7.5,
+        cls_loss_weight=0.5,
+        dfl_loss_weight=1.5,
+    )
 
+    # Create datamodule
+    datamodule = YOLODataModule(
+        root="data/coco",
+        train_images="train2017",
+        val_images="val2017",
+        train_ann="annotations/instances_train2017.json",
+        val_ann="annotations/instances_val2017.json",
+        batch_size=16,
+        num_workers=8,
+        image_size=[640, 640],
+    )
 
-@hydra.main(config_path="config", config_name="config", version_base=None)
-def main(cfg: Config):
-    progress = ProgressLogger(cfg, exp_name=cfg.name)
-    device, use_ddp = get_device(cfg.device)
-    dataloader = create_dataloader(cfg.task.data, cfg.dataset, cfg.task.task, use_ddp)
-    model = create_model(cfg.model, class_num=cfg.dataset.class_num, weight_path=cfg.weight)
-    model = model.to(device)
+    # Create trainer
+    trainer = Trainer(
+        max_epochs=500,
+        accelerator="auto",
+        devices="auto",
+        precision="16-mixed",
+        gradient_clip_val=10.0,
+        callbacks=[
+            ModelCheckpoint(
+                monitor="val/mAP",
+                mode="max",
+                save_top_k=3,
+                save_last=True,
+            ),
+            RichProgressBar(),
+        ],
+    )
 
-    converter = create_converter(cfg.model.name, model, cfg.model.anchor, cfg.image_size, device)
-
-    solver = ModelTrainer(cfg, model, converter, progress, device)
-    progress.start()
-    solver.solve(dataloader)
+    # Train
+    trainer.fit(model, datamodule)
 
 
 if __name__ == "__main__":

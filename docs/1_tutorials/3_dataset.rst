@@ -1,77 +1,97 @@
 Create Dataset
 ==============
 
-In this section, we will prepare the dataset and create a dataloader.
+The data pipeline uses standard COCO format via ``torchvision.datasets.CocoDetection``.
 
-Overall, the dataloader can be created by:
+Dataset Format
+--------------
+
+The pipeline expects COCO format annotations:
+
+.. code-block:: text
+
+    data/coco/
+    |-- train2017/
+    |   |-- 000000000001.jpg
+    |   |-- ...
+    |-- val2017/
+    |   |-- 000000000001.jpg
+    |   |-- ...
+    |-- annotations/
+        |-- instances_train2017.json
+        |-- instances_val2017.json
+
+DataModule
+----------
+
+The ``YOLODataModule`` handles all data loading:
 
 .. code-block:: python
 
-   from yolo import create_dataloader
-   dataloader = create_dataloader(cfg.task.data, cfg.dataset, cfg.task.task, use_ddp)
+    from yolo.data.datamodule import YOLODataModule
 
-For inference, the dataset will be handled by :class:`~yolo.tools.data_loader.StreamDataLoader`, while for training and validation, it will be handled by :class:`~yolo.tools.data_loader.YoloDataLoader`.
+    data = YOLODataModule(
+        root="data/coco",
+        train_images="train2017",
+        val_images="val2017",
+        train_ann="annotations/instances_train2017.json",
+        val_ann="annotations/instances_val2017.json",
+        batch_size=16,
+        image_size=[640, 640],
+        num_workers=8,
+    )
 
-The input arguments are:
+Configuration
+~~~~~~~~~~~~~
 
-- **DataConfig**: :class:`~yolo.config.config.DataConfig`, the relevant configuration for the dataloader.
-- **DatasetConfig**: :class:`~yolo.config.config.DatasetConfig`, the relevant configuration for the dataset.
-- **task_name**: :guilabel:`str`, the task name, which can be `inference`, `validation`, or `train`.
-- **use_ddp**: :guilabel:`bool`, whether to use DDP (Distributed Data Parallel). Default is `False`.
+Data configuration in ``yolo/config/experiment/default.yaml``:
 
-Train and Validation
-----------------------------
+.. code-block:: yaml
+
+    data:
+      root: data/coco
+      train_images: train2017
+      val_images: val2017
+      train_ann: annotations/instances_train2017.json
+      val_ann: annotations/instances_val2017.json
+      batch_size: 16
+      num_workers: 8
+      image_size: [640, 640]
+      # Augmentation
+      mosaic_prob: 1.0
+      mixup_prob: 0.15
+      flip_lr: 0.5
+
+Custom Dataset
+--------------
+
+For custom datasets, create COCO-format annotations and configure the paths:
+
+.. code-block:: bash
+
+    python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
+        --data.root=data/my_dataset \
+        --data.train_images=images/train \
+        --data.val_images=images/val \
+        --data.train_ann=annotations/train.json \
+        --data.val_ann=annotations/val.json \
+        --model.num_classes=10
 
 Dataloader Return Type
-~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~
 
-For each iteration, the return type includes:
+For each batch, the dataloader returns:
 
-- **batch_size**: the size of each batch, used to calculate batch average loss.
-- **images**: the input images.
-- **targets**: the ground truth of the images according to the task.
+- **images**: Tensor of shape ``[batch_size, 3, height, width]``
+- **targets**: List of dictionaries with COCO-format annotations
 
-Auto Download Dataset
-~~~~~~~~~~~~~~~~~~~~~
+Augmentations
+-------------
 
-The dataset will be auto-downloaded if the user provides the `auto_download` configuration. For example, if the configuration is as follows:
+The following augmentations are applied during training:
 
-
-.. literalinclude:: ../../yolo/config/dataset/mock.yaml
-  :language: YAML
-
-
-First, it will download and unzip the dataset from `{prefix}/{postfix}`, and verify that the dataset has `{file_num}` files.
-
-Once the dataset is verified, it will generate `{train, validation}.cache` in Tensor format, which accelerates the dataset preparation speed.
-
-Inference
------------------
-
-In streaming mode, the model will infer the most recent frame and draw the bounding boxes by default, given the save flag to save the image. In other modes, it will save the predictions to `runs/inference/{exp_name}/outputs/` by default.
-
-Dataloader Return Type
-~~~~~~~~~~~~~~~~~~~~~
-
-For each iteration, the return type of `StreamDataLoader` includes:
-
-- **images**: tensor, the size of each batch, used to calculate batch average loss.
-- **rev_tensor**: tensor, reverse tensor for reverting the bounding boxes and images to the input shape.
-- **origin_frame**: tensor, the original input image.
-
-Input Type
-~~~~~~~~~~
-
-- **Stream Input**:
-
-  - **webcam**: :guilabel:`int`, ID of the webcam, for example, 0, 1.
-  - **rtmp**: :guilabel:`str`, RTMP address.
-
-- **Single Source**:
-
-  - **image**: :guilabel:`Path`, path to image files (`jpeg`, `jpg`, `png`, `tiff`).
-  - **video**: :guilabel:`Path`, path to video files (`mp4`).
-
-- **Folder**:
-
-  - **folder of images**: :guilabel:`Path`, the relative or absolute path to the folder containing images.
+- **Mosaic**: Combines 4 images into one
+- **MixUp**: Blends two images together
+- **HSV**: Random hue, saturation, value adjustments
+- **Flip**: Horizontal flip
+- **Resize**: Letterbox resize to target size
