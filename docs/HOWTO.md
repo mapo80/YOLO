@@ -1,172 +1,241 @@
-# How To modified YOLO
+# How To Use YOLO
 
-To facilitate easy customization of the YOLO model, we've structured the codebase to allow for changes through configuration files and minimal code adjustments. This guide will walk you through the steps to customize various components of the model including the architecture, blocks, data loaders, and loss functions.
+This guide explains how to use the YOLO training pipeline built on PyTorch Lightning.
 
-## Examples
+## Quick Start
 
-```shell
-# Train
-python yolo/lazy.py task=train dataset=dev use_wandb=True
+### Training
 
-# Validate
-python yolo/lazy.py task=validation
-python yolo/lazy.py task=validation model=v9-s
-python yolo/lazy.py task=validation dataset=toy
-python yolo/lazy.py task=validation dataset=toy name=validation
+```bash
+# Train with default config
+python -m yolo.cli fit --config yolo/config/experiment/default.yaml
 
-# Inference
-python yolo/lazy.py task=inference
-python yolo/lazy.py task=inference device=cpu
-python yolo/lazy.py task=inference +quiet=True
-python yolo/lazy.py task=inference name=AnyNameYouWant
-python yolo/lazy.py task=inference image_size=\[480,640]
-python yolo/lazy.py task=inference task.nms.min_confidence=0.1
-python yolo/lazy.py task=inference task.fast_inference=deploy
-python yolo/lazy.py task=inference task.fast_inference=onnx device=cpu
-python yolo/lazy.py task=inference task.data.source=data/toy/images/train
+# Train with custom parameters
+python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
+    --model.learning_rate=0.001 \
+    --data.batch_size=32 \
+    --trainer.max_epochs=100
+
+# Debug/quick test
+python -m yolo.cli fit --config yolo/config/experiment/debug.yaml
+```
+
+### Validation
+
+```bash
+# Validate a trained model
+python -m yolo.cli validate --config yolo/config/experiment/default.yaml \
+    --ckpt_path=runs/best.ckpt
+```
+
+### Inference
+
+```bash
+# Run inference on an image
+python examples/sample_inference.py --image path/to/image.jpg
+
+# With custom weights
+python examples/sample_inference.py --image path/to/image.jpg --weights weights/v9-c.pt
+```
+
+## Configuration
+
+All training configuration is done through YAML files in `yolo/config/experiment/`.
+
+### Example Configuration
+
+```yaml
+# yolo/config/experiment/my_experiment.yaml
+
+trainer:
+  max_epochs: 100
+  accelerator: auto
+  devices: auto
+  precision: 16-mixed
+
+model:
+  model_config: v9-c      # Model architecture (v9-c, v9-s, v9-m, etc.)
+  num_classes: 80
+  learning_rate: 0.01
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 3
+  box_loss_weight: 7.5
+  cls_loss_weight: 0.5
+  dfl_loss_weight: 1.5
+
+data:
+  root: data/coco
+  train_images: train2017
+  val_images: val2017
+  train_ann: annotations/instances_train2017.json
+  val_ann: annotations/instances_val2017.json
+  batch_size: 16
+  num_workers: 8
+  image_size: [640, 640]
+  # Augmentation
+  mosaic_prob: 1.0
+  mixup_prob: 0.15
+  flip_lr: 0.5
+```
+
+### CLI Override
+
+Any parameter can be overridden from command line:
+
+```bash
+python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
+    --model.model_config=v9-s \
+    --model.learning_rate=0.005 \
+    --data.batch_size=8 \
+    --trainer.max_epochs=50
 ```
 
 ## Custom Model Architecture
 
-You can change the model architecture simply by modifying the YAML configuration file. Here's how:
+Model architectures are defined in YAML files under `yolo/config/model/`.
 
-1. **Modify Architecture in Config:**
+### Architecture DSL
 
-   Navigate to your model's configuration file (typically formate like `yolo/config/model/v9-c.yaml`).
-   - Adjust the architecture settings under the `architecture` section. Ensure that every module you reference exists in `module.py`, or refer to the next section on how to add new modules.
+```yaml
+# yolo/config/model/custom.yaml
+name: custom
 
-    ```yaml
-    model:
-      foo:
-        - ADown:
-            args: {out_channels: 256}
-        - RepNCSPELAN:
-            source: -2
-            args: {out_channels: 512, part_channels: 256}
-            tags: B4
-      bar:
-        - Concat:
-            source: [-2, B4]
-    ```
+anchor:
+  reg_max: 16
+  strides: [8, 16, 32]
 
-   `tags`: Use this to labels any module you want, and could be the module source.
+model:
+  backbone:
+    - Conv:
+        args: {out_channels: 64, kernel_size: 3, stride: 2}
+        source: 0
+    - Conv:
+        args: {out_channels: 128, kernel_size: 3, stride: 2}
+    - RepNCSPELAN:
+        args: {out_channels: 256, part_channels: 128}
+        tags: B3  # Tag for later reference
 
-   `source`: Set this to the index of the module output you wish to use as input; default is `-1` which refers to the last module's output. Capable tags, relative position, absolute position
+  neck:
+    - SPPELAN:
+        args: {out_channels: 512}
+    - UpSample:
+        args: {scale_factor: 2, mode: nearest}
+    - Concat:
+        source: [-1, B3]  # Reference tagged layer
 
-   `args`: A dictionary used to initialize parameters for convolutional or bottleneck layers.
+  head:
+    - MultiheadDetection:
+        source: [P3, P4, P5]
+        tags: Main
+        output: True
+```
 
-   `output`: Whether to serve as the output of the model.
+### DSL Keywords
 
-## Custom Block
+- `tags`: Label any module for later reference
+- `source`: Input source (default: `-1` = previous layer). Can be:
+  - Relative index: `-1`, `-2`
+  - Absolute index: `0`, `5`
+  - Tag name: `B3`, `N4`
+  - List: `[-1, B3]`
+- `args`: Constructor arguments
+- `output`: Mark as model output
 
-To add or modify a block in the model:
+## Custom Blocks
 
-1. **Create a New Module:**
+To add a custom block:
 
-   Define a new class in `module.py` that inherits from `nn.Module`.
+1. **Define in `yolo/model/module.py`:**
 
-   The constructor should accept `in_channels` as a parameter. Make sure to calculate `out_channels` based on your model's requirements or configure it through the YAML file using `args`.
+```python
+class CustomBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, **kwargs):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.SiLU()
 
-    ```python
-    class CustomBlock(nn.Module):
-        def __init__(self, in_channels, out_channels, **kwargs):
-            super().__init__()
-            self.module = # conv, bool, ...
-        def forward(self, x):
-            return self.module(x)
-    ```
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+```
 
-2. **Reference in Config:**
-   ```yaml
-    ...
-    - CustomBlock:
-        args: {out_channels: int, etc: ...}
-        ...
-    ...
-   ```
+2. **Use in config:**
 
+```yaml
+- CustomBlock:
+    args: {out_channels: 256}
+```
 
-## Custom Data Augmentation
+## Dataset Format
 
-Custom transformations should be designed to accept an image and its bounding boxes, and return them after applying the desired changes. Here’s how you can define such a transformation:
+The pipeline uses standard **COCO format** via `torchvision.datasets.CocoDetection`.
 
+### Expected Directory Structure
 
-1. **Define Dataset:**
+```
+data/coco/
+├── train2017/
+│   └── *.jpg
+├── val2017/
+│   └── *.jpg
+└── annotations/
+    ├── instances_train2017.json
+    └── instances_val2017.json
+```
 
-    Your class must have a `__call__` method that takes a PIL image and its corresponding bounding boxes as input, and returns them after processing.
+### Custom Dataset
 
+For custom datasets, create COCO-format annotations:
 
-   ```python
-    class CustomTransform:
-        def __init__(self, prob=0.5):
-            self.prob = prob
+```bash
+python -m yolo.cli fit \
+    --data.root=data/my_dataset \
+    --data.train_images=images/train \
+    --data.val_images=images/val \
+    --data.train_ann=annotations/train.json \
+    --data.val_ann=annotations/val.json \
+    --model.num_classes=10
+```
 
-        def __call__(self, image, boxes):
-            return image, boxes
-   ```
-2. **Update CustomTransform in Config:**
+## Metrics
 
-    Specify your custom transformation in a YAML config `yolo/config/data/augment.yaml`. For examples:
-    ```yaml
-    Mosaic: 1
-    # ... (Other Transform)
-    CustomTransform: 0.5
-    ```
+The following metrics are logged during validation:
 
+| Metric | Description |
+|--------|-------------|
+| `val/mAP` | mAP @ IoU=0.50:0.95 (COCO primary) |
+| `val/mAP50` | mAP @ IoU=0.50 |
+| `val/mAP75` | mAP @ IoU=0.75 |
+| `val/mAP_small` | mAP for small objects (< 32² px) |
+| `val/mAP_medium` | mAP for medium objects (32²-96² px) |
+| `val/mAP_large` | mAP for large objects (> 96² px) |
+| `val/mAR100` | Mean Average Recall (max 100 detections) |
 
-- **Utils**
-    - **bbox_utils**
-        - `class` Anchor2Box: transform predicted anchor to bounding box
-        - `class` Matcher: given prediction and groudtruth, find the groundtruth for each prediction
-        - `func` calculate_iou: calculate iou for given two list of bbox
-        - `func` transform_bbox: transform bbox from {xywh, xyxy, xcycwh} to {xywh, xyxy, xcycwh}
-        - `func` generate_anchors: given image size, make the anchor point for the given size
-    - **dataset_utils**
-        - `func` locate_label_paths:
-        - `func` create_image_metadata:
-        - `func` organize_annotations_by_image:
-        - `func` scale_segmentation:
-    - **logging_utils**
-        - `func` custom_log: custom loguru, overiding the origin logger
-        - `class` ProgressTracker: A class to handle output for each batch, epoch
-        - `func` log_model_structure: give a torch model, print it as a table
-        - `func` validate_log_directory: for given experiemnt, check if the log folder already existed
-    - **model_utils**
-        - `class` ExponentialMovingAverage: a mirror of model, do ema on model
-        - `func` create_optimizer: return a optimzer, for example SDG, ADAM
-        - `func` create_scheduler: return a scheduler, for example Step, Lambda
-    - **module_utils**
-        - `func` get_layer_map:
-        - `func` auto_pad: given a convolution block, return how many pixel should conv padding
-        - `func` create_activation_function: given a `func` name, return a activation `func`tion
-        - `func` round_up: given number and divider, return a number is mutliplcation of divider
-        - `func` divide_into_chunks: for a given list and n, seperate list to n sub list
-    - **trainer**
-        - `class` Trainer: a class can automatic train the model
-- **Tools**
-    - **converter_json2txt**
-        - `func` discretize_categories: given the dictionary class, turn id from 1: class
-        - `func` process_annotations: handle the whole dataset annotations
-        - `func` process_annotation: handle a annotation(a list of bounding box)
-        - `func` normalize_segmentation: normalize segmentation position to 0~1
-        - `func` convert_annotations: convert json annotations to txt file structure
-    - **data_augment**
-        - `class` AugmentationComposer: Compose a list of data augmentation strategy
-        - `class` VerticalFlip: a custom data augmentation, Random Vertical Flip
-        - `class` Mosaic: a data augmentation strategy, follow YOLOv5
-    - **dataloader**
-        - `class` YoloDataset: a custom dataset for training yolo's model
-        - `class` YoloDataLoader: a dataloader base on torch's dataloader, with custom allocate function
-        - `func` create_dataloader: given a config file, return a YOLO dataloader
-    - **drawer**
-        - `func` draw_bboxes: given a image and list of bbox, draw bbox on the image
-        - `func` draw_model: visualize the given model
-    - **get_dataset**
-        - `func` download_file: for a given link, download the file
-        - `func` unzip_file: unzip the downloaded zip to data/
-        - `func` check_files: check if the dataset file numbers is correct
-        - `func` prepare_dataset: automatic download the dataset and check if it is correct
-    - **loss**
-        - `class` BoxLoss: a Custom Loss for bounding box
-        - `class` YOLOLoss: a implementation of yolov9 loss
-        - `class` DualLoss: a implementation of yolov9 loss with auxiliary detection head
+## Project Structure
+
+```
+yolo/
+├── cli.py                    # LightningCLI entry point
+├── config/
+│   ├── config.py             # Dataclass definitions
+│   ├── experiment/           # Training configs
+│   │   ├── default.yaml
+│   │   └── debug.yaml
+│   └── model/                # Model architecture DSL
+│       ├── v9-c.yaml
+│       ├── v9-s.yaml
+│       └── ...
+├── data/
+│   ├── datamodule.py         # LightningDataModule
+│   └── transforms.py         # Data augmentations
+├── training/
+│   ├── module.py             # LightningModule
+│   └── loss.py               # Loss functions
+├── model/
+│   ├── yolo.py               # Model builder
+│   └── module.py             # Layer definitions
+└── utils/
+    ├── bounding_box_utils.py # BBox utilities
+    └── logger.py             # Logging
+```

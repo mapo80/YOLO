@@ -1,204 +1,141 @@
 All In 1
 ========
 
-:file:`yolo.lazy` is a packaged file that includes :guilabel:`training`, :guilabel:`validation`, and :guilabel:`inference` tasks.
-For detailed function documentation, thercheck out the IPython notebooks to learn how to import and use these function
-the following section will break down operation inside of lazy, also supporting directly import/call the function.
-
-[TOC], setup, build, dataset, train, validation, inference
-To train the model, you can run:
+This guide covers training, validation, and inference using PyTorch Lightning CLI.
 
 Train Model
-----------
+-----------
 
-
-- batch size check / cuda
-- training time / check
-- build model / check
-- dataset / check
+To train the model:
 
 .. code-block:: bash
 
-    python yolo/lazy.py task=train
+    python -m yolo.cli fit --config yolo/config/experiment/default.yaml
 
-You can customize the training process by overriding the following common arguments:
+Common Configuration Options
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- ``name``: :guilabel:`str`
-  The experiment name.
+All configuration is done via YAML files in ``yolo/config/experiment/``. You can override any parameter from the command line:
 
-- ``model``: :guilabel:`str`
-  Model backbone, options include [model_zoo] v9-c, v7, v9-e, etc.
+**Model parameters:**
 
-- ``cpu_num``: :guilabel:`int`
-  Number of CPU workers (num_workers).
+- ``--model.model_config``: Model architecture (v9-c, v9-s, v9-m, etc.)
+- ``--model.num_classes``: Number of classes (default: 80)
+- ``--model.learning_rate``: Learning rate (default: 0.01)
 
-- ``out_path``: :guilabel:`Path`
-  The output path for saving models and logs.
+**Data parameters:**
 
-- ``weight``: :guilabel:`Path | bool | None`
-  The path to pre-trained weights, False for training from scratch, None for default weights.
+- ``--data.batch_size``: Batch size (default: 16)
+- ``--data.image_size``: Input image size (default: [640, 640])
+- ``--data.num_workers``: Number of dataloader workers (default: 8)
 
-- ``use_wandb``: :guilabel:`bool`
-  Whether to use Weights and Biases for experiment tracking.
+**Trainer parameters:**
 
-- ``use_TensorBoard``: :guilabel:`bool`
-  Whether to use TensorBoard for logging.
-
-- ``image_size``: :guilabel:`int | [int, int]`
-  The input image size.
-
-- ``+quiet``: :guilabel:`bool`
-  Optional, disable all output.
-
-- ``task.epoch``: :guilabel:`int`
-  Total number of training epochs.
-
-- ``task.data.batch_size``: :guilabel:`int`
-  The size of each batch (auto-batch sizing [WIP]).
+- ``--trainer.max_epochs``: Total training epochs (default: 500)
+- ``--trainer.accelerator``: Device type (auto, gpu, cpu, mps)
+- ``--trainer.devices``: Number of devices (auto, 1, 2, etc.)
+- ``--trainer.precision``: Training precision (16-mixed, 32, bf16-mixed)
 
 Examples
 ~~~~~~~~
 
-To train a model with a specific batch size and image size, you can run:
+Train with custom batch size and learning rate:
 
 .. code-block:: bash
 
-    python yolo/lazy.py task=train task.data.batch_size=12 image_size=1280
+    python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
+        --data.batch_size=32 \
+        --model.learning_rate=0.001 \
+        --trainer.max_epochs=100
 
-Multi-GPU Training with DDP
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Quick debug run:
 
-For multi-GPU training, we use Distributed Data Parallel (DDP) for efficient and scalable training.
-DDP enable training model with mutliple GPU, even the GPUs aren't on the same machine. For more details, you can refer to the `DDP tutorial <https://pytorch.org/tutorials/intermediate/ddp_tutorial.html>`_.
+.. code-block:: bash
 
-To train on multiple GPUs, replace the ``python`` command with ``torchrun --nproc_per_node=[GPU_NUM]``. The ``nproc_per_node`` argument specifies the number of GPUs to use.
-
-
-.. tabs::
-
-   .. tab:: bash
-    .. code-block:: bash
-
-        torchrun --nproc_per_node=2 yolo/lazy.py task=train device=[0,1]
-
-   .. tab:: zsh
-    .. code-block:: bash
-
-        torchrun --nproc_per_node=2 yolo/lazy.py task=train device=\[0,1\]
+    python -m yolo.cli fit --config yolo/config/experiment/debug.yaml
 
 
-Training on a Custom Dataset
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Multi-GPU Training
+~~~~~~~~~~~~~~~~~~
 
-To use the auto-download module, we suggest users construct the dataset config in the following format.
-If the config files include `auto_download`, the model will automatically download the dataset when creating the dataloader.
+PyTorch Lightning handles multi-GPU training automatically:
 
-Here is an example dataset config file:
+.. code-block:: bash
 
-.. literalinclude:: ../../yolo/config/dataset/dev.yaml
-  :language: YAML
+    # Single GPU
+    python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
+        --trainer.devices=1
 
-Both of the following formats are acceptable:
+    # Multiple GPUs with DDP
+    python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
+        --trainer.devices=2 \
+        --trainer.strategy=ddp
 
-- ``path``: :guilabel:`str`
-  The path to the dataset.
 
-- ``train, validation``: :guilabel:`str`
-  The training and validation directory names under `/images`. If using txt as ground truth, these should also be the names under `/labels/`.
+Custom Dataset
+~~~~~~~~~~~~~~
 
-- ``class_num``: :guilabel:`int`
-  The number of dataset classes.
+The pipeline uses standard **COCO format** via ``torchvision.datasets.CocoDetection``.
 
-- ``class_list``: :guilabel:`List[str]`
-  Optional, the list of class names, used only for visualizing the bounding box classes.
-
-- ``auto_download``: :guilabel:`dict`
-  Optional, whether to auto-download the dataset.
-
-The dataset should include labels or annotations, preferably in JSON format for compatibility with pycocotools during inference:
+Expected directory structure:
 
 .. code-block:: text
 
-    DataSetName/
-    ├── annotations
-    │   ├── train_json_name.json
-    │   └── val_json_name.json
-    ├── labels/
-    │   ├── train/
-    │   │   ├── AnyLabelName.txt
-    │   │   └── ...
-    │   └── validation/
-    │       └── ...
-    └── images/
-        ├── train/
-        │   ├── AnyImageNameN.{png,jpg,jpeg}
-        │   └── ...
-        └── validation/
-            └── ...
+    data/coco/
+    |-- train2017/
+    |   |-- 000000000001.jpg
+    |   |-- ...
+    |-- val2017/
+    |   |-- 000000000001.jpg
+    |   |-- ...
+    |-- annotations/
+        |-- instances_train2017.json
+        |-- instances_val2017.json
+
+To train on a custom dataset:
+
+.. code-block:: bash
+
+    python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
+        --data.root=data/my_dataset \
+        --data.train_images=images/train \
+        --data.val_images=images/val \
+        --data.train_ann=annotations/train.json \
+        --data.val_ann=annotations/val.json \
+        --model.num_classes=10
 
 
-Validation Model
-----------------
+Validation
+----------
 
-During training, this block will be auto-executed. You may also run this task manually to generate a JSON file representing the predictions for a given validation dataset. If the validation set includes JSON annotations, it will run pycocotools for evaluation.
+To validate a trained model:
 
-We recommend setting ``task.data.shuffle`` to False and turning off ``task.data.data_augment``.
+.. code-block:: bash
 
-You can customize the validation process by overriding the following arguments:
+    python -m yolo.cli validate --config yolo/config/experiment/default.yaml \
+        --ckpt_path=runs/best.ckpt
 
-- ``task.nms.min_confidence``: :guilabel:`str`
-  The minimum confidence of model prediction.
+Metrics logged during validation:
 
-- ``task.nms.min_iou``: :guilabel:`str`
-  The minimum IoU threshold for NMS (Non-Maximum Suppression).
-
-Examples
-~~~~~~~~
-
-.. tabs::
-
-   .. tab:: git-cloned
-      .. code-block:: bash
-
-         python yolo/lazy.py task=validation task.nms.min_iou=0.9
-
-   .. tab:: PyPI
-      .. code-block:: bash
-
-         yolo task=validation task.nms.min_iou=0.9
+- ``val/mAP``: mAP @ IoU=0.50:0.95 (COCO primary metric)
+- ``val/mAP50``: mAP @ IoU=0.50
+- ``val/mAP75``: mAP @ IoU=0.75
+- ``val/mAP_small``: mAP for small objects
+- ``val/mAP_medium``: mAP for medium objects
+- ``val/mAP_large``: mAP for large objects
 
 
-Model Inference
----------------
+Inference
+---------
 
-.. note::
-   The ``dataset`` parameter shouldn't be overridden because the model requires the ``class_num`` of the dataset. If the classes have names, please provide the ``class_list``.
+To run inference on images:
 
-You can customize the inference process by overriding the following arguments:
+.. code-block:: bash
 
-- ``task.fast_inference``: :guilabel:`str`
-  Optional. Values can be `onnx`, `trt`, `deploy`, or `None`. `deploy` will detach the model auxiliary head.
+    python examples/sample_inference.py --image path/to/image.jpg
 
-- ``task.data.source``: :guilabel:`str | Path | int`
-  This argument will be auto-resolved and could be a webcam ID, image folder path, video/image path.
+    # With custom weights
+    python examples/sample_inference.py --image path/to/image.jpg --weights weights/v9-c.pt
 
-- ``task.nms.min_confidence``: :guilabel:`str`
-  The minimum confidence of model prediction.
-
-- ``task.nms.min_iou``: :guilabel:`str`
-  The minimum IoU threshold for NMS (Non-Maximum Suppression).
-
-Examples
-~~~~~~~~
-
-.. tabs::
-
-   .. tab:: git-cloned
-      .. code-block:: bash
-
-         python yolo/lazy.py model=v9-m task.nms.min_confidence=0.1 task.data.source=0 task.fast_inference=onnx
-
-   .. tab:: PyPI
-      .. code-block:: bash
-
-         yolo model=v9-m task.nms.min_confidence=0.1 task.data.source=0 task.fast_inference=onnx
+    # With custom model config
+    python examples/sample_inference.py --image path/to/image.jpg --model v9-s

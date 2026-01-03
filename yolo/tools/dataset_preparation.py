@@ -5,7 +5,6 @@ from typing import Optional
 import requests
 from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
 
-from yolo.config.config import DatasetConfig
 from yolo.utils.logger import logger
 
 
@@ -52,17 +51,25 @@ def check_files(directory, expected_count=None):
     return len(files) == expected_count if expected_count is not None else bool(files)
 
 
-def prepare_dataset(dataset_cfg: DatasetConfig, task: str):
+def prepare_dataset(dataset_cfg: dict, task: str):
     """
     Prepares dataset by downloading and unzipping if necessary.
+
+    Args:
+        dataset_cfg: Dataset configuration dict with 'path' and 'auto_download' keys
+        task: Task type ('train', 'validation', etc.)
     """
-    # TODO: do EDA of dataset
-    data_dir = Path(dataset_cfg.path)
-    for data_type, settings in dataset_cfg.auto_download.items():
-        base_url = settings["base_url"]
+    data_dir = Path(dataset_cfg.get("path", "data"))
+    auto_download = dataset_cfg.get("auto_download", {})
+
+    for data_type, settings in auto_download.items():
+        base_url = settings.get("base_url", "")
         for dataset_type, dataset_args in settings.items():
-            if dataset_type != "annotations" and dataset_cfg.get(task, task) != dataset_type:
+            if dataset_type == "base_url":
                 continue
+            if isinstance(dataset_args, str):
+                continue
+
             file_name = f"{dataset_args.get('file_name', dataset_type)}.zip"
             url = f"{base_url}{file_name}"
             local_zip_path = data_dir / file_name

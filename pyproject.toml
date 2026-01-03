@@ -8,7 +8,7 @@ authors = [
 ]
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.6"
+requires-python = ">=3.9"
 keywords = ["yolo", "object detection", "computer vision"]
 
 
@@ -31,4 +31,4 @@ requires = [
 ]
 
 [project.scripts]
-yolo = "yolo.lazy:main"
+yolo = "yolo.cli:main"

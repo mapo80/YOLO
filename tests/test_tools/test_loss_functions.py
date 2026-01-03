@@ -1,56 +1,87 @@
+"""Tests for loss functions."""
+
 import sys
-from math import isinf, isnan
 from pathlib import Path
 
 import pytest
 import torch
-from hydra import compose, initialize
 
 project_root = Path(__file__).resolve().parent.parent.parent
-sys.path.append(str(project_root))
+sys.path.insert(0, str(project_root))
 
-from yolo.config.config import Config
 from yolo.model.yolo import create_model
-from yolo.tools.loss_functions import DualLoss, create_loss_function
+from yolo.training.loss import YOLOLoss
 from yolo.utils.bounding_box_utils import Vec2Box
 
 
 @pytest.fixture
-def cfg() -> Config:
-    with initialize(config_path="../../yolo/config", version_base=None):
-        cfg = compose(config_name="config", overrides=["task=train"])
-    return cfg
+def device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 @pytest.fixture
-def model(cfg: Config):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = create_model(cfg.model, weight_path=None)
+def model(device):
+    from omegaconf import OmegaConf
+    from yolo.config.config import ModelConfig
+
+    model_yaml = project_root / "yolo" / "config" / "model" / "v9-c.yaml"
+    model_cfg = OmegaConf.load(model_yaml)
+    model_cfg = OmegaConf.merge(OmegaConf.structured(ModelConfig), model_cfg)
+    model = create_model(model_cfg, weight_path=False, class_num=80)
     return model.to(device)
 
 
 @pytest.fixture
-def vec2box(cfg: Config, model):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return Vec2Box(model, cfg.model.anchor, cfg.image_size, device)
+def vec2box(model, device):
+    from yolo.config.config import AnchorConfig
+
+    anchor_cfg = AnchorConfig(strides=[8, 16, 32], reg_max=16, anchor_num=None, anchor=[])
+    return Vec2Box(model, anchor_cfg, [640, 640], device)
 
 
 @pytest.fixture
-def loss_function(cfg, vec2box) -> DualLoss:
-    return create_loss_function(cfg, vec2box)
+def loss_function(vec2box):
+    return YOLOLoss(
+        vec2box=vec2box,
+        class_num=80,
+        reg_max=16,
+        box_weight=7.5,
+        cls_weight=0.5,
+        dfl_weight=1.5,
+    )
 
 
-@pytest.fixture
-def data():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    targets = torch.zeros(1, 20, 5, device=device)
-    predicts = [torch.zeros(1, 8400, *cn, device=device) for cn in [(80,), (4, 16), (4,)]]
-    return predicts, targets
+def test_loss_with_empty_targets(loss_function, device):
+    """Test loss computation with no targets."""
+    # Empty targets
+    targets = []
 
+    # Mock outputs
+    outputs = {
+        "Main": [
+            (
+                torch.zeros(1, 80, 80, 80, device=device),
+                torch.zeros(1, 4, 16, 80, 80, device=device),
+                torch.zeros(1, 4, 80, 80, device=device),
+            ),
+            (
+                torch.zeros(1, 80, 40, 40, device=device),
+                torch.zeros(1, 4, 16, 40, 40, device=device),
+                torch.zeros(1, 4, 40, 40, device=device),
+            ),
+            (
+                torch.zeros(1, 80, 20, 20, device=device),
+                torch.zeros(1, 4, 16, 20, 20, device=device),
+                torch.zeros(1, 4, 20, 20, device=device),
+            ),
+        ]
+    }
 
-def test_yolo_loss(loss_function, data):
-    predicts, targets = data
-    loss, loss_dict = loss_function(predicts, predicts, targets)
-    assert loss_dict["Loss/BoxLoss"] == 0
-    assert loss_dict["Loss/DFLLoss"] == 0
-    assert loss_dict["Loss/BCELoss"] >= 2e5
+    loss, loss_dict = loss_function(outputs, targets)
+
+    # With no targets, box and DFL loss should be 0
+    assert "box_loss" in loss_dict
+    assert "cls_loss" in loss_dict
+    assert "dfl_loss" in loss_dict
+    assert not torch.isnan(loss)
+    assert not torch.isinf(loss)

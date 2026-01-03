@@ -2,32 +2,25 @@
 
 [![Documentation Status](https://readthedocs.org/projects/yolo-docs/badge/?version=latest)](https://yolo-docs.readthedocs.io/en/latest/?badge=latest)
 ![GitHub License](https://img.shields.io/github/license/WongKinYiu/YOLO)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch Lightning](https://img.shields.io/badge/PyTorch-Lightning-792ee5.svg)](https://lightning.ai/)
 
-[![Developer Mode Build & Test](https://github.com/WongKinYiu/YOLO/actions/workflows/develop.yaml/badge.svg)](https://github.com/WongKinYiu/YOLO/actions/workflows/develop.yaml)
-[![Deploy Mode Validation & Inference](https://github.com/WongKinYiu/YOLO/actions/workflows/deploy.yaml/badge.svg)](https://github.com/WongKinYiu/YOLO/actions/workflows/deploy.yaml)
+Welcome to the official implementation of YOLOv7[^1], YOLOv9[^2], and YOLO-RD[^3].
 
+## Why This Implementation?
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)]()
-[![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-green)](https://huggingface.co/spaces/henry000/YOLO)
+**A world-class model deserves a world-class training pipeline.**
 
-<!-- > [!IMPORTANT]
-> This project is currently a Work In Progress and may undergo significant changes. It is not recommended for use in production environments until further notice. Please check back regularly for updates.
->
-> Use of this code is at your own risk and discretion. It is advisable to consult with the project owner before deploying or integrating into any critical systems. -->
+The original YOLO implementations focused on the model architecture and research contributions. This repository provides a **production-ready training pipeline** built on modern best practices:
 
-Welcome to the official implementation of YOLOv7[^1] and YOLOv9[^2], YOLO-RD[^3]. This repository will contains the complete codebase, pre-trained models, and detailed instructions for training and deploying YOLOv9.
+- **PyTorch Lightning** - Clean, scalable training with automatic mixed precision, multi-GPU support, and comprehensive logging
+- **Robust & Reproducible** - Deterministic training, proper validation metrics (COCO mAP), and checkpoint management
+- **Simple Configuration** - YAML-based configs with CLI overrides, no complex framework dependencies
+- **Standard Data Format** - Native COCO dataset support via `torchvision.datasets.CocoDetection`
 
-## TL;DR
+The goal: **make training YOLO as reliable and straightforward as the model itself is powerful**.
 
-- This is the official YOLO model implementation with an MIT License.
-- For quick deployment: you can directly install by pip+git:
-
-```shell
-pip install git+https://github.com/WongKinYiu/YOLO.git
-yolo task.data.source=0 # source could be a single file, video, image folder, webcam ID
-```
-
-## Introduction
+## Papers
 
 - [**YOLOv9**: Learning What You Want to Learn Using Programmable Gradient Information](https://arxiv.org/abs/2402.13616)
 - [**YOLOv7**: Trainable Bag-of-Freebies Sets New State-of-the-Art for Real-Time Object Detectors](https://arxiv.org/abs/2207.02696)
@@ -35,105 +28,208 @@ yolo task.data.source=0 # source could be a single file, video, image folder, we
 
 ## Installation
 
-To get started using YOLOv9's developer mode, we recommand you clone this repository and install the required dependencies:
-
 ```shell
-git clone git@github.com:WongKinYiu/YOLO.git
+git clone https://github.com/WongKinYiu/YOLO.git
 cd YOLO
 pip install -r requirements.txt
 ```
 
-## Features
+## Quick Start
 
-<table>
-<tr><td>
-
-## Task
-
-These are simple examples. For more customization details, please refer to [Notebooks](examples) and lower-level modifications **[HOWTO](docs/HOWTO.md)**.
-
-## Training
-
-To train YOLO on your machine/dataset:
-
-1. Modify the configuration file `yolo/config/dataset/**.yaml` to point to your dataset.
-2. Run the training script:
+### Training
 
 ```shell
-python yolo/lazy.py task=train dataset=** use_wandb=True
-python yolo/lazy.py task=train task.data.batch_size=8 model=v9-c weight=False # or more args
-```
+# Train with default config
+python -m yolo.cli fit --config yolo/config/experiment/default.yaml
 
-### Transfer Learning
+# Custom parameters
+python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
+    --model.model_config=v9-c \
+    --data.batch_size=16 \
+    --trainer.max_epochs=300
 
-To perform transfer learning with YOLOv9:
-
-```shell
-python yolo/lazy.py task=train task.data.batch_size=8 model=v9-c dataset={dataset_config} device={cpu, mps, cuda}
-```
-
-### Inference
-
-To use a model for object detection, use:
-
-```shell
-python yolo/lazy.py # if cloned from GitHub
-python yolo/lazy.py task=inference \ # default is inference
-                    name=AnyNameYouWant \ # AnyNameYouWant
-                    device=cpu \ # hardware cuda, cpu, mps
-                    model=v9-s \ # model version: v9-c, m, s
-                    task.nms.min_confidence=0.1 \ # nms config
-                    task.fast_inference=onnx \ # onnx, trt, deploy
-                    task.data.source=data/toy/images/train \ # file, dir, webcam
-                    +quiet=True \ # Quiet Output
-yolo task.data.source={Any Source} # if pip installed
-yolo task=inference task.data.source={Any}
+# Debug run (small dataset, few epochs)
+python -m yolo.cli fit --config yolo/config/experiment/debug.yaml
 ```
 
 ### Validation
 
-To validate model performance, or generate a json file in COCO format:
-
 ```shell
-python yolo/lazy.py task=validation
-python yolo/lazy.py task=validation dataset=toy
+python -m yolo.cli validate --config yolo/config/experiment/default.yaml \
+    --ckpt_path=runs/best.ckpt
 ```
 
-## Contributing
+### Inference
 
-Contributions to the YOLO project are welcome! See [CONTRIBUTING](docs/CONTRIBUTING.md) for guidelines on how to contribute.
+```shell
+python examples/sample_inference.py --image path/to/image.jpg --weights weights/v9-c.pt
+```
 
-## Star History
+## Features
 
-[![Star History Chart](https://api.star-history.com/svg?repos=MultimediaTechLab/YOLO&type=Date)](https://star-history.com/#MultimediaTechLab/YOLO&Date)
+| Feature | Description |
+|---------|-------------|
+| **Multi-GPU Training** | Automatic DDP with `--trainer.devices=N` |
+| **Mixed Precision** | FP16/BF16 training with `--trainer.precision=16-mixed` |
+| **COCO Metrics** | mAP@0.5, mAP@0.5:0.95, per-size metrics |
+| **Checkpointing** | Automatic best/last model saving |
+| **Early Stopping** | Stop on validation plateau |
+| **Logging** | TensorBoard, WandB support |
+
+## Configuration
+
+All configuration via YAML files in `yolo/config/experiment/`:
+
+```yaml
+trainer:
+  max_epochs: 500
+  accelerator: auto
+  devices: auto
+  precision: 16-mixed
+
+model:
+  model_config: v9-c
+  num_classes: 80
+  learning_rate: 0.01
+
+data:
+  root: data/coco
+  batch_size: 16
+  image_size: [640, 640]
+```
+
+See [HOWTO](docs/HOWTO.md) for detailed documentation and [Training Guide](training-experiment/TRAINING_GUIDE.md) for a complete training example.
+
+## Metrics Configuration
+
+The training pipeline supports comprehensive COCO-style evaluation metrics. All metrics are configurable via YAML or CLI.
+
+### Available Metrics
+
+| Metric | Config Key | Default | Description |
+|--------|------------|---------|-------------|
+| **mAP** | `log_map` | ✅ | mAP @ IoU=0.50:0.95 (COCO primary metric) |
+| **mAP50** | `log_map_50` | ✅ | mAP @ IoU=0.50 |
+| **mAP75** | `log_map_75` | ✅ | mAP @ IoU=0.75 |
+| **mAP95** | `log_map_95` | ✅ | mAP @ IoU=0.95 (strict threshold) |
+| **mAP per size** | `log_map_per_size` | ✅ | mAP for small/medium/large objects |
+| **mAR100** | `log_mar_100` | ✅ | Mean Average Recall (max 100 detections) |
+| **mAR per size** | `log_mar_per_size` | ✅ | mAR for small/medium/large objects |
+
+**Size definitions (COCO standard):**
+- Small: area < 32² pixels
+- Medium: 32² ≤ area < 96² pixels
+- Large: area ≥ 96² pixels
+
+### Configuration Example
+
+```yaml
+model:
+  # Enable/disable specific metrics
+  log_map: true           # mAP @ 0.50:0.95
+  log_map_50: true        # mAP @ 0.50
+  log_map_75: true        # mAP @ 0.75
+  log_map_95: true        # mAP @ 0.95
+  log_map_per_size: true  # mAP_small, mAP_medium, mAP_large
+  log_mar_100: true       # Mean Average Recall
+  log_mar_per_size: true  # mAR_small, mAR_medium, mAR_large
+```
+
+### CLI Override Examples
+
+```shell
+# Disable per-size metrics for faster validation
+python -m yolo.cli fit --config config.yaml \
+    --model.log_map_per_size=false \
+    --model.log_mar_per_size=false
+
+# Only log essential metrics (mAP, mAP50)
+python -m yolo.cli fit --config config.yaml \
+    --model.log_map_75=false \
+    --model.log_map_95=false \
+    --model.log_map_per_size=false \
+    --model.log_mar_100=false \
+    --model.log_mar_per_size=false
+```
+
+### Validation Output
+
+After each epoch, a formatted metrics table is displayed:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Epoch 10 - Validation Metrics                 │
+├────────────┬────────────┬────────────┬────────────┬────────────┤
+│    mAP     │   mAP50    │   mAP75    │   mAP95    │   mAR100   │
+│   0.4523   │   0.6821   │   0.4912   │   0.2134   │   0.5234   │
+├────────────┼────────────┼────────────┼────────────┼────────────┤
+│   mAP_sm   │   mAP_md   │   mAP_lg   │    loss    │            │
+│   0.2134   │   0.4521   │   0.5823   │   2.3456   │            │
+├────────────┼────────────┼────────────┼────────────┼────────────┤
+│   mAR_sm   │   mAR_md   │   mAR_lg   │            │            │
+│   0.1823   │   0.4012   │   0.5412   │            │            │
+└────────────┴────────────┴────────────┴────────────┴────────────┘
+```
+
+## Model Zoo
+
+| Model | Params | FLOPs | mAP<sup>val</sup> |
+|-------|--------|-------|-------------------|
+| YOLOv9-S | 7.2M | 26.7G | 46.8% |
+| YOLOv9-M | 20.1M | 76.8G | 51.4% |
+| YOLOv9-C | 25.5M | 102.8G | 53.0% |
+| YOLOv9-E | 58.1M | 192.5G | 55.6% |
+
+## Project Structure
+
+```
+yolo/
+├── cli.py                 # LightningCLI entry point
+├── config/
+│   ├── experiment/        # Training configs (default.yaml, debug.yaml)
+│   └── model/             # Model architectures (v9-c.yaml, v9-s.yaml, ...)
+├── model/
+│   ├── yolo.py            # Model builder from DSL
+│   └── module.py          # Layer definitions
+├── training/
+│   ├── module.py          # LightningModule
+│   └── loss.py            # Loss functions
+└── data/
+    ├── datamodule.py      # LightningDataModule
+    └── transforms.py      # Data augmentations
+```
 
 ## Citations
 
-```
-@inproceedings{wang2022yolov7,
-      title={{YOLOv7}: Trainable Bag-of-Freebies Sets New State-of-the-Art for Real-Time Object Detectors},
-      author={Wang, Chien-Yao and Bochkovskiy, Alexey and Liao, Hong-Yuan Mark},
-      year={2023},
-      booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-
-}
+```bibtex
 @inproceedings{wang2024yolov9,
-      title={{YOLOv9}: Learning What You Want to Learn Using Programmable Gradient Information},
-      author={Wang, Chien-Yao and Yeh, I-Hau and Liao, Hong-Yuan Mark},
-      year={2024},
-      booktitle={Proceedings of the European Conference on Computer Vision (ECCV)},
-}
-@inproceedings{tsui2024yolord,
-      author={Tsui, Hao-Tang and Wang, Chien-Yao and Liao, Hong-Yuan Mark},
-      title={{YOLO-RD}: Introducing Relevant and Compact Explicit Knowledge to YOLO by Retriever-Dictionary},
-      booktitle={Proceedings of the International Conference on Learning Representations (ICLR)},
-      year={2025},
+    title={{YOLOv9}: Learning What You Want to Learn Using Programmable Gradient Information},
+    author={Wang, Chien-Yao and Yeh, I-Hau and Liao, Hong-Yuan Mark},
+    booktitle={Proceedings of the European Conference on Computer Vision (ECCV)},
+    year={2024}
 }
 
+@inproceedings{wang2022yolov7,
+    title={{YOLOv7}: Trainable Bag-of-Freebies Sets New State-of-the-Art for Real-Time Object Detectors},
+    author={Wang, Chien-Yao and Bochkovskiy, Alexey and Liao, Hong-Yuan Mark},
+    booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    year={2023}
+}
+
+@inproceedings{tsui2024yolord,
+    title={{YOLO-RD}: Introducing Relevant and Compact Explicit Knowledge to YOLO by Retriever-Dictionary},
+    author={Tsui, Hao-Tang and Wang, Chien-Yao and Liao, Hong-Yuan Mark},
+    booktitle={Proceedings of the International Conference on Learning Representations (ICLR)},
+    year={2025}
+}
 ```
 
-[^1]: [**YOLOv7**: Trainable Bag-of-Freebies Sets New State-of-the-Art for Real-Time Object Detectors](https://arxiv.org/abs/2207.02696)
+## License
 
-[^2]: [**YOLOv9**: Learning What You Want to Learn Using Programmable Gradient Information](https://arxiv.org/abs/2402.13616)
+This project is released under the [MIT License](LICENSE).
 
-[^3]: [**YOLO-RD**: Introducing Relevant and Compact Explicit Knowledge to YOLO by Retriever-Dictionary](https://arxiv.org/abs/2410.15346)
+---
+
+[^1]: [YOLOv7: Trainable Bag-of-Freebies Sets New State-of-the-Art for Real-Time Object Detectors](https://arxiv.org/abs/2207.02696)
+[^2]: [YOLOv9: Learning What You Want to Learn Using Programmable Gradient Information](https://arxiv.org/abs/2402.13616)
+[^3]: [YOLO-RD: Introducing Relevant and Compact Explicit Knowledge to YOLO by Retriever-Dictionary](https://arxiv.org/abs/2410.15346)

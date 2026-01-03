@@ -1,4 +1,0 @@
-.. _Module:
-
-Model Module
-============

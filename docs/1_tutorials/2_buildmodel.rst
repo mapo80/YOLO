@@ -17,46 +17,64 @@ The overall model flowchart is as follows:
 Load Model
 ~~~~~~~~~~
 
-Using `create_model`, it will automatically create the :class:`~yolo.model.yolo.YOLO` model and load the provided weights.
-
-Arguments:
-
-- **model**: :class:`~yolo.config.config.ModelConfig`
-  The model configuration.
-- **class_num**: :guilabel:`int`
-  The number of classes in the dataset, used for the YOLO's prediction head.
-- **weight_path**: :guilabel:`Path | bool`
-  The path to the model weights.
-    - If `False`, weights are not loaded.
-    - If :guilabel:`True | None`, default weights are loaded.
-    - If a `Path`, the model weights are loaded from the specified path.
+Using ``create_model``, it will automatically create the YOLO model based on the architecture config.
 
 .. code-block:: python
 
-    model = create_model(cfg.model, class_num=cfg.dataset.class_num, weight_path=cfg.weight)
+    from yolo import create_model
+
+    # Create model from architecture name
+    model = create_model("v9-c", num_classes=80)
     model = model.to(device)
 
-Deploy Model
-~~~~~~~~~~~~
+    # Load pretrained weights
+    model.load_state_dict(torch.load("weights/v9-c.pt"))
 
-In the deployment version, we will remove the auxiliary branch of the model for fast inference. If the config includes ONNX and TensorRT, it will load/compile the model to ONNX or TensorRT format after removing the auxiliary branch.
-
-.. code-block:: python
-
-    model = FastModelLoader(cfg).load_model(device)
-
-Autoload Converter
+Model Architecture
 ~~~~~~~~~~~~~~~~~~
 
-Autoload the converter based on the model type (v7 or v9).
+Model architectures are defined in YAML files under ``yolo/config/model/``:
 
-Arguments:
+- ``v9-c.yaml`` - YOLOv9-C (compact)
+- ``v9-s.yaml`` - YOLOv9-S (small)
+- ``v9-m.yaml`` - YOLOv9-M (medium)
 
-- **Model Name**: :guilabel:`str`
-  Used for choosing ``Vec2Box`` or ``Anc2Box``.
-- **Anchor Config**: The anchor configuration, used to generate the anchor grid.
-- **model**, **image_size**: Used for auto-detecting the anchor grid.
+The architecture uses a custom DSL (Domain Specific Language) to define layers:
+
+.. code-block:: yaml
+
+    model:
+      backbone:
+        - Conv:
+            args: {out_channels: 64, kernel_size: 3, stride: 2}
+        - RepNCSPELAN:
+            args: {out_channels: 256}
+            tags: B3
+
+      neck:
+        - SPPELAN:
+            args: {out_channels: 512}
+        - Concat:
+            source: [-1, B3]
+
+      head:
+        - MultiheadDetection:
+            source: [P3, P4, P5]
+            output: True
+
+Converter
+~~~~~~~~~
+
+The converter transforms model predictions to bounding boxes:
 
 .. code-block:: python
 
-    converter = create_converter(cfg.model.name, model, cfg.model.anchor, cfg.image_size, device)
+    from yolo import create_converter
+
+    converter = create_converter(
+        model_name="v9-c",
+        model=model,
+        anchor_cfg=anchor_config,
+        image_size=[640, 640],
+        device=device
+    )

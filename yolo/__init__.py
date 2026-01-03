@@ -1,33 +1,42 @@
-from yolo.config.config import Config, NMSConfig
-from yolo.model.yolo import create_model
-from yolo.tools.data_loader import AugmentationComposer, create_dataloader
-from yolo.tools.drawer import draw_bboxes
-from yolo.tools.solver import TrainModel
-from yolo.utils.bounding_box_utils import Anc2Box, Vec2Box, bbox_nms, create_converter
-from yolo.utils.deploy_utils import FastModelLoader
-from yolo.utils.logging_utils import (
-    ImageLogger,
-    YOLORichModelSummary,
-    YOLORichProgressBar,
-)
-from yolo.utils.model_utils import PostProcess
+"""
+YOLO - Official Implementation with PyTorch Lightning.
 
-all = [
+Usage:
+    # Training
+    python -m yolo.cli fit --config yolo/config/experiment/default.yaml
+
+    # Validation
+    python -m yolo.cli validate --ckpt_path=best.ckpt
+
+    # Or use the installed command
+    yolo fit --config yolo/config/experiment/default.yaml
+"""
+
+# Suppress noisy warnings from dependencies
+# Must be at the very top before any imports that might trigger them
+import warnings
+
+# pkg_resources deprecation warnings from torchmetrics
+warnings.filterwarnings("ignore", message=".*pkg_resources.*")
+warnings.filterwarnings("ignore", message=".*Deprecated call to.*")
+warnings.filterwarnings("ignore", category=UserWarning, module=".*pkg_resources.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=".*pkg_resources.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*pkg_resources.*")
+
+from yolo.config.config import ModelConfig, NMSConfig
+from yolo.model.yolo import YOLO, create_model
+from yolo.utils.bounding_box_utils import Anc2Box, Vec2Box, bbox_nms, create_converter
+
+__all__ = [
+    # Model
+    "YOLO",
     "create_model",
-    "Config",
-    "YOLORichProgressBar",
+    # Config
+    "ModelConfig",
     "NMSConfig",
-    "YOLORichModelSummary",
-    "validate_log_directory",
-    "draw_bboxes",
+    # Utilities
     "Vec2Box",
     "Anc2Box",
     "bbox_nms",
     "create_converter",
-    "AugmentationComposer",
-    "ImageLogger",
-    "create_dataloader",
-    "FastModelLoader",
-    "TrainModel",
-    "PostProcess",
 ]
