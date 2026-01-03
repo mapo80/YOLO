@@ -33,7 +33,18 @@ trainer:
         mode: max
         save_top_k: 3
         save_last: true
+        save_on_train_epoch_end: false
         filename: "simpsons-{epoch:02d}-mAP={val/mAP:.4f}"
+        auto_insert_metric_name: false
+
+    # Save best model with fixed name for easy access
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: training-experiment/checkpoints
+        monitor: val/mAP
+        mode: max
+        save_top_k: 1
+        filename: "best"
         auto_insert_metric_name: false
 
     - class_path: lightning.pytorch.callbacks.EarlyStopping

@@ -62,7 +62,98 @@ python -m yolo.cli validate --config yolo/config/experiment/default.yaml \
 ### Inference
 
 ```shell
-python examples/sample_inference.py --image path/to/image.jpg --weights weights/v9-c.pt
+# Single image
+python -m yolo.cli predict --checkpoint runs/best.ckpt --source image.jpg
+
+# Directory of images
+python -m yolo.cli predict --checkpoint runs/best.ckpt --source images/ --output results/
+
+# Custom thresholds
+python -m yolo.cli predict --checkpoint runs/best.ckpt --source image.jpg --conf 0.5 --iou 0.5
+
+# Without drawing boxes (JSON output only)
+python -m yolo.cli predict --checkpoint runs/best.ckpt --source image.jpg --no-draw --save-json
+```
+
+#### Inference Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--checkpoint, -c` | required | Path to model checkpoint (.ckpt) |
+| `--source, -s` | required | Image file or directory |
+| `--output, -o` | auto | Output path for results |
+| `--conf` | 0.25 | Confidence threshold |
+| `--iou` | 0.65 | IoU threshold for NMS |
+| `--max-det` | 300 | Maximum detections per image |
+| `--draw` | true | Draw bounding boxes on images |
+| `--no-draw` | - | Disable bounding box drawing |
+| `--save-json` | false | Save predictions to JSON |
+| `--class-names` | - | Path to JSON file with class names |
+| `--device` | auto | Device (cuda/mps/cpu) |
+| `--size` | 640 | Input image size |
+
+### Export
+
+Export trained models to ONNX format for deployment.
+
+```shell
+# Export to ONNX
+python -m yolo.cli export --checkpoint runs/best.ckpt
+
+# Export with custom output path
+python -m yolo.cli export --checkpoint runs/best.ckpt --output model.onnx
+
+# Export with FP16 (CUDA only)
+python -m yolo.cli export --checkpoint runs/best.ckpt --half
+
+# Export with dynamic batch size
+python -m yolo.cli export --checkpoint runs/best.ckpt --dynamic-batch
+
+# Export with ONNX simplification (requires onnx-simplifier)
+python -m yolo.cli export --checkpoint runs/best.ckpt --simplify
+```
+
+#### Export Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--checkpoint, -c` | required | Path to model checkpoint (.ckpt) |
+| `--output, -o` | auto | Output path (.onnx) |
+| `--size` | 640 | Input image size |
+| `--opset` | 17 | ONNX opset version |
+| `--simplify` | false | Simplify ONNX model (requires `pip install onnx-simplifier`) |
+| `--dynamic-batch` | false | Enable dynamic batch size |
+| `--half` | false | Export in FP16 (CUDA only) |
+| `--device` | auto | Device (cuda/cpu) |
+
+#### Convert to TFLite
+
+To convert ONNX to TFLite, use [onnx2tf](https://github.com/PINTO0309/onnx2tf):
+
+```shell
+# Install onnx2tf
+pip install onnx2tf tensorflow
+
+# Convert ONNX to TFLite
+onnx2tf -i model.onnx -o tflite_output
+
+# The output directory will contain:
+# - saved_model/          (TensorFlow SavedModel)
+# - model_float32.tflite  (TFLite FP32)
+# - model_float16.tflite  (TFLite FP16)
+```
+
+**Advanced onnx2tf options:**
+
+```shell
+# With INT8 quantization (requires calibration data)
+onnx2tf -i model.onnx -o tflite_output -oiqt
+
+# Specify output signature
+onnx2tf -i model.onnx -o tflite_output -ois images:1,3,640,640
+
+# For Edge TPU deployment
+onnx2tf -i model.onnx -o tflite_output -oiqt -cind images calibration_data.npy
 ```
 
 ## Features
@@ -72,7 +163,7 @@ python examples/sample_inference.py --image path/to/image.jpg --weights weights/
 | **Multi-GPU Training** | Automatic DDP with `--trainer.devices=N` |
 | **Mixed Precision** | FP16/BF16 training with `--trainer.precision=16-mixed` |
 | **COCO Metrics** | mAP@0.5, mAP@0.5:0.95, per-size metrics |
-| **Checkpointing** | Automatic best/last model saving |
+| **Checkpointing** | Automatic best/last model saving (see [Checkpoints](#checkpoints)) |
 | **Early Stopping** | Stop on validation plateau |
 | **Logging** | TensorBoard, WandB support |
 
@@ -169,6 +260,66 @@ After each epoch, a formatted metrics table is displayed:
 │   mAR_sm   │   mAR_md   │   mAR_lg   │            │            │
 │   0.1823   │   0.4012   │   0.5412   │            │            │
 └────────────┴────────────┴────────────┴────────────┴────────────┘
+```
+
+## Checkpoints
+
+During training, model checkpoints are automatically saved to the configured directory.
+
+### Saved Files
+
+| File | Description |
+|------|-------------|
+| `best.ckpt` | Best model (highest val/mAP) - always updated |
+| `last.ckpt` | Latest model (end of last epoch) |
+| `{name}-epoch=XX-mAP=X.XXXX.ckpt` | Top-K best models with metrics in filename |
+
+### Default Location
+
+```
+training-experiment/checkpoints/
+├── best.ckpt                            # Best model (use this for inference)
+├── last.ckpt                            # Latest checkpoint
+├── simpsons-epoch=05-mAP=0.4523.ckpt    # Top-3 checkpoints with metrics
+├── simpsons-epoch=08-mAP=0.4891.ckpt
+└── simpsons-epoch=12-mAP=0.5102.ckpt
+```
+
+### Configuration
+
+```yaml
+trainer:
+  callbacks:
+    # Save top-K models with detailed filenames
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/
+        monitor: val/mAP
+        mode: max
+        save_top_k: 3
+        save_last: true
+        filename: "{name}-{epoch:02d}-mAP={val/mAP:.4f}"
+
+    # Save best model with fixed name
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/
+        monitor: val/mAP
+        mode: max
+        save_top_k: 1
+        filename: "best"
+```
+
+### Resume Training
+
+```shell
+# Resume from last checkpoint
+python -m yolo.cli fit --config config.yaml \
+    --ckpt_path=checkpoints/last.ckpt
+
+# Resume from best checkpoint
+python -m yolo.cli fit --config config.yaml \
+    --ckpt_path=checkpoints/best.ckpt
 ```
 
 ## Performance
