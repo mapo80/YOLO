@@ -352,27 +352,54 @@ cp -r data/coco /dev/shm/coco
 python -m yolo.cli fit --config config.yaml --data.root=/dev/shm/coco
 ```
 
-### Why Not Image Caching?
+### Caching for Custom Loaders
 
-We intentionally don't implement built-in image caching because:
+When using expensive custom loaders (e.g., decryption), you may want to cache processed images to avoid re-processing every epoch.
 
-1. **Multi-worker isolation**: With `num_workers > 0`, each worker process has separate memory. A shared cache would require complex inter-process communication
-2. **Memory constraints**: COCO dataset (~120k images) would require 100GB+ RAM for caching
-3. **Augmentation invalidation**: Images are transformed differently each epoch, making raw image caching less useful
-4. **Disk I/O is fast**: Modern SSDs provide sufficient throughput for typical training
+**Important**: With `num_workers > 0`, each worker runs in a separate process with isolated memory. A simple in-memory cache won't work across workers.
 
-**For custom caching needs**, implement it in your [custom image loader](#custom-image-loader):
+**Solution**: Use `multiprocessing.Manager().dict()` for a shared cache:
 
 ```python
-class CachedImageLoader(ImageLoader):
-    def __init__(self, cache_size: int = 1000):
-        self.cache = LRUCache(cache_size)
+import io
+import pickle
+from multiprocessing import Manager
+from PIL import Image
+from yolo.data.loaders import ImageLoader
+
+class CachedEncryptedImageLoader(ImageLoader):
+    """Encrypted image loader with shared cache across workers."""
+
+    def __init__(self, key: str):
+        self.key = key
+        self._manager = Manager()
+        self._cache = self._manager.dict()  # Shared across all workers
 
     def __call__(self, path: str) -> Image.Image:
-        if path not in self.cache:
-            self.cache[path] = Image.open(path).convert("RGB")
-        return self.cache[path].copy()  # Return copy to avoid mutation
+        # Check cache first
+        if path in self._cache:
+            return pickle.loads(self._cache[path])
+
+        # Decrypt and load image
+        with open(path, 'rb') as f:
+            encrypted_data = f.read()
+        decrypted_data = my_decrypt(encrypted_data, self.key)
+        image = Image.open(io.BytesIO(decrypted_data)).convert("RGB")
+
+        # Store in shared cache (serialized)
+        self._cache[path] = pickle.dumps(image)
+        return image
 ```
+
+**How it works:**
+- First epoch: Each image is decrypted once and cached
+- Subsequent epochs: Images are loaded from shared cache (no decryption)
+- All workers share the same cache via inter-process communication
+
+**Trade-offs:**
+- Memory usage: Cache grows with dataset size
+- Serialization overhead: pickle adds some latency
+- Best for: Expensive operations (decryption, cloud storage, custom formats)
 
 ## Configuration
 
