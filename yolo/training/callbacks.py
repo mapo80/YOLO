@@ -17,6 +17,7 @@ class YOLOProgressBar(RichProgressBar):
     Custom progress bar that displays training metrics in a clean, compact format.
 
     Metrics shown: loss | box | cls | dfl | lr
+    Epoch display: 1-indexed (Epoch 1/100 instead of Epoch 0/99)
     """
 
     def __init__(self):
@@ -33,6 +34,16 @@ class YOLOProgressBar(RichProgressBar):
                 metrics="grey70",
             ),
         )
+
+    def _get_train_description(self, current_epoch: int) -> str:
+        """Override to display 1-indexed epochs (Epoch 1/100 instead of Epoch 0/99)."""
+        train_description = f"Epoch {current_epoch + 1}"
+        if self.trainer.max_epochs is not None:
+            train_description += f"/{self.trainer.max_epochs}"
+        if len(self.validation_description) > len(train_description):
+            # Padding to avoid flickering due to uneven lengths
+            train_description = f"{train_description:{len(self.validation_description)}}"
+        return train_description
 
     def get_metrics(
         self, trainer: L.Trainer, pl_module: L.LightningModule

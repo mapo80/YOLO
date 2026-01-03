@@ -39,8 +39,12 @@ pip install -r requirements.txt
 ### Training
 
 ```shell
-# Train with default config
+# Train with default config (from scratch)
 python -m yolo.cli fit --config yolo/config/experiment/default.yaml
+
+# Train with pretrained weights (transfer learning)
+python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
+    --model.weight_path=weights/v9-c.pt
 
 # Custom parameters
 python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
@@ -51,6 +55,67 @@ python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
 # Debug run (small dataset, few epochs)
 python -m yolo.cli fit --config yolo/config/experiment/debug.yaml
 ```
+
+### Pretrained Weights
+
+Use official YOLOv9 pretrained weights (trained on COCO, 80 classes) for transfer learning on custom datasets.
+
+#### Usage
+
+```shell
+# Auto-download weights based on model_config (recommended)
+python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
+    --model.weight_path=true
+
+# Or specify a path explicitly
+python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
+    --model.weight_path=weights/v9-c.pt
+
+# Train from scratch (no pretrained weights)
+python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
+    --model.weight_path=null
+```
+
+#### YAML Configuration
+
+```yaml
+model:
+  model_config: v9-c      # Model architecture
+  num_classes: 7          # Your custom classes
+
+  # Pretrained weights options:
+  weight_path: null       # Train from scratch
+  weight_path: true       # Auto-download v9-c.pt (based on model_config)
+  weight_path: "weights/custom.pt"  # Use specific file
+```
+
+#### Available Pretrained Weights
+
+| Model | Config Name | Weights |
+|:------|:------------|:-------:|
+| YOLOv9-T | `v9-t` | [v9-t.pt](https://github.com/WongKinYiu/yolov9/releases/download/v0.1/yolov9-t-converted.pt) |
+| YOLOv9-S | `v9-s` | [v9-s.pt](https://github.com/WongKinYiu/yolov9/releases/download/v0.1/yolov9-s-converted.pt) |
+| YOLOv9-M | `v9-m` | [v9-m.pt](https://github.com/WongKinYiu/yolov9/releases/download/v0.1/yolov9-m-converted.pt) |
+| YOLOv9-C | `v9-c` | [v9-c.pt](https://github.com/WongKinYiu/yolov9/releases/download/v0.1/yolov9-c-converted.pt) |
+| YOLOv9-E | `v9-e` | [v9-e.pt](https://github.com/WongKinYiu/yolov9/releases/download/v0.1/yolov9-e-converted.pt) |
+
+#### Transfer Learning Behavior
+
+When loading pretrained weights with a different number of classes, the system automatically:
+
+1. **Loads compatible layers** - Backbone, neck, and box regression layers are loaded from COCO weights
+2. **Skips incompatible layers** - Classification head layers (`class_conv`) are initialized randomly
+3. **Logs warnings** - Shows which layers couldn't be loaded due to shape mismatch
+
+Example output when training 7-class model with COCO (80-class) weights:
+```
+INFO     Building model: v9-t (7 classes)
+WARNING  Weight Mismatch for Layer 22: heads.0.class_conv, heads.1.class_conv, heads.2.class_conv
+WARNING  Weight Mismatch for Layer 30: heads.0.class_conv, heads.1.class_conv, heads.2.class_conv
+INFO     Loaded pretrained weights: weights/v9-t.pt
+```
+
+This is **expected behavior** - the classification layers will be trained for your custom classes while the feature extraction layers benefit from COCO pretraining.
 
 ### Validation
 
@@ -320,7 +385,74 @@ python -m yolo.cli fit --config config.yaml \
 # Resume from best checkpoint
 python -m yolo.cli fit --config config.yaml \
     --ckpt_path=checkpoints/best.ckpt
+
+# Resume and extend training to more epochs
+python -m yolo.cli fit --config config.yaml \
+    --ckpt_path=checkpoints/last.ckpt \
+    --trainer.max_epochs=500
 ```
+
+When resuming, the training state is fully restored including:
+- Model weights and optimizer state
+- Learning rate scheduler position
+- Current epoch and global step
+- Best metric values for checkpointing
+
+## Early Stopping
+
+Early stopping automatically halts training when the validation metric stops improving, preventing overfitting and saving compute time.
+
+### Configuration
+
+```yaml
+trainer:
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: val/mAP          # Metric to monitor
+        mode: max                 # 'max' for mAP (higher is better)
+        patience: 50              # Epochs to wait before stopping
+        verbose: true             # Log when stopping
+        min_delta: 0.0            # Minimum improvement threshold
+        check_on_train_epoch_end: false  # Check after validation (required for resume)
+```
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `monitor` | `val/mAP` | Metric to monitor for improvement |
+| `mode` | `max` | `max` = higher is better, `min` = lower is better |
+| `patience` | 50 | Number of epochs with no improvement before stopping |
+| `min_delta` | 0.0 | Minimum change to qualify as improvement |
+| `verbose` | true | Print message when stopping |
+| `check_on_train_epoch_end` | false | When to check (false = after validation) |
+
+### CLI Override
+
+```shell
+# Increase patience for longer training
+python -m yolo.cli fit --config config.yaml \
+    --trainer.callbacks.1.init_args.patience=100
+
+# Disable early stopping (train for full max_epochs)
+# Simply remove EarlyStopping from callbacks in your YAML config
+```
+
+### Example Output
+
+When early stopping triggers:
+```
+Epoch 45: val/mAP did not improve. Best: 0.5234 @ epoch 35
+EarlyStopping: Stopping training at epoch 85
+```
+
+### Tips
+
+- **For small datasets**: Use higher patience (30-50) as metrics can be noisy
+- **For large datasets**: Lower patience (10-20) is usually sufficient
+- **For fine-tuning**: Consider disabling early stopping to train for a fixed number of epochs
+- **Resume compatibility**: Always use `check_on_train_epoch_end: false` to avoid errors when resuming from checkpoints
 
 ## Performance
 
