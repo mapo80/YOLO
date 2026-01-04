@@ -4,11 +4,16 @@ YOLODataModule - PyTorch Lightning data module for COCO and YOLO format datasets
 Supports:
 - COCO format: Uses torchvision.datasets.CocoDetection
 - YOLO format: Uses custom YOLOFormatDataset for .txt label files
+
+The format can be configured via YAML or CLI:
+    data:
+      format: coco  # or yolo
+      ...
 """
 
 import os
 from pathlib import Path
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Literal, Optional, Union
 
 import lightning as L
 import torch
@@ -30,11 +35,13 @@ from yolo.utils.logger import logger
 
 class YOLODataModule(L.LightningDataModule):
     """
-    Lightning DataModule for YOLO training with COCO format datasets.
+    Unified Lightning DataModule for YOLO training with COCO or YOLO format datasets.
 
-    Uses torchvision.datasets.CocoDetection - the standard COCO dataset class.
+    Supports both formats via the `format` parameter:
+    - 'coco': Uses torchvision.datasets.CocoDetection (JSON annotations)
+    - 'yolo': Uses YOLOFormatDataset (.txt label files)
 
-    Expected directory structure:
+    COCO format directory structure:
         data/coco/
         ├── train2017/
         │   └── *.jpg
@@ -44,12 +51,28 @@ class YOLODataModule(L.LightningDataModule):
             ├── instances_train2017.json
             └── instances_val2017.json
 
+    YOLO format directory structure:
+        dataset/
+        ├── train/
+        │   ├── images/
+        │   │   └── *.jpg
+        │   └── labels/
+        │       └── *.txt
+        └── valid/
+            ├── images/
+            │   └── *.jpg
+            └── labels/
+                └── *.txt
+
     Args:
-        root: Root directory containing images and annotations
+        format: Dataset format - 'coco' or 'yolo' (default: 'coco')
+        root: Root directory containing images and annotations/labels
         train_images: Subdirectory for training images
         val_images: Subdirectory for validation images
-        train_ann: Path to training annotations JSON (relative to root)
-        val_ann: Path to validation annotations JSON (relative to root)
+        train_ann: Path to training annotations JSON (COCO format, relative to root)
+        val_ann: Path to validation annotations JSON (COCO format, relative to root)
+        train_labels: Path to training labels directory (YOLO format, relative to root)
+        val_labels: Path to validation labels directory (YOLO format, relative to root)
         batch_size: Batch size for training and validation
         num_workers: Number of data loading workers
         image_size: Target image size [width, height]
@@ -74,12 +97,18 @@ class YOLODataModule(L.LightningDataModule):
 
     def __init__(
         self,
+        # Dataset format
+        format: Literal["coco", "yolo"] = "coco",
         # Dataset paths
         root: str = "data/coco",
         train_images: str = "train2017",
         val_images: str = "val2017",
+        # COCO format paths
         train_ann: str = "annotations/instances_train2017.json",
         val_ann: str = "annotations/instances_val2017.json",
+        # YOLO format paths
+        train_labels: str = "train/labels",
+        val_labels: str = "valid/labels",
         # DataLoader settings
         batch_size: int = 16,
         num_workers: int = 8,
@@ -112,9 +141,15 @@ class YOLODataModule(L.LightningDataModule):
         self.save_hyperparameters(ignore=["image_loader"])
 
         self.train_dataset = None
-        self.val_dataset: Optional[CocoDetection] = None
+        self.val_dataset = None
         self._mosaic_enabled = True
         self._image_loader = image_loader
+
+        # Validate format
+        if format not in ("coco", "yolo"):
+            raise ValueError(f"Invalid format '{format}'. Must be 'coco' or 'yolo'.")
+
+        logger.info(f"Using dataset format: {format}")
 
         # Log if using custom loader
         if image_loader is not None:
@@ -124,16 +159,26 @@ class YOLODataModule(L.LightningDataModule):
         """Setup datasets for training and validation."""
         root = Path(self.hparams.root)
         image_size = tuple(self.hparams.image_size)
+        is_yolo_format = self.hparams.format == "yolo"
 
         if stage == "fit" or stage is None:
-            # Create base COCO dataset (without transforms - applied after mosaic)
-            base_train_dataset = CocoDetectionWrapper(
-                root=str(root / self.hparams.train_images),
-                annFile=str(root / self.hparams.train_ann),
-                transforms=None,  # Transforms applied after mosaic
-                image_size=image_size,
-                image_loader=self._image_loader,
-            )
+            # Create base dataset based on format
+            if is_yolo_format:
+                base_train_dataset = YOLOFormatDataset(
+                    images_dir=str(root / self.hparams.train_images),
+                    labels_dir=str(root / self.hparams.train_labels),
+                    transforms=None,  # Transforms applied after mosaic
+                    image_size=image_size,
+                    image_loader=self._image_loader,
+                )
+            else:
+                base_train_dataset = CocoDetectionWrapper(
+                    root=str(root / self.hparams.train_images),
+                    annFile=str(root / self.hparams.train_ann),
+                    transforms=None,  # Transforms applied after mosaic
+                    image_size=image_size,
+                    image_loader=self._image_loader,
+                )
 
             # Create post-mosaic transforms (applied after multi-image augmentation)
             post_transforms = create_train_transforms(
@@ -166,13 +211,22 @@ class YOLODataModule(L.LightningDataModule):
             # Validation transforms (no augmentation)
             val_transforms = create_val_transforms(image_size=image_size)
 
-            self.val_dataset = CocoDetectionWrapper(
-                root=str(root / self.hparams.val_images),
-                annFile=str(root / self.hparams.val_ann),
-                transforms=val_transforms,
-                image_size=image_size,
-                image_loader=self._image_loader,
-            )
+            if is_yolo_format:
+                self.val_dataset = YOLOFormatDataset(
+                    images_dir=str(root / self.hparams.val_images),
+                    labels_dir=str(root / self.hparams.val_labels),
+                    transforms=val_transforms,
+                    image_size=image_size,
+                    image_loader=self._image_loader,
+                )
+            else:
+                self.val_dataset = CocoDetectionWrapper(
+                    root=str(root / self.hparams.val_images),
+                    annFile=str(root / self.hparams.val_ann),
+                    transforms=val_transforms,
+                    image_size=image_size,
+                    image_loader=self._image_loader,
+                )
 
     def train_dataloader(self) -> DataLoader:
         """Create training dataloader."""
@@ -411,187 +465,3 @@ class YOLOFormatDataset(Dataset):
             image, target = self._transforms(image, target)
 
         return image, target
-
-
-class YOLOFormatDataModule(L.LightningDataModule):
-    """
-    Lightning DataModule for YOLO format datasets (.txt label files).
-
-    Expected directory structure:
-        dataset/
-        ├── train/
-        │   ├── images/
-        │   │   └── *.jpg
-        │   └── labels/
-        │       └── *.txt
-        └── valid/
-            ├── images/
-            │   └── *.jpg
-            └── labels/
-                └── *.txt
-
-    Args:
-        root: Root directory containing train/valid subdirectories
-        train_images: Path to training images (relative to root)
-        train_labels: Path to training labels (relative to root)
-        val_images: Path to validation images (relative to root)
-        val_labels: Path to validation labels (relative to root)
-        batch_size: Batch size for training and validation
-        num_workers: Number of data loading workers
-        image_size: Target image size [width, height]
-        pin_memory: Whether to pin memory for faster GPU transfer
-        image_loader: Custom image loader (optional)
-        # Augmentation parameters (same as YOLODataModule)
-    """
-
-    def __init__(
-        self,
-        # Dataset paths
-        root: str = "data/yolo",
-        train_images: str = "train/images",
-        train_labels: str = "train/labels",
-        val_images: str = "valid/images",
-        val_labels: str = "valid/labels",
-        # DataLoader settings
-        batch_size: int = 16,
-        num_workers: int = 8,
-        image_size: List[int] = [640, 640],
-        pin_memory: bool = True,
-        # Custom image loader
-        image_loader: Optional[ImageLoader] = None,
-        # Multi-image augmentation parameters
-        mosaic_prob: float = 1.0,
-        mosaic_9_prob: float = 0.0,
-        mixup_prob: float = 0.15,
-        mixup_alpha: float = 32.0,
-        cutmix_prob: float = 0.0,
-        # Single-image augmentation parameters
-        hsv_h: float = 0.015,
-        hsv_s: float = 0.7,
-        hsv_v: float = 0.4,
-        degrees: float = 0.0,
-        translate: float = 0.1,
-        scale: float = 0.9,
-        shear: float = 0.0,
-        perspective: float = 0.0,
-        flip_lr: float = 0.5,
-        flip_ud: float = 0.0,
-        # Training schedule
-        close_mosaic_epochs: int = 15,
-    ):
-        super().__init__()
-        self.save_hyperparameters(ignore=["image_loader"])
-
-        self.train_dataset = None
-        self.val_dataset = None
-        self._mosaic_enabled = True
-        self._image_loader = image_loader
-
-        if image_loader is not None:
-            logger.info(f"Using custom image loader: {type(image_loader).__name__}")
-
-    def setup(self, stage: Optional[str] = None) -> None:
-        """Setup datasets for training and validation."""
-        root = Path(self.hparams.root)
-        image_size = tuple(self.hparams.image_size)
-
-        if stage == "fit" or stage is None:
-            # Create base YOLO format dataset
-            base_train_dataset = YOLOFormatDataset(
-                images_dir=str(root / self.hparams.train_images),
-                labels_dir=str(root / self.hparams.train_labels),
-                transforms=None,  # Transforms applied after mosaic
-                image_size=image_size,
-                image_loader=self._image_loader,
-            )
-
-            # Create post-mosaic transforms
-            post_transforms = create_train_transforms(
-                image_size=image_size,
-                hsv_h=self.hparams.hsv_h,
-                hsv_s=self.hparams.hsv_s,
-                hsv_v=self.hparams.hsv_v,
-                degrees=self.hparams.degrees,
-                translate=self.hparams.translate,
-                scale=self.hparams.scale,
-                shear=self.hparams.shear,
-                perspective=self.hparams.perspective,
-                flip_lr=self.hparams.flip_lr,
-                flip_ud=self.hparams.flip_ud,
-            )
-
-            # Wrap with MosaicMixupDataset
-            self.train_dataset = MosaicMixupDataset(
-                dataset=base_train_dataset,
-                image_size=image_size,
-                mosaic_prob=self.hparams.mosaic_prob,
-                mosaic_9_prob=self.hparams.mosaic_9_prob,
-                mixup_prob=self.hparams.mixup_prob,
-                mixup_alpha=self.hparams.mixup_alpha,
-                cutmix_prob=self.hparams.cutmix_prob,
-                transforms=post_transforms,
-            )
-
-        if stage == "fit" or stage == "validate" or stage is None:
-            # Validation transforms (no augmentation)
-            val_transforms = create_val_transforms(image_size=image_size)
-
-            self.val_dataset = YOLOFormatDataset(
-                images_dir=str(root / self.hparams.val_images),
-                labels_dir=str(root / self.hparams.val_labels),
-                transforms=val_transforms,
-                image_size=image_size,
-                image_loader=self._image_loader,
-            )
-
-    def train_dataloader(self) -> DataLoader:
-        """Create training dataloader."""
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.hparams.batch_size,
-            shuffle=True,
-            num_workers=self.hparams.num_workers,
-            collate_fn=self._collate_fn,
-            pin_memory=self.hparams.pin_memory,
-            drop_last=True,
-        )
-
-    def val_dataloader(self) -> DataLoader:
-        """Create validation dataloader."""
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.hparams.batch_size,
-            shuffle=False,
-            num_workers=self.hparams.num_workers,
-            collate_fn=self._collate_fn,
-            pin_memory=self.hparams.pin_memory,
-        )
-
-    def on_train_epoch_start(self) -> None:
-        """Disable mosaic augmentation for the final N epochs."""
-        if self.hparams.close_mosaic_epochs <= 0:
-            return
-
-        epochs_remaining = self.trainer.max_epochs - self.trainer.current_epoch
-        if epochs_remaining <= self.hparams.close_mosaic_epochs:
-            if self._mosaic_enabled:
-                self._mosaic_enabled = False
-                if hasattr(self.train_dataset, "disable_mosaic"):
-                    self.train_dataset.disable_mosaic()
-                logger.info(
-                    f"Disabling mosaic/mixup augmentation for final "
-                    f"{self.hparams.close_mosaic_epochs} epochs"
-                )
-
-    @staticmethod
-    def _collate_fn(batch):
-        """Custom collate function for batching images with variable number of boxes."""
-        images = []
-        targets = []
-
-        for image, target in batch:
-            images.append(image)
-            targets.append(target)
-
-        images = torch.stack(images, dim=0)
-        return images, targets

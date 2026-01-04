@@ -1,13 +1,14 @@
 # =============================================================================
-# Simpsons Character Detection - Training Configuration
+# Simpsons Character Detection - YOLO Format Training Configuration
 # =============================================================================
 #
-# Dataset: Simpsons Character Detection (Roboflow)
+# Dataset: Simpsons Character Detection (Roboflow) - YOLO FORMAT
 # Model: YOLOv9-Tiny (v9-t)
-# Classes: 7 (bart, homer, lisa, maggie, marge, abraham, ned)
+# Classes: 7 (abraham_grampa_simpson, bart_simpson, homer_simpson, lisa_simpson,
+#             maggie_simpson, marge_simpson, ned_flanders)
 #
 # Usage:
-#   python -m yolo.cli fit --config training-experiment/simpsons-train.yaml
+#   python -m yolo.cli fit --config training-experiment/simpsons-yolo-train.yaml
 #
 # =============================================================================
 
@@ -15,35 +16,35 @@
 # Trainer Configuration
 # -----------------------------------------------------------------------------
 trainer:
-  max_epochs: 100
+  max_epochs: 5
   accelerator: auto      # Supports: cuda, mps, cpu
   devices: auto          # Auto-detect available devices
   precision: 32          # Use 32 for MPS, 16-mixed for CUDA
   gradient_clip_val: 10.0
   accumulate_grad_batches: 1
-  log_every_n_steps: 10
+  log_every_n_steps: 5
   check_val_every_n_epoch: 1
 
   # Callbacks
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: training-experiment/checkpoints
+        dirpath: training-experiment/checkpoints-yolo
         monitor: val/mAP
         mode: max
         save_top_k: 3
         save_last: true
         save_on_train_epoch_end: false
-        filename: "simpsons-epoch={epoch:02d}-mAP={val/mAP:.4f}"
+        filename: "simpsons-yolo-epoch={epoch:02d}-mAP={val/mAP:.4f}"
         auto_insert_metric_name: false
 
     - class_path: lightning.pytorch.callbacks.EarlyStopping
       init_args:
         monitor: val/mAP
         mode: max
-        patience: 30
+        patience: 20
         verbose: true
-        check_on_train_epoch_end: false  # Check after validation, not training
+        check_on_train_epoch_end: false
 
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
       init_args:
@@ -53,7 +54,7 @@ trainer:
 
     - class_path: yolo.training.callbacks.MetricsTableCallback
 
-    # EMA: Exponential Moving Average (improves final accuracy)
+    # EMA: Exponential Moving Average
     - class_path: yolo.training.callbacks.EMACallback
       init_args:
         decay: 0.9999
@@ -65,13 +66,13 @@ trainer:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger
       init_args:
         save_dir: training-experiment/
-        name: logs
+        name: logs-yolo
 
 # -----------------------------------------------------------------------------
 # Model Configuration
 # -----------------------------------------------------------------------------
 model:
-  # Architecture - Using Tiny model for faster training
+  # Architecture
   model_config: v9-t
   num_classes: 7         # Simpsons characters
   image_size: [640, 640]
@@ -81,7 +82,10 @@ model:
   learning_rate: 0.01
   momentum: 0.937
   weight_decay: 0.0005
-  adamw_betas: [0.9, 0.999]
+
+  # LR Scheduler
+  lr_scheduler: cosine
+  lr_min_factor: 0.01
 
   # Warmup
   warmup_epochs: 3
@@ -93,55 +97,56 @@ model:
   cls_loss_weight: 0.5
   dfl_loss_weight: 1.5
 
-  # Pretrained weights (null = from scratch, true = auto-download)
+  # Pretrained weights (transfer learning from COCO)
   weight_path: true
+
+  # Layer Freezing (transfer learning)
+  freeze_backbone: false
+  freeze_until_epoch: 0
 
   # NMS settings
   nms_conf_threshold: 0.25
   nms_iou_threshold: 0.65
   nms_max_detections: 300
 
-  # Metrics to log
+  # Metrics
   log_map: true
   log_map_50: true
   log_map_75: true
-  log_map_95: true
-  log_map_per_size: true
-  log_mar_100: true
-  log_mar_per_size: true
+  save_metrics_plots: true
 
 # -----------------------------------------------------------------------------
-# Data Configuration
+# Data Configuration (YOLO Format)
 # -----------------------------------------------------------------------------
 data:
   # Dataset format: 'coco' or 'yolo'
-  format: coco
+  format: yolo
 
-  # Dataset paths (COCO format)
-  root: training-experiment/simpsons-coco-std
-  train_images: images/train
-  val_images: images/val
-  train_ann: annotations/instances_train.json
-  val_ann: annotations/instances_val.json
+  # Dataset paths (YOLO format)
+  root: training-experiment/simpsons-yolo
+  train_images: train/images
+  train_labels: train/labels
+  val_images: valid/images
+  val_labels: valid/labels
 
   # DataLoader
-  batch_size: 8          # Small batch for small dataset
+  batch_size: 8
   num_workers: 4
   image_size: [640, 640]
   pin_memory: true
 
-  # === Multi-Image Augmentation (strong for small dataset) ===
-  mosaic_prob: 1.0             # Mosaic always on
-  mosaic_9_prob: 0.0           # Use 4-way mosaic
-  mixup_prob: 0.3              # Higher mixup for regularization
+  # Multi-Image Augmentation
+  mosaic_prob: 1.0
+  mosaic_9_prob: 0.0
+  mixup_prob: 0.15
   mixup_alpha: 32.0
-  cutmix_prob: 0.1             # Add cutmix for small dataset
+  cutmix_prob: 0.0
 
-  # === Single-Image Augmentation ===
+  # Single-Image Augmentation
   hsv_h: 0.015
   hsv_s: 0.7
   hsv_v: 0.4
-  degrees: 10.0                # More rotation for cartoon images
+  degrees: 10.0
   translate: 0.1
   scale: 0.9
   shear: 0.0
@@ -149,5 +154,5 @@ data:
   flip_lr: 0.5
   flip_ud: 0.0
 
-  # === Training Schedule ===
+  # Training Schedule
   close_mosaic_epochs: 10

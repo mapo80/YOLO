@@ -1,10 +1,9 @@
 # YOLO: Official Implementation of YOLOv9, YOLOv7, YOLO-RD
 
-[![Documentation Status](https://readthedocs.org/projects/yolo-docs/badge/?version=latest)](https://yolo-docs.readthedocs.io/en/latest/?badge=latest)
 ![GitHub License](https://img.shields.io/github/license/WongKinYiu/YOLO)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch Lightning](https://img.shields.io/badge/PyTorch-Lightning-792ee5.svg)](https://lightning.ai/)
-[![Tests](https://img.shields.io/badge/tests-256%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-243%20passed-brightgreen.svg)](tests/)
 
 Welcome to the official implementation of YOLOv7[^1], YOLOv9[^2], and YOLO-RD[^3].
 
@@ -56,6 +55,8 @@ python -m yolo.cli fit --config yolo/config/experiment/default.yaml \
 # Debug run (small dataset, few epochs)
 python -m yolo.cli fit --config yolo/config/experiment/debug.yaml
 ```
+
+📖 **For complete documentation**, see [HOWTO.md](HOWTO.md) - covers configuration, custom models, dataset formats, metrics, LR schedulers, layer freezing, and model export.
 
 ### Training Example
 
@@ -959,9 +960,21 @@ See [HOWTO](docs/HOWTO.md) for detailed documentation and [Training Guide](train
 
 The training pipeline supports two dataset formats: **COCO** (default) and **YOLO**.
 
+The format is configured via the `data.format` parameter in your YAML config file:
+
+```yaml
+data:
+  format: coco   # or 'yolo'
+```
+
+You can also override via CLI:
+```shell
+python -m yolo.cli fit --config config.yaml --data.format=yolo
+```
+
 #### COCO Format (Default)
 
-Standard COCO JSON annotation format. Used by default.
+Standard COCO JSON annotation format. Used by default when `format: coco` or not specified.
 
 **Directory structure:**
 ```
@@ -979,6 +992,7 @@ dataset/
 **Configuration:**
 ```yaml
 data:
+  format: coco
   root: path/to/dataset
   train_images: images/train
   val_images: images/val
@@ -988,14 +1002,9 @@ data:
   image_size: [640, 640]
 ```
 
-**Training command:**
-```shell
-python -m yolo.cli fit --config config.yaml
-```
-
 #### YOLO Format
 
-Standard YOLO `.txt` annotation format with normalized coordinates.
+Standard YOLO `.txt` annotation format with normalized coordinates. Use `format: yolo` in your config.
 
 **Directory structure:**
 ```
@@ -1023,6 +1032,7 @@ All coordinates are **normalized** (0-1 range).
 **Configuration:**
 ```yaml
 data:
+  format: yolo
   root: path/to/dataset
   train_images: train/images
   train_labels: train/labels
@@ -1030,11 +1040,6 @@ data:
   val_labels: valid/labels
   batch_size: 16
   image_size: [640, 640]
-```
-
-**Training command** (note `--data.format=yolo`):
-```shell
-python -m yolo.cli fit --config config.yaml --data.format=yolo
 ```
 
 #### Example Configurations
@@ -1052,7 +1057,7 @@ See the training experiment for complete examples:
 python -m yolo.cli fit --config training-experiment/simpsons-train.yaml
 
 # Train with YOLO format
-python -m yolo.cli fit --config training-experiment/simpsons-yolo-train.yaml --data.format=yolo
+python -m yolo.cli fit --config training-experiment/simpsons-yolo-train.yaml
 ```
 
 ## Testing
