@@ -342,13 +342,14 @@ too few values
 
 
 class TestYOLOFormatDataModule:
-    """Tests for YOLOFormatDataModule."""
+    """Tests for YOLODataModule with format='yolo'."""
 
     def test_datamodule_initialization(self):
         """Test datamodule initializes with correct parameters."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(
+            format="yolo",
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -362,12 +363,14 @@ class TestYOLOFormatDataModule:
         assert dm.hparams.batch_size == 4
         assert dm.hparams.image_size == [320, 320]
         assert dm.hparams.root == str(YOLO_DATASET_PATH)
+        assert dm.hparams.format == "yolo"
 
     def test_datamodule_setup(self):
         """Test datamodule setup creates datasets."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(
+            format="yolo",
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -386,9 +389,10 @@ class TestYOLOFormatDataModule:
 
     def test_datamodule_train_dataloader(self):
         """Test train dataloader creation."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(
+            format="yolo",
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -408,9 +412,10 @@ class TestYOLOFormatDataModule:
 
     def test_datamodule_val_dataloader(self):
         """Test validation dataloader creation."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(
+            format="yolo",
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -429,9 +434,10 @@ class TestYOLOFormatDataModule:
 
     def test_datamodule_batch_content(self):
         """Test batch has correct content and shapes."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(
+            format="yolo",
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -467,9 +473,9 @@ class TestYOLOFormatWithMosaic:
 
     def test_mosaic_integration(self):
         """Test YOLO format works with MosaicMixupDataset."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(format="yolo", 
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -492,9 +498,9 @@ class TestYOLOFormatWithMosaic:
 
     def test_mosaic_with_mixup(self):
         """Test YOLO format with both mosaic and mixup."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(format="yolo", 
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -519,7 +525,7 @@ class TestYOLOFormatWithMosaic:
 
     def test_different_augmentation_configs(self):
         """Test various augmentation parameter combinations."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
         configs = [
             {"mosaic_prob": 0.0, "mixup_prob": 0.0},
@@ -529,7 +535,7 @@ class TestYOLOFormatWithMosaic:
         ]
 
         for config in configs:
-            dm = YOLOFormatDataModule(
+            dm = YOLODataModule(format="yolo", 
                 root=str(YOLO_DATASET_PATH),
                 train_images="train/images",
                 train_labels="train/labels",
@@ -553,9 +559,9 @@ class TestYOLOFormatTransforms:
 
     def test_validation_transforms(self):
         """Test that validation transforms resize correctly."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(format="yolo", 
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -574,10 +580,10 @@ class TestYOLOFormatTransforms:
 
     def test_hsv_augmentation_params(self):
         """Test HSV augmentation parameters are used."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
         # Custom HSV params
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(format="yolo", 
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -601,9 +607,9 @@ class TestYOLOFormatTransforms:
 
     def test_geometric_augmentation_params(self):
         """Test geometric augmentation parameters."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(format="yolo", 
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -634,9 +640,9 @@ class TestYOLOFormatCollate:
 
     def test_collate_variable_box_counts(self):
         """Test collate handles images with different numbers of boxes."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(format="yolo", 
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -663,9 +669,9 @@ class TestYOLOFormatCollate:
 
     def test_collate_preserves_target_structure(self):
         """Test collate preserves target dict structure."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(format="yolo", 
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -840,9 +846,9 @@ class TestYOLOFormatDataModuleHyperparams:
 
     def test_hyperparams_saved(self):
         """Test that hyperparameters are saved correctly."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(format="yolo", 
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -863,9 +869,9 @@ class TestYOLOFormatDataModuleHyperparams:
 
     def test_close_mosaic_epochs(self):
         """Test close_mosaic_epochs parameter."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(format="yolo", 
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -886,9 +892,9 @@ class TestYOLOFormatDatasetIntegration:
 
     def test_full_epoch_iteration(self):
         """Test iterating through full dataset epoch."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(format="yolo", 
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",
@@ -920,9 +926,9 @@ class TestYOLOFormatDatasetIntegration:
 
     def test_multiple_epochs_iteration(self):
         """Test iterating multiple epochs (shuffle working)."""
-        from yolo.data.datamodule import YOLOFormatDataModule
+        from yolo.data.datamodule import YOLODataModule
 
-        dm = YOLOFormatDataModule(
+        dm = YOLODataModule(format="yolo", 
             root=str(YOLO_DATASET_PATH),
             train_images="train/images",
             train_labels="train/labels",

@@ -2,9 +2,13 @@
 YOLO Training CLI - LightningCLI entry point.
 
 Usage:
-    # Training
+    # Training (COCO format - default)
     python -m yolo.cli fit --config config/experiment/default.yaml
     python -m yolo.cli fit --config config/experiment/default.yaml --model.learning_rate=0.001
+
+    # Training (YOLO format)
+    python -m yolo.cli fit --config config/yolo-format.yaml  # with data.format=yolo in YAML
+    python -m yolo.cli fit --config config/default.yaml --data.format=yolo  # CLI override
 
     # Validation
     python -m yolo.cli validate --ckpt_path=runs/best.ckpt

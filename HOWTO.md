@@ -31,11 +31,14 @@ python -m yolo.cli validate --config yolo/config/experiment/default.yaml \
 ### Inference
 
 ```bash
-# Run inference on an image
-python examples/sample_inference.py --image path/to/image.jpg
+# Single image
+python -m yolo.cli predict --checkpoint runs/best.ckpt --source image.jpg
 
-# With custom weights
-python examples/sample_inference.py --image path/to/image.jpg --weights weights/v9-c.pt
+# Directory of images
+python -m yolo.cli predict --checkpoint runs/best.ckpt --source images/ --output results/
+
+# Custom thresholds
+python -m yolo.cli predict --checkpoint runs/best.ckpt --source image.jpg --conf 0.5 --iou 0.5
 ```
 
 ## Configuration
@@ -167,12 +170,27 @@ class CustomBlock(nn.Module):
     args: {out_channels: 256}
 ```
 
-## Dataset Format
+## Dataset Formats
 
-The pipeline uses standard **COCO format** via `torchvision.datasets.CocoDetection`.
+The pipeline supports two dataset formats: **COCO** (default) and **YOLO**.
 
-### Expected Directory Structure
+Configure the format via the `data.format` parameter:
 
+```yaml
+data:
+  format: coco   # or 'yolo'
+```
+
+Or override via CLI:
+```bash
+python -m yolo.cli fit --config config.yaml --data.format=yolo
+```
+
+### COCO Format (Default)
+
+Standard COCO JSON annotation format.
+
+**Directory structure:**
 ```
 data/coco/
 ├── train2017/
@@ -184,17 +202,76 @@ data/coco/
     └── instances_val2017.json
 ```
 
+**Configuration:**
+```yaml
+data:
+  format: coco
+  root: data/coco
+  train_images: train2017
+  val_images: val2017
+  train_ann: annotations/instances_train2017.json
+  val_ann: annotations/instances_val2017.json
+```
+
+### YOLO Format
+
+Standard YOLO `.txt` annotation format with normalized coordinates.
+
+**Directory structure:**
+```
+dataset/
+├── train/
+│   ├── images/
+│   │   └── *.jpg
+│   └── labels/
+│       └── *.txt
+└── valid/
+    ├── images/
+    │   └── *.jpg
+    └── labels/
+        └── *.txt
+```
+
+**Label file format** (one `.txt` per image, same name):
+```
+class_id x_center y_center width height
+```
+All coordinates are normalized (0-1 range).
+
+**Configuration:**
+```yaml
+data:
+  format: yolo
+  root: dataset
+  train_images: train/images
+  train_labels: train/labels
+  val_images: valid/images
+  val_labels: valid/labels
+```
+
 ### Custom Dataset
 
-For custom datasets, create COCO-format annotations:
+For custom datasets, configure the paths:
 
 ```bash
+# COCO format
 python -m yolo.cli fit \
+    --data.format=coco \
     --data.root=data/my_dataset \
     --data.train_images=images/train \
     --data.val_images=images/val \
     --data.train_ann=annotations/train.json \
     --data.val_ann=annotations/val.json \
+    --model.num_classes=10
+
+# YOLO format
+python -m yolo.cli fit \
+    --data.format=yolo \
+    --data.root=data/my_dataset \
+    --data.train_images=train/images \
+    --data.train_labels=train/labels \
+    --data.val_images=valid/images \
+    --data.val_labels=valid/labels \
     --model.num_classes=10
 ```
 
