@@ -42,6 +42,10 @@ def compute_iou_matrix(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
     if len(boxes1) == 0 or len(boxes2) == 0:
         return np.zeros((len(boxes1), len(boxes2)))
 
+    # Cast to float64 to avoid overflow with large coordinates
+    boxes1 = boxes1.astype(np.float64)
+    boxes2 = boxes2.astype(np.float64)
+
     # Compute areas
     area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
     area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
