@@ -81,6 +81,16 @@ model:
   num_classes: 7         # Simpsons characters
   image_size: [640, 640]
 
+  # Class names for metrics display
+  class_names:
+    - abraham_grampa_simpson
+    - bart_simpson
+    - homer_simpson
+    - lisa_simpson
+    - maggie_simpson
+    - marge_simpson
+    - ned_flanders
+
   # Optimizer
   optimizer: sgd
   learning_rate: 0.01

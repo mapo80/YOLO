@@ -99,6 +99,15 @@ model:
   num_classes: 80
   image_size: [640, 640]
 
+  # Class names for metrics display (optional)
+  # If not specified, class indices (0, 1, 2, ...) will be used
+  # Example for custom dataset:
+  #   class_names:
+  #     - person
+  #     - car
+  #     - bicycle
+  class_names: null
+
   # Optimizer: "sgd" (default, recommended for detection) or "adamw"
   optimizer: sgd
   learning_rate: 0.01
@@ -210,3 +219,10 @@ data:
   # === Training Schedule ===
   # Disable mosaic/mixup/cutmix for final N epochs (improves convergence)
   close_mosaic_epochs: 15
+
+  # === Dataset Caching ===
+  # Cache parsed labels for faster loading on subsequent runs
+  cache_labels: true           # true = cache labels, false = parse every time
+  cache_images: none           # "none", "ram" (keep in memory), "disk" (save as .npy)
+  cache_max_memory_gb: 8.0     # Max RAM for image caching (only used if cache_images=ram)
+  cache_refresh: false         # Force cache regeneration (delete and rebuild)

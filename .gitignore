@@ -122,6 +122,7 @@ runs
 *.pt
 *.trt
 *.onnx
+*.npy
 
 # Image files
 *.png
@@ -158,3 +159,4 @@ training-experiment/*
 
 # Lightning logs
 lightning_logs/
+validation_results/

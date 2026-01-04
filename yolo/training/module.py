@@ -77,7 +77,8 @@ class YOLOModule(L.LightningModule):
         log_recall: bool = True,
         log_f1: bool = True,
         # Class names for metrics (None = use indices)
-        class_names: Optional[Dict[int, str]] = None,
+        # Can be a dict {0: "name0", 1: "name1"} or list ["name0", "name1"]
+        class_names: Optional[Union[Dict[int, str], List[str]]] = None,
         # Metrics plots
         save_metrics_plots: bool = True,
         metrics_plots_dir: Optional[str] = None,
@@ -128,7 +129,11 @@ class YOLOModule(L.LightningModule):
 
         # Build class names dict
         if class_names is not None:
-            self._class_names = class_names
+            if isinstance(class_names, list):
+                # Convert list to dict: ["name0", "name1"] -> {0: "name0", 1: "name1"}
+                self._class_names = {i: name for i, name in enumerate(class_names)}
+            else:
+                self._class_names = class_names
         else:
             # Default: use class indices as names
             self._class_names = {i: str(i) for i in range(num_classes)}

@@ -13,7 +13,7 @@ The format can be configured via YAML or CLI:
 
 import os
 from pathlib import Path
-from typing import Callable, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 import lightning as L
 import torch
@@ -93,6 +93,10 @@ class YOLODataModule(L.LightningDataModule):
         flip_lr: Horizontal flip probability
         flip_ud: Vertical flip probability
         close_mosaic_epochs: Disable mosaic for last N epochs
+        cache_labels: Enable label caching (default: True)
+        cache_images: Image caching mode - 'none', 'ram', or 'disk' (default: 'none')
+        cache_max_memory_gb: Maximum RAM for image caching in GB (default: 8.0)
+        cache_refresh: Force cache regeneration (default: False)
     """
 
     def __init__(
@@ -135,6 +139,11 @@ class YOLODataModule(L.LightningDataModule):
         flip_ud: float = 0.0,
         # Training schedule
         close_mosaic_epochs: int = 15,
+        # Caching parameters
+        cache_labels: bool = True,
+        cache_images: Literal["none", "ram", "disk"] = "none",
+        cache_max_memory_gb: float = 8.0,
+        cache_refresh: bool = False,
     ):
         super().__init__()
         # Exclude image_loader from hyperparameters (not serializable)
@@ -170,6 +179,8 @@ class YOLODataModule(L.LightningDataModule):
                     transforms=None,  # Transforms applied after mosaic
                     image_size=image_size,
                     image_loader=self._image_loader,
+                    cache_labels=self.hparams.cache_labels,
+                    cache_refresh=self.hparams.cache_refresh,
                 )
             else:
                 base_train_dataset = CocoDetectionWrapper(
@@ -218,6 +229,8 @@ class YOLODataModule(L.LightningDataModule):
                     transforms=val_transforms,
                     image_size=image_size,
                     image_loader=self._image_loader,
+                    cache_labels=self.hparams.cache_labels,
+                    cache_refresh=self.hparams.cache_refresh,
                 )
             else:
                 self.val_dataset = CocoDetectionWrapper(
@@ -238,6 +251,7 @@ class YOLODataModule(L.LightningDataModule):
             collate_fn=self._collate_fn,
             pin_memory=self.hparams.pin_memory,
             drop_last=True,
+            persistent_workers=self.hparams.num_workers > 0,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -249,6 +263,7 @@ class YOLODataModule(L.LightningDataModule):
             num_workers=self.hparams.num_workers,
             collate_fn=self._collate_fn,
             pin_memory=self.hparams.pin_memory,
+            persistent_workers=self.hparams.num_workers > 0,
         )
 
     def on_train_epoch_start(self) -> None:
@@ -370,12 +385,17 @@ class YOLOFormatDataset(Dataset):
         └── labels/
             └── *.txt
 
+    Supports label caching to accelerate data loading on subsequent runs.
+    Labels are cached in a .cache file with hash validation.
+
     Args:
         images_dir: Directory containing images
         labels_dir: Directory containing label .txt files
         transforms: Optional transform to apply
         image_size: Target image size (width, height)
         image_loader: Optional custom image loader
+        cache_labels: Enable label caching (default: True)
+        cache_refresh: Force cache regeneration (default: False)
     """
 
     def __init__(
@@ -385,12 +405,15 @@ class YOLOFormatDataset(Dataset):
         transforms: Optional[Callable] = None,
         image_size: tuple = (640, 640),
         image_loader: Optional[ImageLoader] = None,
+        cache_labels: bool = True,
+        cache_refresh: bool = False,
     ):
         self.images_dir = Path(images_dir)
         self.labels_dir = Path(labels_dir)
         self._transforms = transforms
         self.image_size = image_size
         self._image_loader = image_loader or DefaultImageLoader()
+        self._labels_cache: Optional[List[Dict[str, Any]]] = None
 
         # Find all images
         self.image_files = []
@@ -403,21 +426,66 @@ class YOLOFormatDataset(Dataset):
 
         logger.info(f"Found {len(self.image_files)} images in {images_dir}")
 
+        # Setup label caching
+        if cache_labels:
+            self._setup_cache(refresh=cache_refresh)
+
     def __len__(self) -> int:
         return len(self.image_files)
 
-    def __getitem__(self, index: int):
-        """Get image and target at index."""
-        # Load image
-        image_path = self.image_files[index]
-        image = self._image_loader(str(image_path))
-        img_w, img_h = image.size
+    def _setup_cache(self, refresh: bool = False) -> None:
+        """
+        Setup label caching.
 
-        # Find corresponding label file
+        Loads labels from cache if valid, otherwise parses all label files
+        and saves to cache.
+
+        Args:
+            refresh: Force cache regeneration even if valid cache exists.
+        """
+        from yolo.data.cache import DatasetCache
+
+        cache = DatasetCache(self.labels_dir.parent, self.labels_dir.name)
+
+        # Get all label files for hash computation
+        label_files = list(self.labels_dir.glob("*.txt"))
+
+        # Force refresh: delete existing cache
+        if refresh:
+            cache.delete()
+
+        if cache.is_valid(label_files):
+            logger.info(f"Loading cached labels from {cache.cache_path}")
+            self._labels_cache = cache.load()["labels"]
+            logger.info(f"Loaded {len(self._labels_cache)} cached labels")
+        else:
+            logger.info(f"Parsing {len(self.image_files)} labels (first run or files changed)...")
+            self._labels_cache = []
+
+            for image_path in self.image_files:
+                label_data = self._parse_label_file(image_path)
+                self._labels_cache.append(label_data)
+
+            # Save cache
+            stats = {
+                "count": len(self._labels_cache),
+                "total_boxes": sum(len(l["boxes_norm"]) for l in self._labels_cache),
+            }
+            cache.save(self._labels_cache, label_files, stats)
+
+    def _parse_label_file(self, image_path: Path) -> Dict[str, Any]:
+        """
+        Parse a single YOLO format label file.
+
+        Args:
+            image_path: Path to the image file.
+
+        Returns:
+            Dictionary with normalized box coordinates and class labels.
+        """
         label_path = self.labels_dir / (image_path.stem + ".txt")
 
-        # Parse YOLO format labels
-        boxes = []
+        boxes_norm = []  # Normalized xywh format
         labels = []
 
         if label_path.exists():
@@ -431,22 +499,52 @@ class YOLOFormatDataset(Dataset):
                         width = float(parts[3])
                         height = float(parts[4])
 
-                        # Convert from normalized xywh to xyxy (pixel coordinates)
-                        x1 = (x_center - width / 2) * img_w
-                        y1 = (y_center - height / 2) * img_h
-                        x2 = (x_center + width / 2) * img_w
-                        y2 = (y_center + height / 2) * img_h
-
-                        # Clip to image bounds
-                        x1 = max(0, min(x1, img_w))
-                        y1 = max(0, min(y1, img_h))
-                        x2 = max(0, min(x2, img_w))
-                        y2 = max(0, min(y2, img_h))
-
-                        # Only add valid boxes
-                        if x2 > x1 and y2 > y1:
-                            boxes.append([x1, y1, x2, y2])
+                        # Validate normalized coordinates
+                        if 0 <= x_center <= 1 and 0 <= y_center <= 1 and width > 0 and height > 0:
+                            boxes_norm.append([x_center, y_center, width, height])
                             labels.append(class_id)
+
+        return {"boxes_norm": boxes_norm, "labels": labels}
+
+    def __getitem__(self, index: int):
+        """Get image and target at index."""
+        # Load image
+        image_path = self.image_files[index]
+        image = self._image_loader(str(image_path))
+        img_w, img_h = image.size
+
+        # Get labels (from cache or parse on-the-fly)
+        if self._labels_cache is not None:
+            cached = self._labels_cache[index]
+            boxes_norm = cached["boxes_norm"]
+            label_ids = cached["labels"]
+        else:
+            # Parse on-the-fly (no caching)
+            parsed = self._parse_label_file(image_path)
+            boxes_norm = parsed["boxes_norm"]
+            label_ids = parsed["labels"]
+
+        # Convert normalized xywh to xyxy pixel coordinates
+        boxes = []
+        labels = []
+
+        for (x_center, y_center, width, height), class_id in zip(boxes_norm, label_ids):
+            # Convert from normalized xywh to xyxy (pixel coordinates)
+            x1 = (x_center - width / 2) * img_w
+            y1 = (y_center - height / 2) * img_h
+            x2 = (x_center + width / 2) * img_w
+            y2 = (y_center + height / 2) * img_h
+
+            # Clip to image bounds
+            x1 = max(0, min(x1, img_w))
+            y1 = max(0, min(y1, img_h))
+            x2 = max(0, min(x2, img_w))
+            y2 = max(0, min(y2, img_h))
+
+            # Only add valid boxes
+            if x2 > x1 and y2 > y1:
+                boxes.append([x1, y1, x2, y2])
+                labels.append(class_id)
 
         # Create target dict
         if boxes:
