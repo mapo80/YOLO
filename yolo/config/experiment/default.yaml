@@ -136,14 +136,6 @@ model:
   nms_iou_threshold: 0.65
   nms_max_detections: 300
 
-  # Metrics to log
-  log_map: true
-  log_map_50: true
-  log_map_75: true
-  log_precision: true
-  log_recall: true
-  log_f1: true
-
   # Metrics plots
   # Automatically saves PR, F1, P, R curves and confusion matrix
   save_metrics_plots: true
