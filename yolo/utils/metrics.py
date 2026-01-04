@@ -889,15 +889,25 @@ class DetMetrics:
         if not self._predictions:
             return empty_result
 
+        from yolo.utils.logger import logger
+        import time as _time
+
+        logger.debug(f"[Metrics] Processing {len(self._predictions)} predictions...")
+
         # Compute COCO metrics
         coco_stats = np.zeros(12)  # 12 standard COCO metrics
         try:
+            _t0 = _time.time()
             coco_gt = self.coco_converter.get_coco_gt()
             coco_dt = self.coco_converter.get_coco_dt(coco_gt)
+            logger.debug(f"[Metrics] COCO conversion done in {_time.time() - _t0:.2f}s")
 
+            _t0 = _time.time()
             coco_eval = COCOeval(coco_gt, coco_dt, 'bbox')
             coco_eval.evaluate()
             coco_eval.accumulate()
+            logger.debug(f"[Metrics] COCO eval done in {_time.time() - _t0:.2f}s")
+
             # Suppress verbose COCO output - metrics are shown in EvalDashboard
             import io
             import sys
@@ -911,8 +921,8 @@ class DetMetrics:
             # Extract all 12 metrics from COCO evaluation
             # stats order: AP, AP50, AP75, APs, APm, APl, AR1, AR10, AR100, ARs, ARm, ARl
             coco_stats = coco_eval.stats
-        except Exception:
-            pass  # Keep zeros
+        except Exception as e:
+            logger.debug(f"[Metrics] COCO eval failed: {e}")
 
         # COCO standard metrics
         map_val = float(coco_stats[0])    # AP @ IoU=0.50:0.95
@@ -929,6 +939,8 @@ class DetMetrics:
         ar_large = float(coco_stats[11])  # AR large
 
         # Compute precision-recall curves and per-class metrics
+        logger.debug("[Metrics] Computing precision-recall curves...")
+        _t0 = _time.time()
         precision_curves, recall_curves, f1_curves, conf_axis, ap_values = \
             create_precision_recall_curves(
                 self._predictions,
@@ -936,6 +948,7 @@ class DetMetrics:
                 self.nc,
                 iou_threshold=0.5,
             )
+        logger.debug(f"[Metrics] PR curves done in {_time.time() - _t0:.2f}s")
 
         # Find best F1 threshold (smoothed)
         mean_f1 = gaussian_smooth(f1_curves.mean(axis=0), sigma=3)
