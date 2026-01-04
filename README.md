@@ -32,9 +32,14 @@ The goal: **make training YOLO as reliable and straightforward as the model itse
 git clone https://github.com/WongKinYiu/YOLO.git
 cd YOLO
 pip install -r requirements.txt
+
+# (Recommended) install as a package to enable the `yolo` CLI entrypoint
+pip install -e .  # add --no-deps if you already ran pip install -r requirements.txt
 ```
 
 ## Quick Start
+
+All CLI commands can be run either with `python -m yolo.cli ...` (from this repo) or with the installed `yolo ...` entrypoint.
 
 ### Training
 
@@ -183,9 +188,14 @@ python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml \
 | `--batch-size` | 16 | Batch size for validation |
 | `--conf` | 0.001 | Confidence threshold |
 | `--iou` | 0.6 | IoU threshold for NMS |
+| `--size` | 640 | Input image size |
+| `--device` | auto | Device (cuda/mps/cpu) |
 | `--output, -o` | validation_results | Output directory |
 | `--save-plots` | true | Save metric plots (PR curve, confusion matrix) |
+| `--no-plots` | - | Disable metric plots |
 | `--save-json` | true | Save results as JSON |
+| `--no-json` | - | Disable JSON output |
+| `--workers` | 4 | Number of data loading workers |
 
 **Output**: Eval dashboard with comprehensive metrics, per-class analysis, confusion matrix, PR/F1 curves.
 
@@ -755,6 +765,13 @@ This implementation includes advanced training techniques that improve model acc
 
 ### Data Augmentation
 
+Augmentations are applied in two stages:
+
+1. **Multi-image** (dataset wrapper): Mosaic (4-way/9-way), optional MixUp on top of Mosaic, optional CutMix on single images.
+2. **Single-image** (transform pipeline): `LetterBox` → `RandomPerspective` → `RandomHSV` → `RandomFlip`.
+
+All parameters live under `data:` and can be overridden via CLI (`--data.*=...`).
+
 #### Mosaic Augmentation
 
 Mosaic combines multiple images into a single training sample, improving detection of small objects and increasing batch diversity.
@@ -786,7 +803,7 @@ python -m yolo.cli fit --config config.yaml \
 
 #### MixUp Augmentation
 
-MixUp blends two images together with a random weight, creating soft labels that improve model generalization.
+MixUp blends two images together with a random weight; for detection, boxes/labels from both images are kept. In this implementation, MixUp is applied only when Mosaic is selected for the sample (it blends two mosaic images).
 
 **Configuration:**
 
@@ -808,7 +825,7 @@ python -m yolo.cli fit --config config.yaml --data.mixup_prob=0.3
 
 #### CutMix Augmentation
 
-CutMix cuts a rectangular region from one image and pastes it onto another, combining their labels.
+CutMix cuts a rectangular region from one image and pastes it onto another, combining their labels. In this implementation, CutMix is applied only when Mosaic is not selected for the sample.
 
 **Configuration:**
 
@@ -827,6 +844,8 @@ python -m yolo.cli fit --config config.yaml --data.cutmix_prob=0.1
 #### RandomPerspective
 
 Applies geometric transformations including rotation, translation, scale, shear, and perspective distortion.
+
+Internally it builds a 3×3 homography by composing center shift → (optional) perspective → rotation/scale → (optional) shear → translation, then warps the image with OpenCV. Boxes are filtered by minimum area/visibility after the transform.
 
 **Configuration:**
 
@@ -853,6 +872,45 @@ python -m yolo.cli fit --config config.yaml \
     --data.shear=0 --data.perspective=0
 ```
 
+#### RandomHSV
+
+Applies random hue/saturation/value shifts (color augmentation).
+
+**Configuration:**
+
+```yaml
+data:
+  hsv_h: 0.015          # Hue shift (0.0 = disable)
+  hsv_s: 0.7            # Saturation gain (0.0 = disable)
+  hsv_v: 0.4            # Value/brightness gain (0.0 = disable)
+```
+
+**CLI override:**
+
+```shell
+# Disable HSV augmentation
+python -m yolo.cli fit --config config.yaml --data.hsv_h=0 --data.hsv_s=0 --data.hsv_v=0
+```
+
+#### RandomFlip
+
+Applies random horizontal/vertical flips and updates bounding boxes accordingly.
+
+**Configuration:**
+
+```yaml
+data:
+  flip_lr: 0.5          # Horizontal flip probability
+  flip_ud: 0.0          # Vertical flip probability
+```
+
+**CLI override:**
+
+```shell
+# Disable flips
+python -m yolo.cli fit --config config.yaml --data.flip_lr=0 --data.flip_ud=0
+```
+
 ### Close Mosaic
 
 Disables mosaic, mixup, and cutmix augmentations for the final N epochs of training. This allows the model to fine-tune on "clean" single images, improving convergence.
@@ -873,6 +931,52 @@ python -m yolo.cli fit --config config.yaml --data.close_mosaic_epochs=0
 # Use close_mosaic for last 20 epochs
 python -m yolo.cli fit --config config.yaml --data.close_mosaic_epochs=20
 ```
+
+### Dataset Caching
+
+Accelerate data loading with label caching and optional image caching. Labels are parsed once and cached; subsequent runs load instantly. The cache auto-invalidates when source files change.
+
+**Label Caching (Default: Enabled)**
+
+Labels are parsed from `.txt` files once and saved to a `.cache` file. On subsequent runs, labels load from cache instead of re-parsing all files. The cache validates against file modification times and sizes.
+
+**Image Caching (Optional)**
+
+| Mode | Description |
+|------|-------------|
+| `none` | No image caching (default) |
+| `ram` | Load all images to RAM (fastest, high memory usage) |
+| `disk` | Save decoded images as `.npy` files (moderate speedup, persistent) |
+
+**Configuration:**
+
+```yaml
+data:
+  cache_labels: true           # Enable label caching (default: true)
+  cache_images: none           # "none", "ram", or "disk"
+  cache_max_memory_gb: 8.0     # Max RAM for image caching
+  cache_refresh: false         # Force cache regeneration
+```
+
+**CLI override:**
+
+```shell
+# Disable label caching
+python -m yolo.cli fit --config config.yaml --data.cache_labels=false
+
+# Enable RAM image caching
+python -m yolo.cli fit --config config.yaml --data.cache_images=ram
+
+# Force cache regeneration (delete and rebuild)
+python -m yolo.cli fit --config config.yaml --data.cache_refresh=true
+```
+
+**Force Cache Refresh:**
+
+Use `--data.cache_refresh=true` to force deletion and regeneration of the cache. Useful when:
+- Dataset files were modified but timestamps didn't change
+- Cache file is corrupted
+- Switching between different preprocessing configurations
 
 ### Exponential Moving Average (EMA)
 

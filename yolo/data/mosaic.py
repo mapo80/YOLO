@@ -38,6 +38,7 @@ class MosaicMixupDataset(Dataset):
         cutmix_beta: Beta distribution parameter for cutmix area (default: 1.0)
         transforms: Post-augmentation transforms to apply
         fill_value: Fill value for padding (default: 114 gray)
+        buffer_size: Size of LRU buffer for caching recently accessed images (default: 64)
     """
 
     def __init__(
@@ -52,6 +53,7 @@ class MosaicMixupDataset(Dataset):
         cutmix_beta: float = 1.0,
         transforms: Optional[Callable] = None,
         fill_value: int = 114,
+        buffer_size: int = 64,
     ):
         self.dataset = dataset
         self.image_size = image_size
@@ -66,6 +68,15 @@ class MosaicMixupDataset(Dataset):
         self._mosaic_enabled = True
         # Border for mosaic: allows center to be outside image bounds
         self.border = (-image_size[0] // 2, -image_size[1] // 2)
+
+        # LRU buffer for caching recently accessed images
+        # Improves performance for mosaic where images may be reused
+        self._buffer_size = buffer_size
+        self._buffer = None
+        if buffer_size > 0:
+            from yolo.data.cache import LRUImageBuffer
+
+            self._buffer = LRUImageBuffer(buffer_size)
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -99,8 +110,31 @@ class MosaicMixupDataset(Dataset):
     def _load_image_target(
         self, index: int
     ) -> Tuple[Image.Image, Dict[str, Tensor]]:
-        """Load a single image and target from base dataset."""
-        return self.dataset[index]
+        """
+        Load a single image and target from base dataset.
+
+        Uses LRU buffer to cache recently accessed images for faster
+        mosaic operations when the same images are reused.
+        """
+        # Check buffer first
+        if self._buffer is not None:
+            cached = self._buffer.get(index)
+            if cached is not None:
+                # Return deep copy to prevent modifications
+                img, target = cached
+                return img.copy(), {
+                    "boxes": target["boxes"].clone(),
+                    "labels": target["labels"].clone(),
+                }
+
+        # Load from dataset
+        img, target = self.dataset[index]
+
+        # Store in buffer
+        if self._buffer is not None:
+            self._buffer.put(index, (img, target))
+
+        return img, target
 
     def _load_and_resize(
         self, index: int, target_size: Tuple[int, int]
