@@ -24,9 +24,17 @@ class YOLOTargetTransform:
     Converts from COCO format (list of annotation dicts) to:
         {
             "boxes": Tensor[N, 4] in xyxy format,
-            "labels": Tensor[N] class indices
+            "labels": Tensor[N] class indices (0-indexed)
         }
+
+    Args:
+        category_id_to_idx: Optional mapping from COCO category_id to 0-indexed class index.
+                           If None, category_id values are used directly (assumes 0-indexed).
+                           For standard COCO datasets (1-indexed), pass a mapping like {1:0, 2:1, ...}.
     """
+
+    def __init__(self, category_id_to_idx: Optional[Dict[int, int]] = None):
+        self.category_id_to_idx = category_id_to_idx
 
     def __call__(
         self,
@@ -62,8 +70,17 @@ class YOLOTargetTransform:
             # Convert to xyxy format
             x1, y1, x2, y2 = x, y, x + w, y + h
 
+            # Map category_id to class index
+            category_id = ann["category_id"]
+            if self.category_id_to_idx is not None:
+                if category_id not in self.category_id_to_idx:
+                    continue  # Skip unknown categories
+                class_idx = self.category_id_to_idx[category_id]
+            else:
+                class_idx = category_id
+
             boxes.append([x1, y1, x2, y2])
-            labels.append(ann["category_id"])
+            labels.append(class_idx)
 
         if len(boxes) == 0:
             return {
