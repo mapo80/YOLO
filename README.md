@@ -3,7 +3,7 @@
 ![GitHub License](https://img.shields.io/github/license/WongKinYiu/YOLO)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch Lightning](https://img.shields.io/badge/PyTorch-Lightning-792ee5.svg)](https://lightning.ai/)
-[![Tests](https://img.shields.io/badge/tests-257%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-289%20passed-brightgreen.svg)](tests/)
 
 Welcome to the official implementation of YOLOv7[^1], YOLOv9[^2], and YOLO-RD[^3].
 
