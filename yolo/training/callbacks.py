@@ -747,6 +747,25 @@ class TrainingSummaryCallback(Callback):
         console.print(table)
         console.print()
 
+        # Progress bar legend with target values
+        legend = Table(
+            title="Progress Bar Metrics",
+            title_style="bold cyan",
+            box=box.SIMPLE,
+            padding=(0, 1),
+            expand=False,
+        )
+        legend.add_column("Metric", style="bold white", width=8)
+        legend.add_column("Description", style="dim", width=28)
+        legend.add_column("Target", style="green", width=18)
+        legend.add_row("loss", "Total loss (box + cls + dfl)", "< 3.0 (converged)")
+        legend.add_row("box", "Bounding box regression", "< 0.5 (good fit)")
+        legend.add_row("cls", "Classification loss", "< 1.0 (learned)")
+        legend.add_row("dfl", "Distribution focal loss", "< 1.0 (stable)")
+        legend.add_row("lr", "Learning rate", "Decays over epochs")
+        console.print(legend)
+        console.print()
+
     def _get_checkpoint_dir(self, trainer: L.Trainer) -> Optional[str]:
         """Get checkpoint directory from ModelCheckpoint callback."""
         for cb in trainer.callbacks:
