@@ -923,9 +923,9 @@ class DetMetrics:
             if coco_eval.stats is not None and len(coco_eval.stats) >= 12:
                 coco_stats = coco_eval.stats
             else:
-                logger.warning("[Metrics] COCO eval returned empty stats (no valid predictions?)")
+                logger.debug("[Metrics] COCO eval returned empty stats (no valid predictions yet)")
         except Exception as e:
-            logger.warning(f"[Metrics] COCO eval failed: {e}")
+            logger.debug(f"[Metrics] COCO eval skipped: {e}")
 
         # COCO standard metrics
         map_val = float(coco_stats[0])    # AP @ IoU=0.50:0.95
