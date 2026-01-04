@@ -479,43 +479,6 @@ python -m yolo.cli export --checkpoint best.ckpt --format saved_model
 | `--half` | FP16 precision (ONNX with CUDA) | False |
 | `--quantization` | TFLite quantization (fp32, fp16, int8) | fp32 |
 
-## Benchmark
-
-Measure model inference performance across different formats and configurations:
-
-```bash
-# Benchmark PyTorch model
-python -m yolo.cli benchmark --checkpoint best.ckpt
-
-# Benchmark ONNX model
-python -m yolo.cli benchmark --model model.onnx
-
-# Benchmark multiple formats
-python -m yolo.cli benchmark --checkpoint best.ckpt --formats pytorch,onnx
-
-# Benchmark with multiple batch sizes
-python -m yolo.cli benchmark --checkpoint best.ckpt --batch-sizes 1,8,16
-
-# Full benchmark with JSON output
-python -m yolo.cli benchmark --checkpoint best.ckpt \
-    --formats pytorch,onnx,tflite --batch-sizes 1,8 \
-    --warmup 20 --runs 200 --output benchmark.json
-```
-
-### Benchmark Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--checkpoint` | Path to PyTorch checkpoint | - |
-| `--model` | Path to exported model (ONNX/TFLite) | - |
-| `--formats` | Comma-separated formats to benchmark | pytorch |
-| `--batch-sizes` | Comma-separated batch sizes to test | 1 |
-| `--size` | Input image size | 640 |
-| `--warmup` | Number of warmup iterations | 10 |
-| `--runs` | Number of benchmark runs | 100 |
-| `--device` | Device (cuda/mps/cpu) | auto |
-| `--output` | Output path for JSON results | - |
-
 ## Project Structure
 
 ```

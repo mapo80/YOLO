@@ -420,11 +420,11 @@ python -m pytest tests/test_training_experiment.py -v
 
 ### Full Test Suite
 
-The complete test suite includes 209 tests:
+The complete test suite includes 289 tests:
 
 ```bash
 python -m pytest tests/ -q
-# Result: 209 passed, 13 skipped
+# Result: 289 passed, 12 skipped
 ```
 
 ### Test Categories

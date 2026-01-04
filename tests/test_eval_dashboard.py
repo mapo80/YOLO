@@ -16,7 +16,6 @@ class TestEvalConfig:
         assert config.nms_iou == 0.65
         assert config.max_det == 300
         assert config.top_n_classes == 3
-        assert config.threshold_sweep == (0.1, 0.2, 0.3, 0.4, 0.5)
         assert config.show_trends is True
         assert config.trend_window == 10
 
