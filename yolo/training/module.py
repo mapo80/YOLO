@@ -263,24 +263,23 @@ class YOLOModule(L.LightningModule):
         conf_prod = getattr(self.hparams, "nms_conf_threshold", 0.25)
 
         # Process metrics and generate plots (with extended COCO metrics)
-        from yolo.utils.logger import logger
         import time as _time
 
-        logger.info("[Validation] Processing metrics...")
+        logger.debug("[Validation] Processing metrics...")
         _t0 = _time.time()
         metrics = self._det_metrics.process(
             save_dir=save_dir,
             plot=self.hparams.save_metrics_plots,
             conf_prod=conf_prod,
         )
-        logger.info(f"[Validation] Metrics processed in {_time.time() - _t0:.2f}s")
+        logger.debug(f"[Validation] Metrics processed in {_time.time() - _t0:.2f}s")
 
         # Store extended metrics for EvalDashboardCallback
         self._last_validation_metrics = metrics
 
         # Log all validation metrics to loggers (TensorBoard, etc.)
         # Note: val/mAP is required by ModelCheckpoint and EarlyStopping callbacks
-        logger.info("[Validation] Logging metrics to TensorBoard...")
+        logger.debug("[Validation] Logging metrics to TensorBoard...")
         _t0 = _time.time()
         log_dict = {
             "val/mAP": metrics["map"],
@@ -296,13 +295,15 @@ class YOLOModule(L.LightningModule):
             log_dict["val/AR@100"] = metrics["ar_100"]
 
         # Log to loggers (TensorBoard, etc.)
-        self.log_dict(log_dict, prog_bar=False, sync_dist=True)
-        logger.info(f"[Validation] Logging done in {_time.time() - _t0:.2f}s")
+        # Note: sync_dist=False to avoid blocking on single GPU
+        logger.debug("[Validation] Calling log_dict...")
+        self.log_dict(log_dict, prog_bar=False, sync_dist=False)
+        logger.debug(f"[Validation] log_dict done in {_time.time() - _t0:.2f}s")
 
         # Reset metrics for next epoch
-        logger.info("[Validation] Resetting metrics...")
+        logger.debug("[Validation] Resetting metrics...")
         self._det_metrics.reset()
-        logger.info("[Validation] on_validation_epoch_end complete")
+        logger.debug("[Validation] on_validation_epoch_end complete")
 
     def configure_optimizers(self):
         """Configure optimizer and learning rate scheduler."""
