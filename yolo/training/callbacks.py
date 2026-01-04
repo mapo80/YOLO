@@ -854,7 +854,6 @@ class ClassNamesCallback(Callback):
         # Update detection metrics if available
         if hasattr(pl_module, "_det_metrics") and pl_module._det_metrics is not None:
             pl_module._det_metrics.names = class_names
-            logger.debug(f"Set {len(class_names)} class names in detection metrics")
 
 
 class EvalDashboardCallback(Callback):
