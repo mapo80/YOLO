@@ -1,24 +1,26 @@
-# YOLO: Official Implementation of YOLOv9, YOLOv7, YOLO-RD
+# YOLO: Training CLI for YOLOv9
 
 ![GitHub License](https://img.shields.io/github/license/WongKinYiu/YOLO)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch Lightning](https://img.shields.io/badge/PyTorch-Lightning-792ee5.svg)](https://lightning.ai/)
 [![Tests](https://img.shields.io/badge/tests-289%20passed-brightgreen.svg)](tests/)
 
-Welcome to the official implementation of YOLOv7[^1], YOLOv9[^2], and YOLO-RD[^3].
+> **Fork Notice**: This is a fork of [WongKinYiu/YOLO](https://github.com/WongKinYiu/YOLO) with extensive additions for production training.
 
-## Why This Implementation?
+This repository extends the official YOLOv7[^1], YOLOv9[^2], and YOLO-RD[^3] implementation with a **robust CLI for training, validation, and export**.
 
-**A world-class model deserves a world-class training pipeline.**
+## What's Different From the Original?
 
-The original YOLO implementations focused on the model architecture and research contributions. This repository provides a **production-ready training pipeline** built on modern best practices:
+The original repository focuses on model architecture and research contributions. This fork adds:
 
-- **PyTorch Lightning** - Clean, scalable training with automatic mixed precision, multi-GPU support, and comprehensive logging
-- **Robust & Reproducible** - Deterministic training, proper validation metrics (COCO mAP), and checkpoint management
-- **Simple Configuration** - YAML-based configs with CLI overrides, no complex framework dependencies
-- **Standard Data Format** - Native COCO dataset support via `torchvision.datasets.CocoDetection`
+- **Complete training CLI** with YAML configuration and command-line overrides
+- **Data augmentation suite** - Mosaic 4/9, MixUp, CutMix, RandomPerspective, HSV
+- **Multiple dataset formats** - COCO JSON and YOLO TXT with caching
+- **Comprehensive metrics** - Full COCO evaluation, confusion matrix, PR curves
+- **Rich monitoring** - Progress bars, eval dashboard, TensorBoard integration
+- **Model export** - ONNX, TFLite (FP32/FP16/INT8), SavedModel
 
-The goal: **make training YOLO as reliable and straightforward as the model itself is powerful**.
+All additions are built on **PyTorch Lightning** for clean, scalable training.
 
 ## Features
 
@@ -96,7 +98,7 @@ The goal: **make training YOLO as reliable and straightforward as the model itse
 ## Installation
 
 ```shell
-git clone https://github.com/WongKinYiu/YOLO.git
+git clone https://github.com/mapo80/YOLO.git
 cd YOLO
 pip install -r requirements.txt
 
