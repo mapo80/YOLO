@@ -241,6 +241,22 @@ class YOLODataModule(L.LightningDataModule):
                     image_loader=self._image_loader,
                 )
 
+            # Extract class names from dataset
+            self._extract_class_names(is_yolo_format)
+
+    def _extract_class_names(self, is_yolo_format: bool) -> None:
+        """Extract class names from dataset for metrics display."""
+        from yolo.data.class_names import load_class_names
+
+        data_format = "yolo" if is_yolo_format else "coco"
+        ann_file = None if is_yolo_format else self.hparams.val_ann
+
+        self.class_names = load_class_names(
+            data_root=self.hparams.root,
+            data_format=data_format,
+            ann_file=ann_file,
+        )
+
     def train_dataloader(self) -> DataLoader:
         """Create training dataloader."""
         return DataLoader(
