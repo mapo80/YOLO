@@ -115,6 +115,7 @@ runs
 /data
 /datasets
 */data
+!yolo/data/
 
 # Datasets and model checkpoints
 *.ckpt
