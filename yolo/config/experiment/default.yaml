@@ -69,7 +69,11 @@ trainer:
 
     - class_path: yolo.training.callbacks.YOLOProgressBar
 
-    - class_path: yolo.training.callbacks.MetricsTableCallback
+    - class_path: yolo.training.callbacks.EvalDashboardCallback
+      init_args:
+        conf_prod: 0.25        # Production confidence threshold
+        show_trends: true      # Show sparkline trends
+        top_n_classes: 3       # N classes for TOP/WORST
 
     # EMA: Exponential Moving Average of model weights
     # Improves final model accuracy by averaging weights over training

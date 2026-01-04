@@ -14,6 +14,9 @@ Usage:
     python -m yolo.cli validate --checkpoint best.ckpt --data.root dataset/ --data.format yolo
     python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml
 
+    # Validation with benchmark (latency/memory)
+    python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml --benchmark
+
     # Inference
     python -m yolo.cli predict --checkpoint best.ckpt --source image.jpg
     python -m yolo.cli predict --checkpoint best.ckpt --source images/ --output results/
@@ -21,10 +24,6 @@ Usage:
     # Export
     python -m yolo.cli export --checkpoint best.ckpt --format onnx
     python -m yolo.cli export --checkpoint best.ckpt --format onnx --half --simplify
-
-    # Benchmark
-    python -m yolo.cli benchmark --checkpoint best.ckpt
-    python -m yolo.cli benchmark --checkpoint best.ckpt --formats pytorch,onnx --batch-sizes 1,8
 """
 
 import argparse
@@ -58,14 +57,14 @@ Examples:
   # Validate checkpoint on a dataset (standalone metrics)
   yolo validate --checkpoint runs/best.ckpt --config config.yaml
 
+  # Validate with benchmark (latency/memory)
+  yolo validate --checkpoint runs/best.ckpt --config config.yaml --benchmark
+
   # Inference on an image
   yolo predict --checkpoint runs/best.ckpt --source image.jpg --no-draw --save-json
 
   # Export checkpoint
   yolo export --checkpoint runs/best.ckpt --format onnx --simplify
-
-  # Benchmark
-  yolo benchmark --checkpoint runs/best.ckpt --formats pytorch,onnx --batch-sizes 1,8
         """,
     )
     subparsers = parser.add_subparsers(title="commands", metavar="<command>")
@@ -74,8 +73,7 @@ Examples:
     subparsers.add_parser("test", help="Test a model (LightningCLI).")
     subparsers.add_parser("predict", help="Run inference on images.")
     subparsers.add_parser("export", help="Export a checkpoint to ONNX/TFLite/SavedModel.")
-    subparsers.add_parser("validate", help="Standalone validation with detection metrics.")
-    subparsers.add_parser("benchmark", help="Benchmark inference performance.")
+    subparsers.add_parser("validate", help="Standalone validation with detection metrics and optional benchmark.")
 
     return parser
 
@@ -451,7 +449,7 @@ Examples:
 def validate_main(argv: Optional[List[str]] = None) -> int:
     """Run standalone validation on a trained model."""
     parser = argparse.ArgumentParser(
-        description="YOLO Validate - Run validation on a trained model",
+        description="YOLO Validate - Run validation on a trained model with eval dashboard",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -471,6 +469,13 @@ Examples:
   # Save plots and JSON
   python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml \\
       --output results/ --save-plots --save-json
+
+  # Validate with benchmark (latency/memory)
+  python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml --benchmark
+
+  # Benchmark with custom warmup/runs
+  python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml \\
+      --benchmark --benchmark-warmup 20 --benchmark-runs 200
         """,
     )
     parser.add_argument(
@@ -593,6 +598,31 @@ Examples:
         default=4,
         help="Number of data loading workers (default: 4)",
     )
+    # Production confidence threshold for operative metrics
+    parser.add_argument(
+        "--conf-prod",
+        type=float,
+        default=0.25,
+        help="Production confidence threshold for operative metrics (default: 0.25)",
+    )
+    # Benchmark arguments
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run latency/memory benchmark",
+    )
+    parser.add_argument(
+        "--benchmark-warmup",
+        type=int,
+        default=10,
+        help="Warmup iterations for benchmark (default: 10)",
+    )
+    parser.add_argument(
+        "--benchmark-runs",
+        type=int,
+        default=100,
+        help="Number of benchmark runs (default: 100)",
+    )
 
     try:
         args = parser.parse_args(sys.argv[2:] if argv is None else argv)  # skip subcommand
@@ -652,124 +682,15 @@ Examples:
         image_size=image_size,
         conf_threshold=args.conf,
         iou_threshold=args.iou,
+        conf_prod=args.conf_prod,
         device=args.device,
         output_dir=args.output,
         save_plots=save_plots,
         save_json=bool(args.save_json),
         verbose=True,
-    )
-    return 0
-
-
-def benchmark_main(argv: Optional[List[str]] = None) -> int:
-    """Run performance benchmarks on a model."""
-    parser = argparse.ArgumentParser(
-        description="YOLO Benchmark - Measure model inference performance",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Benchmark PyTorch model
-  python -m yolo.cli benchmark --checkpoint best.ckpt
-
-  # Benchmark ONNX model
-  python -m yolo.cli benchmark --model model.onnx
-
-  # Benchmark multiple formats
-  python -m yolo.cli benchmark --checkpoint best.ckpt --formats pytorch,onnx
-
-  # Benchmark with multiple batch sizes
-  python -m yolo.cli benchmark --checkpoint best.ckpt --batch-sizes 1,8,16
-
-  # Full benchmark
-  python -m yolo.cli benchmark --checkpoint best.ckpt \\
-      --formats pytorch,onnx,tflite --batch-sizes 1,8 \\
-      --warmup 20 --runs 200 --output benchmark.json
-        """,
-    )
-    parser.add_argument(
-        "--checkpoint", "-c",
-        type=str,
-        default=None,
-        help="Path to PyTorch checkpoint (.ckpt file)",
-    )
-    parser.add_argument(
-        "--model", "-m",
-        type=str,
-        default=None,
-        help="Path to exported model (ONNX or TFLite)",
-    )
-    parser.add_argument(
-        "--formats",
-        type=str,
-        default="pytorch",
-        help="Comma-separated list of formats to benchmark (default: pytorch)",
-    )
-    parser.add_argument(
-        "--batch-sizes",
-        type=str,
-        default="1",
-        help="Comma-separated list of batch sizes (default: 1)",
-    )
-    parser.add_argument(
-        "--size",
-        type=int,
-        default=640,
-        help="Input image size (default: 640)",
-    )
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        default=10,
-        help="Number of warmup iterations (default: 10)",
-    )
-    parser.add_argument(
-        "--runs",
-        type=int,
-        default=100,
-        help="Number of benchmark runs (default: 100)",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="Device to use (cuda/mps/cpu, default: auto)",
-    )
-    parser.add_argument(
-        "--output", "-o",
-        type=str,
-        default=None,
-        help="Output path for JSON results",
-    )
-
-    try:
-        args = parser.parse_args(sys.argv[2:] if argv is None else argv)  # skip subcommand
-    except SystemExit as exc:
-        return _coerce_system_exit_code(exc)
-
-    if args.checkpoint is None and args.model is None:
-        print("Error: Either --checkpoint or --model is required", file=sys.stderr)
-        return 1
-
-    # Parse formats and batch sizes
-    formats = [f.strip() for f in args.formats.split(",")]
-    batch_sizes = [int(b.strip()) for b in args.batch_sizes.split(",")]
-
-    # Import and run benchmark
-    from yolo.tools.benchmark import benchmark
-
-    image_size = (args.size, args.size)
-
-    benchmark(
-        checkpoint_path=args.checkpoint,
-        model_path=args.model,
-        formats=formats,
-        batch_sizes=batch_sizes,
-        image_size=image_size,
-        warmup=args.warmup,
-        runs=args.runs,
-        device=args.device,
-        output_path=args.output,
-        verbose=True,
+        benchmark=args.benchmark,
+        benchmark_warmup=args.benchmark_warmup,
+        benchmark_runs=args.benchmark_runs,
     )
     return 0
 
@@ -790,15 +711,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return export_main(args[1:])
     if cmd == "validate":
         return validate_main(args[1:])
-    if cmd == "benchmark":
-        return benchmark_main(args[1:])
 
     # Fall back to training CLI (supports global options before the subcommand).
     if cmd.startswith("-"):
         return train_main(args)
 
     # If it's not a known command, provide a clearer error than LightningCLI.
-    known = {"fit", "test", "predict", "export", "validate", "benchmark"}
+    known = {"fit", "test", "predict", "export", "validate"}
     if cmd not in known:
         print(f"Error: Unknown command: {cmd}\n", file=sys.stderr)
         _root_parser().print_help()

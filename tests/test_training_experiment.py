@@ -159,25 +159,28 @@ class TestMetricsSystem:
         from yolo.utils.metrics import ConfusionMatrix
 
         names = {i: f"class_{i}" for i in range(7)}
-        cm = ConfusionMatrix(nc=7, names=names)
+        cm = ConfusionMatrix(num_classes=7, class_names=names)
 
         # Add some detections
+        # Format: [x1, y1, x2, y2, conf, class]
         detections = np.array([
             [100, 100, 200, 200, 0.9, 0],  # Pred class 0
             [300, 300, 400, 400, 0.8, 1],  # Pred class 1
             [500, 500, 600, 600, 0.7, 2],  # Pred class 2
         ])
+        # Format: [class, x1, y1, x2, y2]
         labels = np.array([
             [0, 100, 100, 200, 200],  # GT class 0
             [1, 300, 300, 400, 400],  # GT class 1
             [2, 500, 500, 600, 600],  # GT class 2
         ])
 
-        cm.process_batch(detections, labels)
+        cm.update(detections, labels)
 
-        # Check we have some true positives
-        tp, fp = cm.tp_fp()
-        assert sum(tp) >= 3  # Should detect all 3
+        # Check diagonal has true positives (perfect detections)
+        assert cm.matrix[0, 0] >= 1  # class 0 detected correctly
+        assert cm.matrix[1, 1] >= 1  # class 1 detected correctly
+        assert cm.matrix[2, 2] >= 1  # class 2 detected correctly
 
 
 class TestLRSchedulers:

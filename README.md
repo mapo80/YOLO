@@ -3,7 +3,7 @@
 ![GitHub License](https://img.shields.io/github/license/WongKinYiu/YOLO)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch Lightning](https://img.shields.io/badge/PyTorch-Lightning-792ee5.svg)](https://lightning.ai/)
-[![Tests](https://img.shields.io/badge/tests-243%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-257%20passed-brightgreen.svg)](tests/)
 
 Welcome to the official implementation of YOLOv7[^1], YOLOv9[^2], and YOLO-RD[^3].
 
@@ -187,7 +187,29 @@ python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml \
 | `--save-plots` | true | Save metric plots (PR curve, confusion matrix) |
 | `--save-json` | true | Save results as JSON |
 
-**Output**: mAP, mAP50, mAP75, precision, recall, F1, per-class metrics, confusion matrix, PR/F1 curves.
+**Output**: Eval dashboard with comprehensive metrics, per-class analysis, confusion matrix, PR/F1 curves.
+
+#### Validation with Benchmark
+
+Run validation with integrated benchmark to measure inference performance:
+
+```shell
+# Validate + benchmark (latency, memory, model size)
+python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml --benchmark
+
+# Custom benchmark settings
+python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml \
+    --benchmark --benchmark-warmup 20 --benchmark-runs 200
+```
+
+#### Extended Validation Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--conf-prod` | 0.25 | Production confidence for operative metrics |
+| `--benchmark` | false | Run latency/memory benchmark |
+| `--benchmark-warmup` | 10 | Warmup iterations for benchmark |
+| `--benchmark-runs` | 100 | Number of benchmark runs |
 
 ### Inference
 
@@ -583,59 +605,8 @@ docker build --platform linux/amd64 -t yolo-tflite-export -f docker/Dockerfile.t
 | **Close Mosaic** | Disable augmentation for final N epochs |
 | **Optimizer Selection** | SGD (default) or AdamW |
 | **Model Export** | ONNX, TFLite (FP32/FP16/INT8), SavedModel |
-| **Standalone Validation** | Evaluate models with full metrics, plots, JSON export |
-| **Performance Benchmark** | Profile inference speed across formats (PyTorch, ONNX, TFLite) |
-
-### Benchmark
-
-Measure model inference performance across different formats and configurations:
-
-```shell
-# Benchmark PyTorch model
-python -m yolo.cli benchmark --checkpoint best.ckpt
-
-# Benchmark ONNX model
-python -m yolo.cli benchmark --model model.onnx
-
-# Benchmark multiple formats
-python -m yolo.cli benchmark --checkpoint best.ckpt --formats pytorch,onnx
-
-# Benchmark with multiple batch sizes
-python -m yolo.cli benchmark --checkpoint best.ckpt --batch-sizes 1,8,16
-
-# Full benchmark with JSON output
-python -m yolo.cli benchmark --checkpoint best.ckpt \
-    --formats pytorch,onnx,tflite --batch-sizes 1,8 \
-    --warmup 20 --runs 200 --output benchmark.json
-```
-
-#### Benchmark Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--checkpoint, -c` | - | Path to PyTorch checkpoint (.ckpt) |
-| `--model, -m` | - | Path to exported model (ONNX or TFLite) |
-| `--formats` | pytorch | Comma-separated formats to benchmark |
-| `--batch-sizes` | 1 | Comma-separated batch sizes to test |
-| `--size` | 640 | Input image size |
-| `--warmup` | 10 | Number of warmup iterations |
-| `--runs` | 100 | Number of benchmark runs |
-| `--device` | auto | Device (cuda/mps/cpu) |
-| `--output, -o` | - | Output path for JSON results |
-
-**Sample Output:**
-
-```
-╭──────────────────────────────────────────────────────────────╮
-│                    Benchmark Results                          │
-├────────────┬────────┬─────────┬──────────────────┬───────────┤
-│ Format     │ Device │ Batch   │ Latency (ms)     │ FPS       │
-├────────────┼────────┼─────────┼──────────────────┼───────────┤
-│ PyTorch    │ cuda   │ 1       │ 8.20 ± 0.50      │ 122.0     │
-│ ONNX       │ cuda   │ 1       │ 5.10 ± 0.30      │ 196.1     │
-│ TFLite     │ cpu    │ 1       │ 85.20 ± 2.10     │ 11.7      │
-╰────────────┴────────┴─────────┴──────────────────┴───────────╯
-```
+| **Standalone Validation** | Eval dashboard with full COCO metrics, plots, JSON export |
+| **Integrated Benchmark** | Measure latency/memory during validation with `--benchmark` |
 
 ## Custom Image Loader
 
@@ -1174,7 +1145,9 @@ python -m pytest tests/ -v --run-integration
 | Module | Tests | Description |
 |--------|-------|-------------|
 | **Augmentations** | 44 tests | Mosaic4/9, MixUp, CutMix, RandomPerspective, EMA |
-| **Metrics** | 47 tests | IoU, AP computation, confusion matrix, DetMetrics, plot generation |
+| **Metrics** | 33 tests | IoU, AP computation, confusion matrix, DetMetrics, plot generation |
+| **Eval Dashboard** | 26 tests | Dashboard rendering, trends, sparklines, sections |
+| **Validate** | 16 tests | Benchmark, device detection, metrics integration |
 | **Schedulers** | 15 tests | Cosine, linear, step, OneCycle creation and behavior |
 | **Layer Freezing** | 14 tests | Backbone freezing, pattern matching, epoch-based unfreezing |
 | **Model Building** | 10 tests | v9-c, v9-m, v9-s, v7 models, forward pass |
@@ -1185,7 +1158,7 @@ python -m pytest tests/ -v --run-integration
 | **Integration** | 10 tests | Full pipeline tests (run with `--run-integration`) |
 | **Other** | 40+ tests | Utils, module tests, edge cases |
 
-**Total: 256 tests** covering data augmentation, training callbacks, metrics, schedulers, layer freezing, model components, export, and utilities.
+**Total: 257 tests** covering data augmentation, training callbacks, metrics, eval dashboard, schedulers, layer freezing, model components, export, validate, and utilities.
 
 ### Training Experiment Tests
 
@@ -1260,20 +1233,131 @@ python -m yolo.cli fit --config config.yaml \
     --model.metrics_plots_dir=outputs/metrics
 ```
 
-### Validation Output
+### Eval Dashboard
 
-After each epoch, a formatted metrics table is displayed:
+During training and validation, a comprehensive dashboard displays all metrics using Rich tables with clean formatting:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                   Epoch 10 - Validation Metrics                 │
-├────────────┬────────────┬────────────┬────────────┬────────────┤
-│    mAP     │   mAP50    │   mAP75    │            │            │
-│   0.4523   │   0.6821   │   0.4912   │            │            │
-├────────────┼────────────┼────────────┼────────────┼────────────┤
-│    Prec    │   Recall   │     F1     │    loss    │            │
-│   0.7234   │   0.6521   │   0.6860   │   2.3456   │            │
-└────────────┴────────────┴────────────┴────────────┴────────────┘
+                            EVAL SUMMARY
+╭─────────────────────────────┬───────────────────────┬──────────────────────────────────╮
+│ Info                        │ mAP                   │ Settings                         │
+├─────────────────────────────┼───────────────────────┼──────────────────────────────────┤
+│ epoch: 25/100  imgs: 1200   │ 0.4523 [NEW BEST]     │ conf: 0.25  iou: 0.65  max: 300  │
+│ size: 640x640               │                       │                                  │
+╰─────────────────────────────┴───────────────────────┴──────────────────────────────────╯
+
+                              KPI (QUALITY)
+╭──────────┬────────┬────────┬─────────┬────────┬────────┬────────╮
+│ AP50-95  │   AP50 │   AP75 │  AR@100 │    APs │    APm │    APl │
+├──────────┼────────┼────────┼─────────┼────────┼────────┼────────┤
+│   0.4523 │ 0.6821 │ 0.4912 │  0.5234 │ 0.2134 │ 0.4521 │ 0.5823 │
+╰──────────┴────────┴────────┴─────────┴────────┴────────┴────────╯
+
+                          KPI (OPERATIVE @ 0.25)
+╭─────────┬─────────┬──────────┬─────────┬───────────╮
+│  P@0.25 │  R@0.25 │  F1@0.25 │ best-F1 │ conf_best │
+├─────────┼─────────┼──────────┼─────────┼───────────┤
+│  0.7823 │  0.6234 │   0.6941 │  0.7123 │      0.32 │
+╰─────────┴─────────┴──────────┴─────────┴───────────╯
+
+                       TRENDS (last 10 epochs)
+╭─────────┬────────────┬──────────────────────╮
+│ Metric  │ Trend      │ Range                │
+├─────────┼────────────┼──────────────────────┤
+│ AP50-95 │ _.,~'^.~'^ │ min: 0.32  max: 0.45 │
+│ AP50    │ .~'^.~'^.^ │ min: 0.58  max: 0.68 │
+│ AR@100  │ _.,~'.~'^. │ min: 0.42  max: 0.52 │
+╰─────────┴────────────┴──────────────────────╯
+
+                        THRESHOLD SWEEP
+╭──────┬──────┬──────┬──────╮
+│ conf │    P │    R │   F1 │
+├──────┼──────┼──────┼──────┤
+│ 0.10 │ 0.52 │ 0.89 │ 0.66 │
+│ 0.20 │ 0.68 │ 0.72 │ 0.70 │
+│ 0.30 │ 0.78 │ 0.61 │ 0.69 │
+│ 0.40 │ 0.85 │ 0.48 │ 0.61 │
+│ 0.50 │ 0.91 │ 0.34 │ 0.50 │
+╰──────┴──────┴──────┴──────╯
+
+                    PER-CLASS: TOP by AP50-95
+╭────────┬──────────┬────────┬────────┬─────╮
+│ Class  │ AP50-95  │   AP50 │ R@conf │  GT │
+├────────┼──────────┼────────┼────────┼─────┤
+│ homer  │   0.6234 │ 0.8521 │ 0.7823 │ 342 │
+│ bart   │   0.5821 │ 0.7934 │ 0.7234 │ 289 │
+│ marge  │   0.5234 │ 0.7621 │ 0.6821 │ 256 │
+╰────────┴──────────┴────────┴────────┴─────╯
+
+                   PER-CLASS: WORST by AP50-95
+╭─────────┬──────────┬────────┬────────┬────╮
+│ Class   │ AP50-95  │   AP50 │ R@conf │ GT │
+├─────────┼──────────┼────────┼────────┼────┤
+│ maggie  │   0.2134 │ 0.4523 │ 0.3421 │ 45 │
+│ abraham │   0.2821 │ 0.5234 │ 0.4123 │ 67 │
+│ ned     │   0.3421 │ 0.5821 │ 0.4821 │ 89 │
+╰─────────┴──────────┴────────┴────────┴────╯
+
+                       ERROR HEALTH CHECK
+╭──────┬──────┬──────────────┬─────────────╮
+│   FP │   FN │ det/img mean │ det/img p95 │
+├──────┼──────┼──────────────┼─────────────┤
+│  234 │  156 │          8.3 │          15 │
+╰──────┴──────┴──────────────┴─────────────╯
+
+                   Top Confusions (pred → true)
+╭───┬───────────┬───┬───────┬───────╮
+│ # │ Predicted │ → │ True  │ Count │
+├───┼───────────┼───┼───────┼───────┤
+│ 1 │ bart      │ → │ lisa  │    23 │
+│ 2 │ homer     │ → │ abraham │  12 │
+│ 3 │ marge     │ → │ lisa  │     8 │
+╰───┴───────────┴───┴───────┴───────╯
+```
+
+The dashboard shows a **[NEW BEST]** indicator when the model achieves a new best mAP, or displays a delta **(+0.0050)** in green for improvements or **(-0.0123)** in red when worse than the best.
+
+#### Dashboard Metrics
+
+**Quality Metrics (COCO Standard):**
+
+| Metric | Description |
+|--------|-------------|
+| **AP50-95** | mAP @ IoU=0.50:0.95 (primary COCO metric) |
+| **AP50** | mAP @ IoU=0.50 |
+| **AP75** | mAP @ IoU=0.75 |
+| **AR@100** | Average Recall @ 100 detections/image |
+| **APs/APm/APl** | AP for small/medium/large objects |
+
+**Operative Metrics (at production threshold):**
+
+| Metric | Description |
+|--------|-------------|
+| **P@conf** | Precision at production confidence |
+| **R@conf** | Recall at production confidence |
+| **F1@conf** | F1 at production confidence |
+| **best-F1** | Best achievable F1 score |
+| **conf_best** | Confidence threshold for best F1 |
+
+**Error Metrics:**
+
+| Metric | Description |
+|--------|-------------|
+| **FP/FN** | Total False Positives and False Negatives |
+| **det/img** | Detections per image (mean, p95) |
+| **MeanIoU(TP)** | Mean IoU of True Positives |
+| **Top confusions** | Most confused class pairs |
+
+#### Dashboard Configuration
+
+```yaml
+trainer:
+  callbacks:
+    - class_path: yolo.training.callbacks.EvalDashboardCallback
+      init_args:
+        conf_prod: 0.25        # Production confidence threshold
+        show_trends: true      # Show sparkline trends
+        top_n_classes: 3       # N classes for TOP/WORST
 ```
 
 ## Learning Rate Schedulers

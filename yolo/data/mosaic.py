@@ -139,6 +139,39 @@ class MosaicMixupDataset(Dataset):
 
         return img_resized, target, scale
 
+    @staticmethod
+    def _compute_paste_slices(
+        x0: int,
+        y0: int,
+        patch_w: int,
+        patch_h: int,
+        canvas_w: int,
+        canvas_h: int,
+    ) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]:
+        """
+        Compute destination (canvas) and source (patch) slices for pasting with clipping.
+
+        Args:
+            x0, y0: Desired top-left corner on the canvas
+            patch_w, patch_h: Patch dimensions
+            canvas_w, canvas_h: Canvas dimensions
+
+        Returns:
+            ((dx0, dy0, dx1, dy1), (sx0, sy0, sx1, sy1)) slices where:
+              - canvas[dy0:dy1, dx0:dx1] = patch[sy0:sy1, sx0:sx1]
+        """
+        dx0 = max(x0, 0)
+        dy0 = max(y0, 0)
+        dx1 = min(x0 + patch_w, canvas_w)
+        dy1 = min(y0 + patch_h, canvas_h)
+
+        sx0 = dx0 - x0
+        sy0 = dy0 - y0
+        sx1 = sx0 + (dx1 - dx0)
+        sy1 = sy0 + (dy1 - dy0)
+
+        return (dx0, dy0, dx1, dy1), (sx0, sy0, sx1, sy1)
+
     def _mosaic4(self, index: int) -> Tuple[Image.Image, Dict[str, Tensor]]:
         """
         Create 4-way mosaic from 4 random images.
@@ -157,44 +190,40 @@ class MosaicMixupDataset(Dataset):
         xc = int(random.uniform(-self.border[0], 2 * s + self.border[0]))
 
         # Create 2x canvas
-        canvas = np.full((s * 2, s * 2, 3), self.fill_value, dtype=np.uint8)
+        canvas_side = s * 2
+        canvas = np.full((canvas_side, canvas_side, 3), self.fill_value, dtype=np.uint8)
 
-        all_boxes = []
-        all_labels = []
+        placed = []
+        placements = (
+            (False, False),  # top-left
+            (True, False),   # top-right
+            (False, True),   # bottom-left
+            (True, True),    # bottom-right
+        )
 
-        for i, idx in enumerate(indices):
-            img, target, _ = self._load_and_resize(idx, (s, s))
-            h, w = img.shape[:2]
+        for (place_right, place_down), idx in zip(placements, indices):
+            patch, target, _ = self._load_and_resize(idx, (s, s))
+            patch_h, patch_w = patch.shape[:2]
 
-            # Place image based on quadrant
-            if i == 0:  # top-left
-                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
-                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
-            elif i == 1:  # top-right
-                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
-                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
-            elif i == 2:  # bottom-left
-                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
-                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
-            else:  # bottom-right (i == 3)
-                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
-                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
+            x0 = xc if place_right else xc - patch_w
+            y0 = yc if place_down else yc - patch_h
 
-            # Place image on canvas
-            canvas[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]
+            (dx0, dy0, dx1, dy1), (sx0, sy0, sx1, sy1) = self._compute_paste_slices(
+                x0=x0,
+                y0=y0,
+                patch_w=patch_w,
+                patch_h=patch_h,
+                canvas_w=canvas_side,
+                canvas_h=canvas_side,
+            )
 
-            # Calculate padding offset for this image
-            padw = x1a - x1b
-            padh = y1a - y1b
+            canvas[dy0:dy1, dx0:dx1] = patch[sy0:sy1, sx0:sx1]
 
-            # Transform boxes
             if len(target["boxes"]) > 0:
                 boxes = target["boxes"].clone()
-                # Add offset
-                boxes[:, [0, 2]] += padw
-                boxes[:, [1, 3]] += padh
-                all_boxes.append(boxes)
-                all_labels.append(target["labels"])
+                boxes[:, [0, 2]] += x0
+                boxes[:, [1, 3]] += y0
+                placed.append((boxes, target["labels"]))
 
         # Crop from 2x canvas to final size using border
         # The border defines the crop region: from -border to s+(-border) = from s/2 to 3s/2
@@ -206,7 +235,7 @@ class MosaicMixupDataset(Dataset):
         # Adjust boxes for crop and clip
         final_boxes = []
         final_labels = []
-        for boxes, labels in zip(all_boxes, all_labels):
+        for boxes, labels in placed:
             boxes = boxes.clone()
             boxes[:, [0, 2]] -= crop_x1
             boxes[:, [1, 3]] -= crop_y1
@@ -243,54 +272,57 @@ class MosaicMixupDataset(Dataset):
         indices = [index] + [random.randint(0, len(self.dataset) - 1) for _ in range(8)]
 
         # Create 3x canvas
-        canvas = np.full((s * 3, s * 3, 3), self.fill_value, dtype=np.uint8)
+        canvas_side = s * 3
+        canvas = np.full((canvas_side, canvas_side, 3), self.fill_value, dtype=np.uint8)
 
-        all_boxes = []
-        all_labels = []
+        placed = []
+        prev_h, prev_w = -1, -1
+        center_h, center_w = 0, 0
 
-        hp, wp = -1, -1  # height, width of previous image
+        for pos, idx in enumerate(indices):
+            patch, target, _ = self._load_and_resize(idx, (s, s))
+            patch_h, patch_w = patch.shape[:2]
 
-        for i, idx in enumerate(indices):
-            img, target, _ = self._load_and_resize(idx, (s, s))
-            h, w = img.shape[:2]
+            if pos == 0:
+                center_h, center_w = patch_h, patch_w
 
-            # Place image based on position
-            # Layout: center image at (s, s), then clockwise from top
-            if i == 0:  # center
-                h0, w0 = h, w
-                c = s, s, s + w, s + h  # xmin, ymin, xmax, ymax
-            elif i == 1:  # top
-                c = s, s - h, s + w, s
-            elif i == 2:  # top right
-                c = s + wp, s - h, s + wp + w, s
-            elif i == 3:  # right
-                c = s + w0, s, s + w0 + w, s + h
-            elif i == 4:  # bottom right
-                c = s + w0, s + hp, s + w0 + w, s + hp + h
-            elif i == 5:  # bottom
-                c = s + w0 - w, s + h0, s + w0, s + h0 + h
-            elif i == 6:  # bottom left
-                c = s + w0 - wp - w, s + h0, s + w0 - wp, s + h0 + h
-            elif i == 7:  # left
-                c = s - w, s + h0 - h, s, s + h0
-            else:  # i == 8, top left
-                c = s - w, s + h0 - hp - h, s, s + h0 - hp
+            # Determine top-left corner for each tile.
+            if pos == 0:  # center
+                x0, y0 = s, s
+            elif pos == 1:  # top
+                x0, y0 = s, s - patch_h
+            elif pos == 2:  # top-right
+                x0, y0 = s + prev_w, s - patch_h
+            elif pos == 3:  # right
+                x0, y0 = s + center_w, s
+            elif pos == 4:  # bottom-right
+                x0, y0 = s + center_w, s + prev_h
+            elif pos == 5:  # bottom
+                x0, y0 = s + center_w - patch_w, s + center_h
+            elif pos == 6:  # bottom-left
+                x0, y0 = s + center_w - prev_w - patch_w, s + center_h
+            elif pos == 7:  # left
+                x0, y0 = s - patch_w, s + center_h - patch_h
+            else:  # pos == 8, top-left
+                x0, y0 = s - patch_w, s + center_h - prev_h - patch_h
 
-            padw, padh = c[0], c[1]
-            x1, y1, x2, y2 = max(c[0], 0), max(c[1], 0), min(c[2], s * 3), min(c[3], s * 3)
+            (dx0, dy0, dx1, dy1), (sx0, sy0, sx1, sy1) = self._compute_paste_slices(
+                x0=x0,
+                y0=y0,
+                patch_w=patch_w,
+                patch_h=patch_h,
+                canvas_w=canvas_side,
+                canvas_h=canvas_side,
+            )
 
-            # Place image on canvas
-            canvas[y1:y2, x1:x2] = img[y1 - padh:, x1 - padw:]
+            canvas[dy0:dy1, dx0:dx1] = patch[sy0:sy1, sx0:sx1]
+            prev_h, prev_w = patch_h, patch_w
 
-            hp, wp = h, w  # store for next iteration
-
-            # Transform boxes - use border offset for final crop
             if len(target["boxes"]) > 0:
                 boxes = target["boxes"].clone()
-                boxes[:, [0, 2]] += padw + self.border[0]
-                boxes[:, [1, 3]] += padh + self.border[1]
-                all_boxes.append(boxes)
-                all_labels.append(target["labels"])
+                boxes[:, [0, 2]] += x0 + self.border[0]
+                boxes[:, [1, 3]] += y0 + self.border[1]
+                placed.append((boxes, target["labels"]))
 
         # Crop using border (from -border to s-border on the 3x canvas)
         # border = (-s/2, -s/2), so we crop from s/2 to s/2+s
@@ -301,7 +333,7 @@ class MosaicMixupDataset(Dataset):
         # Adjust boxes - they already have border offset applied
         final_boxes = []
         final_labels = []
-        for boxes, labels in zip(all_boxes, all_labels):
+        for boxes, labels in placed:
             boxes = boxes.clone()
             # Clip to image bounds
             boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, s)

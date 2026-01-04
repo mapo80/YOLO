@@ -341,42 +341,40 @@ class RandomPerspective:
     def _build_transform_matrix(
         self, w: int, h: int, new_w: int, new_h: int
     ) -> np.ndarray:
-        """Build combined perspective transformation matrix."""
-        # Center matrix
-        C = np.eye(3, dtype=np.float32)
-        C[0, 2] = -w / 2  # x translation (pixels)
-        C[1, 2] = -h / 2  # y translation (pixels)
+        """Build a 3x3 homography for random perspective/affine augmentation."""
+        # Shift origin to image center (so rotations/scales are around the center).
+        shift_to_center = np.eye(3, dtype=np.float32)
+        shift_to_center[0, 2] = -w / 2
+        shift_to_center[1, 2] = -h / 2
 
-        # Perspective matrix
-        P = np.eye(3, dtype=np.float32)
+        # Perspective (optional). Keep random-call order stable for reproducibility.
+        persp_x = 0.0
+        persp_y = 0.0
         if self.perspective != 0:
-            P[2, 0] = random.uniform(-self.perspective, self.perspective)
-            P[2, 1] = random.uniform(-self.perspective, self.perspective)
+            persp_x = random.uniform(-self.perspective, self.perspective)
+            persp_y = random.uniform(-self.perspective, self.perspective)
+        perspective = np.eye(3, dtype=np.float32)
+        perspective[2, 0] = persp_x
+        perspective[2, 1] = persp_y
 
-        # Rotation and scale matrix
-        R = np.eye(3, dtype=np.float32)
+        # Rotation + scale.
         angle = random.uniform(-self.degrees, self.degrees)
-        scale = random.uniform(1 - self.scale, 1 + self.scale)
-        R[:2] = cv2.getRotationMatrix2D(angle=angle, center=(0, 0), scale=scale)
+        scale_factor = random.uniform(1 - self.scale, 1 + self.scale)
+        rot_scale = np.eye(3, dtype=np.float32)
+        rot_scale[:2] = cv2.getRotationMatrix2D(angle=angle, center=(0, 0), scale=scale_factor)
 
-        # Shear matrix
-        S = np.eye(3, dtype=np.float32)
+        # Shear (optional).
+        shear = np.eye(3, dtype=np.float32)
         if self.shear != 0:
-            S[0, 1] = math.tan(random.uniform(-self.shear, self.shear) * math.pi / 180)
-            S[1, 0] = math.tan(random.uniform(-self.shear, self.shear) * math.pi / 180)
+            shear[0, 1] = math.tan(random.uniform(-self.shear, self.shear) * math.pi / 180)
+            shear[1, 0] = math.tan(random.uniform(-self.shear, self.shear) * math.pi / 180)
 
-        # Translation matrix
-        T = np.eye(3, dtype=np.float32)
-        T[0, 2] = (
-            random.uniform(0.5 - self.translate, 0.5 + self.translate) * new_w
-        )  # x translation
-        T[1, 2] = (
-            random.uniform(0.5 - self.translate, 0.5 + self.translate) * new_h
-        )  # y translation
+        # Translate back into output canvas coordinates.
+        translate = np.eye(3, dtype=np.float32)
+        translate[0, 2] = random.uniform(0.5 - self.translate, 0.5 + self.translate) * new_w
+        translate[1, 2] = random.uniform(0.5 - self.translate, 0.5 + self.translate) * new_h
 
-        # Combined matrix: T @ S @ R @ P @ C
-        M = T @ S @ R @ P @ C
-        return M
+        return translate @ shear @ rot_scale @ perspective @ shift_to_center
 
     def _transform_boxes(
         self,
