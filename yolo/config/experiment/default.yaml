@@ -127,8 +127,33 @@ model:
   log_map: true
   log_map_50: true
   log_map_75: true
-  log_map_per_size: true
-  log_mar_100: true
+  log_precision: true
+  log_recall: true
+  log_f1: true
+
+  # Metrics plots
+  # Automatically saves PR, F1, P, R curves and confusion matrix
+  save_metrics_plots: true
+  metrics_plots_dir: null  # null = auto (runs/<experiment>/metrics/)
+
+  # === Learning Rate Scheduler ===
+  # Options: "cosine" (default), "linear", "step", "one_cycle"
+  lr_scheduler: cosine
+
+  # Scheduler-specific parameters
+  lr_min_factor: 0.01           # For cosine/linear: final_lr = initial_lr * lr_min_factor
+  step_size: 30                 # For step: epochs between LR decay
+  step_gamma: 0.1               # For step: LR multiplication factor at each step
+
+  # OneCycle-specific parameters (for super-convergence)
+  one_cycle_pct_start: 0.3      # Fraction of training spent in warmup
+  one_cycle_div_factor: 25.0    # initial_lr = max_lr / div_factor
+  one_cycle_final_div_factor: 10000.0  # final_lr = initial_lr / final_div_factor
+
+  # === Layer Freezing (Transfer Learning) ===
+  freeze_backbone: false        # Freeze backbone layers
+  freeze_until_epoch: 0         # Unfreeze after this epoch (0 = always frozen)
+  freeze_layers: null           # List of specific layer patterns to freeze
 
 # -----------------------------------------------------------------------------
 # Data Configuration

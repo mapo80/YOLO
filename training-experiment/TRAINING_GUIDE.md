@@ -356,3 +356,127 @@ training-experiment/simpsons-coco-std/
 ├── images/val/
 └── annotations/
 ```
+
+---
+
+## Feature Test Results
+
+All features have been tested on this dataset. Run the tests with:
+
+```bash
+python -m pytest tests/test_training_experiment.py -v
+```
+
+### Test Summary
+
+| Test Category | Tests | Status |
+|--------------|-------|--------|
+| Dataset Loading | 5 | ✅ All Passed |
+| Metrics System | 2 | ✅ All Passed |
+| LR Schedulers | 2 | ✅ All Passed |
+| Layer Freezing | 2 | ✅ All Passed |
+| Model Export | 2 | ✅ All Passed |
+| Full Pipeline | 3 | ✅ All Passed |
+| **Total** | **16** | ✅ **All Passed** |
+
+### Dataset Features Tested
+
+1. **COCO Format Loading**
+   - ✅ Dataset structure validation
+   - ✅ Annotations JSON parsing
+   - ✅ YOLODataModule setup
+   - ✅ Batch generation with transforms
+
+2. **YOLO Format**
+   - ✅ Dataset exists in YOLO format
+   - (Note: Pipeline uses COCO format, YOLO format available for reference)
+
+3. **Metrics System**
+   - ✅ DetMetrics with 7 Simpsons classes
+   - ✅ Confusion matrix generation
+   - ✅ PR curve plotting
+   - ✅ mAP/Precision/Recall calculation
+
+4. **Learning Rate Schedulers**
+   - ✅ Cosine annealing scheduler
+   - ✅ OneCycle scheduler
+   - ✅ Warmup integration
+
+5. **Layer Freezing (Transfer Learning)**
+   - ✅ Backbone pattern freezing
+   - ✅ Epoch-based unfreezing
+   - ✅ Gradient flow verification
+
+6. **Model Export**
+   - ✅ ONNX export function
+   - ✅ TFLite export function
+   - ✅ Letterbox preprocessing
+
+### Full Test Suite
+
+The complete test suite includes 209 tests:
+
+```bash
+python -m pytest tests/ -q
+# Result: 209 passed, 13 skipped
+```
+
+### Test Categories
+
+| Category | Tests |
+|----------|-------|
+| Augmentations (Mosaic, MixUp, CutMix, EMA) | 44 |
+| Metrics (DetMetrics, ConfusionMatrix, Plots) | 47 |
+| Schedulers | 15 |
+| Layer Freezing | 14 |
+| Model Export | 10 |
+| Model Building | 10 |
+| Bounding Box Utils | 13 |
+| Training Experiment Integration | 16 |
+| Other | 40+ |
+
+---
+
+## Advanced Features
+
+### LR Schedulers
+
+```bash
+# Cosine annealing (default)
+python -m yolo.cli fit --config training-experiment/simpsons-train.yaml \
+    --model.lr_scheduler=cosine
+
+# OneCycle for faster convergence
+python -m yolo.cli fit --config training-experiment/simpsons-train.yaml \
+    --model.lr_scheduler=one_cycle
+
+# Step decay
+python -m yolo.cli fit --config training-experiment/simpsons-train.yaml \
+    --model.lr_scheduler=step \
+    --model.step_size=30
+```
+
+### Layer Freezing (Transfer Learning)
+
+```bash
+# Freeze backbone for first 10 epochs
+python -m yolo.cli fit --config training-experiment/simpsons-train.yaml \
+    --model.weight_path=true \
+    --model.freeze_backbone=true \
+    --model.freeze_until_epoch=10
+```
+
+### Model Export
+
+```bash
+# Export to ONNX
+python -m yolo.cli export \
+    --checkpoint training-experiment/checkpoints/best.ckpt \
+    --format onnx
+
+# Export to TFLite
+python -m yolo.cli export \
+    --checkpoint training-experiment/checkpoints/best.ckpt \
+    --format tflite \
+    --quantization fp16
+```

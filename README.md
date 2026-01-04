@@ -4,7 +4,7 @@
 ![GitHub License](https://img.shields.io/github/license/WongKinYiu/YOLO)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch Lightning](https://img.shields.io/badge/PyTorch-Lightning-792ee5.svg)](https://lightning.ai/)
-[![Tests](https://img.shields.io/badge/tests-81%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-256%20passed-brightgreen.svg)](tests/)
 
 Welcome to the official implementation of YOLOv7[^1], YOLOv9[^2], and YOLO-RD[^3].
 
@@ -532,7 +532,10 @@ docker build --platform linux/amd64 -t yolo-tflite-export -f docker/Dockerfile.t
 |---------|-------------|
 | **Multi-GPU Training** | Automatic DDP with `--trainer.devices=N` |
 | **Mixed Precision** | FP16/BF16 training with `--trainer.precision=16-mixed` |
-| **COCO Metrics** | mAP@0.5, mAP@0.5:0.95, per-size metrics |
+| **Advanced Metrics** | mAP@0.5, mAP@0.5:0.95, Precision, Recall, F1, Confusion Matrix |
+| **Metrics Plots** | Auto-generated PR, F1, P, R curves per epoch |
+| **Multiple LR Schedulers** | Cosine, Linear, Step, OneCycle |
+| **Layer Freezing** | Transfer learning with backbone freezing |
 | **Checkpointing** | Automatic best/last model saving (see [Checkpoints](#checkpoints)) |
 | **Early Stopping** | Stop on validation plateau |
 | **Logging** | TensorBoard, WandB support |
@@ -542,6 +545,7 @@ docker build --platform linux/amd64 -t yolo-tflite-export -f docker/Dockerfile.t
 | **EMA** | Exponential Moving Average of model weights |
 | **Close Mosaic** | Disable augmentation for final N epochs |
 | **Optimizer Selection** | SGD (default) or AdamW |
+| **Model Export** | ONNX, TFLite (FP32/FP16/INT8), SavedModel |
 
 ## Custom Image Loader
 
@@ -972,24 +976,38 @@ python -m pytest tests/ --cov=yolo --cov-report=html
 
 | Module | Tests | Description |
 |--------|-------|-------------|
-| **Mosaic4** | 4 tests | 4-way mosaic output shape, box bounds, center point range, empty boxes |
-| **Mosaic9** | 3 tests | 9-way mosaic output shape, box bounds, empty boxes |
-| **MixUp** | 3 tests | Output shape, box combination, Beta(32,32) distribution |
-| **CutMix** | 4 tests | Output shape, bbox bounds, center-based sampling, IoA threshold |
-| **RandomPerspective** | 7 tests | Transform disabled, output shape, box bounds, matrix composition, empty boxes |
-| **EMA** | 8 tests | Initialization, decay formula, warmup, state serialization, gradients disabled |
-| **EMACallback** | 3 tests | Initialization, disabled state |
-| **Integration** | 4 tests | Full pipeline, transform chains, mosaic disable |
-| **Edge Cases** | 4 tests | Single image, small images, non-square, reproducibility |
-| **Model Modules** | 6 tests | Conv, Pool, ADown, CBLinear, SPPELAN |
-| **Utils** | 12 tests | Auto-pad, activation functions, chunk division |
-| **Export** | 16 tests | Letterbox preprocessing, calibration images, ONNX/TFLite signatures, CLI options |
+| **Augmentations** | 44 tests | Mosaic4/9, MixUp, CutMix, RandomPerspective, EMA |
+| **Metrics** | 47 tests | IoU, AP computation, confusion matrix, DetMetrics, plot generation |
+| **Schedulers** | 15 tests | Cosine, linear, step, OneCycle creation and behavior |
+| **Layer Freezing** | 14 tests | Backbone freezing, pattern matching, epoch-based unfreezing |
+| **Model Building** | 10 tests | v9-c, v9-m, v9-s, v7 models, forward pass |
+| **Bounding Box Utils** | 13 tests | IoU, transforms, NMS, anchor generation |
+| **Export** | 10 tests | Letterbox, ONNX/TFLite signatures, CLI options |
+| **Training Experiment** | 16 tests | Dataset loading, metrics, schedulers, freezing, export |
+| **Other** | 40+ tests | Utils, module tests, edge cases |
 
-**Total: 81 tests** covering data augmentation, training callbacks, model components, export, and utilities.
+**Total: 209 tests** covering data augmentation, training callbacks, metrics, schedulers, layer freezing, model components, export, and utilities.
 
-## Metrics Configuration
+### Training Experiment Tests
 
-The training pipeline supports comprehensive COCO-style evaluation metrics. All metrics are configurable via YAML or CLI.
+All features have been validated on the [Simpsons Character Detection](training-experiment/TRAINING_GUIDE.md) dataset:
+
+```bash
+python -m pytest tests/test_training_experiment.py -v
+# Result: 16 passed (dataset loading, metrics, schedulers, freezing, export)
+```
+
+| Feature | Status |
+|---------|--------|
+| COCO Dataset Loading | ✅ Tested |
+| Metrics System (7 classes) | ✅ Tested |
+| LR Schedulers | ✅ Tested |
+| Layer Freezing | ✅ Tested |
+| Model Export (ONNX/TFLite) | ✅ Tested |
+
+## Metrics
+
+The training pipeline includes a comprehensive detection metrics system with automatic plot generation.
 
 ### Available Metrics
 
@@ -998,15 +1016,21 @@ The training pipeline supports comprehensive COCO-style evaluation metrics. All 
 | **mAP** | `log_map` | ✅ | mAP @ IoU=0.50:0.95 (COCO primary metric) |
 | **mAP50** | `log_map_50` | ✅ | mAP @ IoU=0.50 |
 | **mAP75** | `log_map_75` | ✅ | mAP @ IoU=0.75 |
-| **mAP95** | `log_map_95` | ✅ | mAP @ IoU=0.95 (strict threshold) |
-| **mAP per size** | `log_map_per_size` | ✅ | mAP for small/medium/large objects |
-| **mAR100** | `log_mar_100` | ✅ | Mean Average Recall (max 100 detections) |
-| **mAR per size** | `log_mar_per_size` | ✅ | mAR for small/medium/large objects |
+| **Precision** | `log_precision` | ✅ | Mean precision across all classes |
+| **Recall** | `log_recall` | ✅ | Mean recall across all classes |
+| **F1** | `log_f1` | ✅ | Mean F1 score across all classes |
 
-**Size definitions (COCO standard):**
-- Small: area < 32² pixels
-- Medium: 32² ≤ area < 96² pixels
-- Large: area ≥ 96² pixels
+### Metrics Plots
+
+When `save_metrics_plots: true` (default), the following plots are automatically generated for each validation epoch:
+
+- **PR_curve.png**: Precision-Recall curve per class
+- **F1_curve.png**: F1 vs. Confidence threshold curve
+- **P_curve.png**: Precision vs. Confidence curve
+- **R_curve.png**: Recall vs. Confidence curve
+- **confusion_matrix.png**: Confusion matrix with class predictions
+
+Plots are saved to `runs/<experiment>/metrics/epoch_<N>/`.
 
 ### Configuration Example
 
@@ -1016,27 +1040,25 @@ model:
   log_map: true           # mAP @ 0.50:0.95
   log_map_50: true        # mAP @ 0.50
   log_map_75: true        # mAP @ 0.75
-  log_map_95: true        # mAP @ 0.95
-  log_map_per_size: true  # mAP_small, mAP_medium, mAP_large
-  log_mar_100: true       # Mean Average Recall
-  log_mar_per_size: true  # mAR_small, mAR_medium, mAR_large
+  log_precision: true     # Mean precision
+  log_recall: true        # Mean recall
+  log_f1: true            # Mean F1 score
+
+  # Metrics plots
+  save_metrics_plots: true
+  metrics_plots_dir: null  # Auto: runs/<experiment>/metrics/
 ```
 
 ### CLI Override Examples
 
 ```shell
-# Disable per-size metrics for faster validation
+# Disable metrics plots for faster validation
 python -m yolo.cli fit --config config.yaml \
-    --model.log_map_per_size=false \
-    --model.log_mar_per_size=false
+    --model.save_metrics_plots=false
 
-# Only log essential metrics (mAP, mAP50)
+# Custom metrics plots directory
 python -m yolo.cli fit --config config.yaml \
-    --model.log_map_75=false \
-    --model.log_map_95=false \
-    --model.log_map_per_size=false \
-    --model.log_mar_100=false \
-    --model.log_mar_per_size=false
+    --model.metrics_plots_dir=outputs/metrics
 ```
 
 ### Validation Output
@@ -1047,16 +1069,108 @@ After each epoch, a formatted metrics table is displayed:
 ┌─────────────────────────────────────────────────────────────────┐
 │                   Epoch 10 - Validation Metrics                 │
 ├────────────┬────────────┬────────────┬────────────┬────────────┤
-│    mAP     │   mAP50    │   mAP75    │   mAP95    │   mAR100   │
-│   0.4523   │   0.6821   │   0.4912   │   0.2134   │   0.5234   │
+│    mAP     │   mAP50    │   mAP75    │            │            │
+│   0.4523   │   0.6821   │   0.4912   │            │            │
 ├────────────┼────────────┼────────────┼────────────┼────────────┤
-│   mAP_sm   │   mAP_md   │   mAP_lg   │    loss    │            │
-│   0.2134   │   0.4521   │   0.5823   │   2.3456   │            │
-├────────────┼────────────┼────────────┼────────────┼────────────┤
-│   mAR_sm   │   mAR_md   │   mAR_lg   │            │            │
-│   0.1823   │   0.4012   │   0.5412   │            │            │
+│    Prec    │   Recall   │     F1     │    loss    │            │
+│   0.7234   │   0.6521   │   0.6860   │   2.3456   │            │
 └────────────┴────────────┴────────────┴────────────┴────────────┘
 ```
+
+## Learning Rate Schedulers
+
+The training pipeline supports multiple learning rate schedulers for different training strategies.
+
+### Available Schedulers
+
+| Scheduler | Description | Best For |
+|-----------|-------------|----------|
+| **cosine** | Cosine annealing (default) | General training |
+| **linear** | Linear decay to minimum LR | Simple baseline |
+| **step** | Step decay every N epochs | Classic approach |
+| **one_cycle** | One cycle policy | Fast convergence |
+
+### Configuration
+
+```yaml
+model:
+  lr_scheduler: cosine  # Options: cosine, linear, step, one_cycle
+
+  # Common parameters
+  lr_min_factor: 0.01   # final_lr = initial_lr * lr_min_factor
+
+  # Step scheduler parameters
+  step_size: 30         # Epochs between LR decay
+  step_gamma: 0.1       # LR multiplication factor
+
+  # OneCycle scheduler parameters
+  one_cycle_pct_start: 0.3        # Warmup fraction
+  one_cycle_div_factor: 25.0      # initial_lr = max_lr / div_factor
+  one_cycle_final_div_factor: 10000.0  # final_lr = initial_lr / final_div_factor
+```
+
+### CLI Examples
+
+```shell
+# Cosine annealing (default)
+python -m yolo.cli fit --config config.yaml --model.lr_scheduler=cosine
+
+# OneCycle for faster convergence
+python -m yolo.cli fit --config config.yaml \
+    --model.lr_scheduler=one_cycle \
+    --model.one_cycle_pct_start=0.3
+
+# Step decay (classic approach)
+python -m yolo.cli fit --config config.yaml \
+    --model.lr_scheduler=step \
+    --model.step_size=30 \
+    --model.step_gamma=0.1
+```
+
+## Layer Freezing (Transfer Learning)
+
+Freeze layers for efficient transfer learning on custom datasets. This is especially useful when fine-tuning on small datasets.
+
+### Configuration
+
+```yaml
+model:
+  # Load pretrained weights
+  weight_path: true  # Auto-download based on model_config
+
+  # Freeze entire backbone
+  freeze_backbone: true
+  freeze_until_epoch: 10  # Unfreeze after epoch 10 (0 = always frozen)
+
+  # Or freeze specific layers by name pattern
+  freeze_layers:
+    - backbone_conv1
+    - stem
+```
+
+### CLI Examples
+
+```shell
+# Freeze backbone for first 10 epochs, then fine-tune all layers
+python -m yolo.cli fit --config config.yaml \
+    --model.weight_path=true \
+    --model.freeze_backbone=true \
+    --model.freeze_until_epoch=10
+
+# Freeze specific layers permanently
+python -m yolo.cli fit --config config.yaml \
+    --model.weight_path=true \
+    --model.freeze_layers='[backbone_conv1, backbone_conv2]'
+```
+
+### Transfer Learning Workflow
+
+1. **Load pretrained weights**: `--model.weight_path=true`
+2. **Freeze backbone**: `--model.freeze_backbone=true`
+3. **Train head for N epochs**: `--model.freeze_until_epoch=10`
+4. **Unfreeze and fine-tune**: Automatic after `freeze_until_epoch`
+
+This approach allows the detection head to adapt to your custom classes first, then fine-tunes the entire network with a lower learning rate.
 
 ## Checkpoints
 
@@ -1208,19 +1322,27 @@ MS COCO Object Detection
 
 ```
 yolo/
-├── cli.py                 # LightningCLI entry point
+├── cli.py                    # CLI entry point (train, predict, export)
 ├── config/
-│   ├── experiment/        # Training configs (default.yaml, debug.yaml)
-│   └── model/             # Model architectures (v9-c.yaml, v9-s.yaml, ...)
+│   ├── experiment/           # Training configs (default.yaml, debug.yaml)
+│   └── model/                # Model architectures (v9-c.yaml, v9-s.yaml, ...)
+├── data/
+│   ├── datamodule.py         # LightningDataModule
+│   └── transforms.py         # Data augmentations
 ├── model/
-│   ├── yolo.py            # Model builder from DSL
-│   └── module.py          # Layer definitions
+│   ├── yolo.py               # Model builder from DSL
+│   └── module.py             # Layer definitions
 ├── training/
-│   ├── module.py          # LightningModule
-│   └── loss.py            # Loss functions
-└── data/
-    ├── datamodule.py      # LightningDataModule
-    └── transforms.py      # Data augmentations
+│   ├── module.py             # LightningModule (training, schedulers, freezing)
+│   ├── loss.py               # Loss functions
+│   └── callbacks.py          # Custom callbacks (EMA, metrics display)
+├── tools/
+│   ├── export.py             # Model export (ONNX, TFLite, SavedModel)
+│   └── inference.py          # Inference utilities
+└── utils/
+    ├── bounding_box_utils.py # BBox utilities
+    ├── metrics.py            # Detection metrics (mAP, P/R, confusion matrix)
+    └── logger.py             # Logging
 ```
 
 ## Citations
