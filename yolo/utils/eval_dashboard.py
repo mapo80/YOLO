@@ -223,25 +223,13 @@ class EvalDashboard:
         # === Per-Class Section ===
         per_class = metrics.get("per_class", [])
         if per_class:
-            n = self.config.top_n_classes
             sorted_by_ap = sorted(per_class, key=lambda x: x.get("ap", 0), reverse=True)
-            top_classes = sorted_by_ap[:n]
-            worst_classes = sorted_by_ap[-n:] if len(sorted_by_ap) > n else []
 
-            # Top classes
             table.add_row("", "")
-            table.add_row("[bold yellow]Per-Class (Top)[/]", "")
-            for cls in top_classes:
+            table.add_row("[bold yellow]Per-Class (by AP)[/]", "")
+            for cls in sorted_by_ap:
                 cls_info = f"AP: {cls['ap']:.4f}  AP50: {cls['ap50']:.4f}  R: {cls['recall']:.4f}  GT: {cls['support']}"
                 table.add_row(f"  {cls['name']}", cls_info)
-
-            # Worst classes
-            if worst_classes:
-                table.add_row("", "")
-                table.add_row("[bold yellow]Per-Class (Worst)[/]", "")
-                for cls in worst_classes:
-                    cls_info = f"AP: {cls['ap']:.4f}  AP50: {cls['ap50']:.4f}  R: {cls['recall']:.4f}  GT: {cls['support']}"
-                    table.add_row(f"  {cls['name']}", cls_info)
 
         # === Threshold Sweep Section ===
         sweep = metrics.get("threshold_sweep", {})
