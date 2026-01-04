@@ -287,8 +287,13 @@ class YOLOModule(L.LightningModule):
         if metrics.get("ar_100", 0) >= 0:  # -1 means undefined
             log_dict["val/AR@100"] = metrics["ar_100"]
 
-        # Log to loggers but not to progress bar (EvalDashboard handles display)
+        # Log to loggers (TensorBoard, etc.)
         self.log_dict(log_dict, prog_bar=False, sync_dist=True)
+
+        # Show key metrics in progress bar (mAP is the primary metric)
+        self.log("mAP", metrics["map"], prog_bar=True, sync_dist=True)
+        self.log("mAP50", metrics["map50"], prog_bar=True, sync_dist=True)
+        self.log("mAP75", metrics["map75"], prog_bar=True, sync_dist=True)
 
         # Reset metrics for next epoch
         self._det_metrics.reset()
