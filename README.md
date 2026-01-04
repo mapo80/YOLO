@@ -20,6 +20,73 @@ The original YOLO implementations focused on the model architecture and research
 
 The goal: **make training YOLO as reliable and straightforward as the model itself is powerful**.
 
+## Features
+
+### Training & Optimization
+| Feature | Description |
+|---------|-------------|
+| **Multi-GPU Training** | Scale training across multiple GPUs with automatic Distributed Data Parallel (DDP). No code changes needed - just set `--trainer.devices=N` |
+| **Mixed Precision** | Train 2x faster with half the memory using FP16/BF16. Automatic loss scaling prevents underflow |
+| **Optimizers** | SGD with Nesterov momentum (recommended for detection) or AdamW for faster convergence on small datasets |
+| **LR Schedulers** | Cosine annealing for smooth decay, OneCycle for super-convergence, Step for classic training, Linear for simplicity |
+| **Warmup** | Gradually ramp learning rate and momentum during initial epochs to stabilize training and prevent early divergence |
+| **EMA** | Maintain a smoothed copy of model weights that often achieves better accuracy than final training weights |
+| **Layer Freezing** | Freeze backbone layers when fine-tuning on small datasets. Train only the detection head, then unfreeze for full fine-tuning |
+| **Early Stopping** | Automatically stop training when validation mAP stops improving, saving compute and preventing overfitting |
+| **Checkpointing** | Save best model by mAP, keep last checkpoint for resume, and maintain top-K checkpoints with metrics in filenames |
+
+### Data Augmentation
+| Feature | Description |
+|---------|-------------|
+| **Mosaic 4/9** | Combine 4 or 9 images into one training sample. Improves small object detection and increases effective batch diversity |
+| **MixUp** | Blend two mosaic images with random weights. Regularizes the model and improves generalization |
+| **CutMix** | Cut a patch from one image and paste onto another. Combines benefits of cutout and mixup augmentation |
+| **RandomPerspective** | Apply geometric transforms: rotation, translation, scaling, shear, and perspective distortion with box adjustment |
+| **RandomHSV** | Randomly shift hue, saturation, and brightness. Makes model robust to lighting and color variations |
+| **RandomFlip** | Horizontal and vertical flips with automatic bounding box coordinate updates |
+| **Close Mosaic** | Disable heavy augmentations for final N epochs. Lets model fine-tune on clean images for better convergence |
+
+### Data Loading & Caching
+| Feature | Description |
+|---------|-------------|
+| **Dataset Formats** | Native support for COCO JSON annotations and YOLO TXT format. Switch with `--data.format=yolo` |
+| **Label Caching** | Parse label files once and cache to disk. Subsequent runs load instantly with automatic invalidation on file changes |
+| **Image Caching** | Load images to RAM (`ram`) for fastest training or cache decoded images to disk (`disk`) for moderate speedup |
+| **Custom Loaders** | Plug in custom image loaders for encrypted datasets, cloud storage, or proprietary formats |
+| **Pin Memory** | Pre-load batches to pinned (page-locked) memory for faster CPU-to-GPU transfer |
+
+### Inference & NMS
+| Feature | Description |
+|---------|-------------|
+| **Configurable NMS** | Tune confidence threshold, IoU threshold, and max detections per image to balance precision vs recall |
+| **Batch Inference** | Process entire directories of images with automatic output organization and optional JSON export |
+| **Class Names** | Automatically load class names from dataset (data.yaml or COCO JSON) for human-readable predictions |
+
+### Metrics & Evaluation
+| Feature | Description |
+|---------|-------------|
+| **COCO Metrics** | Full COCO evaluation: mAP@0.5, mAP@0.5:0.95, AP75, AR@100, and size-specific APs/APm/APl |
+| **Precision/Recall/F1** | Track detection quality at your production confidence threshold. Per-class and aggregate scores |
+| **Confusion Matrix** | Visualize which classes get confused with each other. Essential for debugging detection errors |
+| **PR/F1 Curves** | Auto-generated plots showing precision-recall tradeoffs and optimal confidence thresholds |
+| **Eval Dashboard** | Rich terminal dashboard with sparkline trends, top/worst classes, error analysis, and threshold sweep |
+| **Benchmark** | Measure inference latency (mean, p95, p99), memory usage, and throughput with `--benchmark` |
+
+### Model Export
+| Feature | Description |
+|---------|-------------|
+| **ONNX** | Export for cross-platform deployment. Supports simplification, dynamic batching, and FP16 precision |
+| **TFLite** | Deploy on mobile/edge devices with FP32, FP16, or INT8 quantization. INT8 requires calibration images |
+| **SavedModel** | TensorFlow SavedModel format for TF Serving, TensorFlow.js, and cloud deployment |
+
+### Logging & Monitoring
+| Feature | Description |
+|---------|-------------|
+| **TensorBoard** | Visualize training curves, validation metrics, learning rate, and hyperparameters in real-time |
+| **WandB** | Weights & Biases integration for experiment tracking, team collaboration, and hyperparameter sweeps |
+| **Progress Bar** | Custom progress bar showing epoch, loss components (box/cls/dfl), learning rate, and ETA |
+| **Training Summary** | End-of-epoch summary with current vs best mAP, improvement indicators, and checkpoint status |
+
 ## Papers
 
 - [**YOLOv9**: Learning What You Want to Learn Using Programmable Gradient Information](https://arxiv.org/abs/2402.13616)
