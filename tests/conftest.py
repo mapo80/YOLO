@@ -17,8 +17,32 @@ from yolo.model.yolo import YOLO, create_model
 from yolo.utils.bounding_box_utils import Vec2Box, create_converter
 
 
+def pytest_addoption(parser):
+    """Add custom pytest options."""
+    parser.addoption(
+        "--run-integration",
+        action="store_true",
+        default=False,
+        help="Run integration tests (skipped by default)",
+    )
+
+
 def pytest_configure(config):
+    """Configure pytest markers."""
     config.addinivalue_line("markers", "requires_cuda: mark test to run only if CUDA is available")
+    config.addinivalue_line("markers", "integration: mark test as integration test (skipped by default, use --run-integration to run)")
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip integration tests unless --run-integration is passed."""
+    if config.getoption("--run-integration"):
+        # --run-integration given: do not skip integration tests
+        return
+
+    skip_integration = pytest.mark.skip(reason="Integration tests skipped by default. Use --run-integration to run.")
+    for item in items:
+        if "integration" in item.keywords:
+            item.add_marker(skip_integration)
 
 
 @pytest.fixture(scope="session")
