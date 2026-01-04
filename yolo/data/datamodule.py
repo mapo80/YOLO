@@ -350,7 +350,14 @@ class CocoDetectionWrapper(CocoDetection):
         super().__init__(root, annFile)
         self._transforms = transforms
         self.image_size = image_size
-        self.target_transform = YOLOTargetTransform()
+
+        # Build category_id to 0-indexed class mapping from COCO categories
+        # This handles both standard COCO (1-indexed) and custom datasets
+        categories = self.coco.loadCats(self.coco.getCatIds())
+        sorted_cats = sorted(categories, key=lambda x: x["id"])
+        category_id_to_idx = {cat["id"]: idx for idx, cat in enumerate(sorted_cats)}
+
+        self.target_transform = YOLOTargetTransform(category_id_to_idx)
         # Use provided loader or default PIL loader
         self._image_loader = image_loader or DefaultImageLoader()
 
