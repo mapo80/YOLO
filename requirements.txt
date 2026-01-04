@@ -28,3 +28,11 @@ graphviz
 
 # HTTP requests (for weight download)
 requests
+
+# Export (ONNX)
+onnx>=1.14.0
+onnxsim>=0.4.0
+
+# Export (TFLite) - optional, install separately if needed
+# tensorflow>=2.13.0
+# onnx2tf>=1.17.0

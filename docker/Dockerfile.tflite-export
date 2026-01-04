@@ -1,0 +1,35 @@
+# Dockerfile for TFLite export using PINTO0309/onnx2tf base image
+# Build: docker build --platform linux/amd64 -t yolo-tflite-export -f docker/Dockerfile.tflite-export .
+# Run:   docker run --platform linux/amd64 -v $(pwd):/workspace yolo-tflite-export \
+#          --checkpoint /workspace/training-experiment/checkpoints/last.ckpt \
+#          --format tflite --output /workspace/model.tflite
+
+FROM --platform=linux/amd64 pinto0309/onnx2tf:1.26.3
+
+USER root
+WORKDIR /app
+
+# Install only what's missing: PyTorch and YOLO-specific deps
+RUN pip install --no-cache-dir \
+    torch==2.2.0+cpu torchvision==0.17.0+cpu \
+    --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir \
+    lightning "jsonargparse[signatures]>=4.27.7" \
+    omegaconf einops pycocotools opencv-python-headless
+
+# Fix numpy 2.x incompatibility with onnxruntime (must be after lightning which upgrades it)
+RUN pip install --no-cache-dir "numpy<2.0"
+
+# Copy and install YOLO package
+COPY yolo/ /app/yolo/
+COPY pyproject.toml /app/
+RUN pip install --no-cache-dir -e . --no-deps
+
+WORKDIR /workspace
+
+# Wrapper script to use /app/yolo instead of /workspace/yolo
+RUN echo '#!/bin/bash\ncd /app && python -m yolo.cli export "$@"' > /usr/local/bin/yolo-export && \
+    chmod +x /usr/local/bin/yolo-export
+
+ENTRYPOINT ["/usr/local/bin/yolo-export"]
+CMD ["--help"]

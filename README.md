@@ -4,7 +4,7 @@
 ![GitHub License](https://img.shields.io/github/license/WongKinYiu/YOLO)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch Lightning](https://img.shields.io/badge/PyTorch-Lightning-792ee5.svg)](https://lightning.ai/)
-[![Tests](https://img.shields.io/badge/tests-65%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-81%20passed-brightgreen.svg)](tests/)
 
 Welcome to the official implementation of YOLOv7[^1], YOLOv9[^2], and YOLO-RD[^3].
 
@@ -187,67 +187,344 @@ python -m yolo.cli predict --checkpoint runs/best.ckpt --source image.jpg --no-d
 
 ### Export
 
-Export trained models to ONNX format for deployment.
+Export trained models to ONNX, TFLite, or TensorFlow SavedModel format for deployment on various platforms including mobile devices, edge TPUs, and cloud services.
+
+#### Supported Export Formats
+
+| Format | Extension | Use Case | Dependencies |
+|--------|-----------|----------|--------------|
+| **ONNX** | `.onnx` | Cross-platform inference, TensorRT, OpenVINO | `onnx`, `onnxsim` |
+| **TFLite** | `.tflite` | Mobile (Android/iOS), Edge TPU, Coral | `tensorflow`, `onnx2tf` |
+| **SavedModel** | directory | TensorFlow Serving, TF.js | `tensorflow`, `onnx2tf` |
+
+#### Export to ONNX
+
+ONNX export is the fastest and simplest option, with no additional dependencies beyond the base installation.
 
 ```shell
-# Export to ONNX
-python -m yolo.cli export --checkpoint runs/best.ckpt
+# Basic ONNX export
+python -m yolo.cli export --checkpoint runs/best.ckpt --format onnx
 
 # Export with custom output path
 python -m yolo.cli export --checkpoint runs/best.ckpt --output model.onnx
 
-# Export with FP16 (CUDA only)
+# Export with FP16 precision (CUDA only, smaller model)
 python -m yolo.cli export --checkpoint runs/best.ckpt --half
 
-# Export with dynamic batch size
+# Export with dynamic batch size (for variable batch inference)
 python -m yolo.cli export --checkpoint runs/best.ckpt --dynamic-batch
 
-# Export with ONNX simplification (requires onnx-simplifier)
+# Export with ONNX simplification (recommended for deployment)
 python -m yolo.cli export --checkpoint runs/best.ckpt --simplify
+
+# Full example with all optimizations
+python -m yolo.cli export --checkpoint runs/best.ckpt \
+    --format onnx \
+    --output model_optimized.onnx \
+    --simplify \
+    --opset 17
 ```
 
-#### Export Options
+#### Export to TFLite
+
+TFLite export enables deployment on mobile devices (Android, iOS), microcontrollers, and Edge TPU devices like Google Coral.
+
+##### TFLite Dependencies
+
+TFLite export requires additional dependencies and uses a specific export pipeline:
+
+```
+PyTorch (.ckpt) → ONNX → onnx2tf → TFLite (.tflite)
+```
+
+**Important:** The `onnxsim` (ONNX Simplifier) step is **critical** for TFLite export. It propagates static shapes through the ONNX graph, which resolves shape inference issues that would otherwise cause `onnx2tf` conversion to fail.
+
+##### Option 1: Native Installation (Linux x86_64)
+
+For Linux x86_64 systems, you can install dependencies directly:
+
+```shell
+# Install TFLite export dependencies
+pip install tensorflow>=2.15.0 onnx2tf>=1.25.0 onnx>=1.14.0 onnxsim>=0.4.0
+
+# Or use the setup script
+chmod +x scripts/setup_tflite_export.sh
+./scripts/setup_tflite_export.sh
+```
+
+##### Option 2: Docker (macOS, Windows, ARM)
+
+**Why Docker?** TFLite export using `onnx2tf` requires specific dependencies that are challenging to install on:
+- **macOS** (especially Apple Silicon M1/M2/M3)
+- **Windows**
+- **ARM-based Linux systems**
+
+The main issues are:
+1. `onnx2tf` and `tensorflow` have complex dependency chains
+2. Some dependencies are only available for x86_64 architecture
+3. Conflicting numpy versions between tensorflow and onnxruntime
+
+We provide a Docker image based on [PINTO0309/onnx2tf](https://github.com/PINTO0309/onnx2tf) that handles all these complexities.
+
+**Build the Docker image:**
+
+```shell
+# Build the TFLite export Docker image (one-time setup)
+docker build --platform linux/amd64 -t yolo-tflite-export -f docker/Dockerfile.tflite-export .
+```
+
+**Export using Docker:**
+
+```shell
+# Export to TFLite (FP32)
+docker run --platform linux/amd64 -v $(pwd):/workspace yolo-tflite-export \
+    --checkpoint /workspace/runs/best.ckpt \
+    --format tflite \
+    --output /workspace/model.tflite
+
+# Export with FP16 quantization
+docker run --platform linux/amd64 -v $(pwd):/workspace yolo-tflite-export \
+    --checkpoint /workspace/runs/best.ckpt \
+    --format tflite \
+    --quantization fp16 \
+    --output /workspace/model_fp16.tflite
+
+# Export with INT8 quantization (requires calibration images)
+docker run --platform linux/amd64 -v $(pwd):/workspace yolo-tflite-export \
+    --checkpoint /workspace/runs/best.ckpt \
+    --format tflite \
+    --quantization int8 \
+    --calibration-images /workspace/path/to/calibration/images/ \
+    --num-calibration 100 \
+    --output /workspace/model_int8.tflite
+```
+
+##### TFLite Export Commands (Native)
+
+If you have dependencies installed natively:
+
+```shell
+# Export to TFLite (FP32 - full precision)
+python -m yolo.cli export --checkpoint runs/best.ckpt --format tflite
+
+# Export with FP16 quantization (half size, minimal accuracy loss)
+python -m yolo.cli export --checkpoint runs/best.ckpt --format tflite --quantization fp16
+
+# Export with INT8 quantization (smallest size, requires calibration)
+python -m yolo.cli export --checkpoint runs/best.ckpt --format tflite \
+    --quantization int8 \
+    --calibration-images /path/to/train/images/ \
+    --num-calibration 100
+```
+
+#### Export to TensorFlow SavedModel
+
+SavedModel format is useful for TensorFlow Serving and TensorFlow.js deployments.
+
+```shell
+# Export to SavedModel format
+python -m yolo.cli export --checkpoint runs/best.ckpt --format saved_model
+
+# With Docker (if dependencies are not available)
+docker run --platform linux/amd64 -v $(pwd):/workspace yolo-tflite-export \
+    --checkpoint /workspace/runs/best.ckpt \
+    --format saved_model \
+    --output /workspace/saved_model/
+```
+
+#### Export Options Reference
+
+**Common options (all formats):**
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--checkpoint, -c` | required | Path to model checkpoint (.ckpt) |
-| `--output, -o` | auto | Output path (.onnx) |
-| `--size` | 640 | Input image size |
-| `--opset` | 17 | ONNX opset version |
-| `--simplify` | false | Simplify ONNX model (requires `pip install onnx-simplifier`) |
-| `--dynamic-batch` | false | Enable dynamic batch size |
-| `--half` | false | Export in FP16 (CUDA only) |
-| `--device` | auto | Device (cuda/cpu) |
+| `--output, -o` | auto | Output path (auto-generated if not specified) |
+| `--format, -f` | onnx | Export format: `onnx`, `tflite`, or `saved_model` |
+| `--size` | 640 | Input image size (height and width) |
+| `--device` | auto | Device for export (cuda/cpu) |
 
-#### Convert to TFLite
+**ONNX-specific options:**
 
-To convert ONNX to TFLite, use [onnx2tf](https://github.com/PINTO0309/onnx2tf):
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--opset` | 17 | ONNX opset version (13 recommended for TFLite conversion) |
+| `--simplify` | false | Simplify ONNX model using onnxsim |
+| `--dynamic-batch` | false | Enable dynamic batch size dimension |
+| `--half` | false | Export in FP16 precision (CUDA only) |
+
+**TFLite-specific options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--quantization, -q` | fp32 | Quantization mode: `fp32`, `fp16`, or `int8` |
+| `--calibration-images` | - | Directory with representative images (required for INT8) |
+| `--num-calibration` | 100 | Number of calibration images for INT8 quantization |
+
+#### Quantization Comparison
+
+| Mode | Model Size | Inference Speed | Accuracy | Use Case |
+|------|------------|-----------------|----------|----------|
+| **FP32** | 1x (baseline) | 1x | Best | Development, cloud GPU |
+| **FP16** | ~0.5x | ~1.5-2x | Near FP32 | GPU inference, mobile GPU |
+| **INT8** | ~0.25x | ~2-4x | Slight loss | Mobile CPU, Edge TPU, Coral |
+
+**Example model sizes (YOLOv9-T):**
+- FP32: ~10.8 MB
+- FP16: ~5.6 MB
+- INT8: ~2.8 MB (approximate)
+
+#### INT8 Full Quantization
+
+INT8 quantization provides the smallest model size and fastest inference, ideal for Edge TPU (Google Coral), mobile CPUs, and microcontrollers. It requires a **calibration dataset** to determine optimal quantization ranges for each layer.
+
+##### How INT8 Calibration Works
+
+1. **Representative Dataset**: You provide a set of images representative of your inference data
+2. **Forward Pass**: The model runs inference on these images to collect activation statistics
+3. **Range Calculation**: Min/max ranges are computed for each tensor in the network
+4. **Quantization**: Weights and activations are mapped from FP32 to INT8 using these ranges
+
+##### INT8 Export Commands
+
+**Native (Linux x86_64):**
 
 ```shell
-# Install onnx2tf
-pip install onnx2tf tensorflow
+# INT8 with calibration images from training set
+python -m yolo.cli export --checkpoint runs/best.ckpt --format tflite \
+    --quantization int8 \
+    --calibration-images data/train/images/ \
+    --num-calibration 200
 
-# Convert ONNX to TFLite
-onnx2tf -i model.onnx -o tflite_output
-
-# The output directory will contain:
-# - saved_model/          (TensorFlow SavedModel)
-# - model_float32.tflite  (TFLite FP32)
-# - model_float16.tflite  (TFLite FP16)
+# INT8 with custom calibration dataset
+python -m yolo.cli export --checkpoint runs/best.ckpt --format tflite \
+    --quantization int8 \
+    --calibration-images /path/to/calibration/images/ \
+    --num-calibration 100 \
+    --output model_int8.tflite
 ```
 
-**Advanced onnx2tf options:**
+**Docker (macOS, Windows, ARM):**
 
 ```shell
-# With INT8 quantization (requires calibration data)
-onnx2tf -i model.onnx -o tflite_output -oiqt
+# Build Docker image first (one-time)
+docker build --platform linux/amd64 -t yolo-tflite-export -f docker/Dockerfile.tflite-export .
 
-# Specify output signature
-onnx2tf -i model.onnx -o tflite_output -ois images:1,3,640,640
-
-# For Edge TPU deployment
-onnx2tf -i model.onnx -o tflite_output -oiqt -cind images calibration_data.npy
+# INT8 export with calibration
+docker run --platform linux/amd64 -v $(pwd):/workspace yolo-tflite-export \
+    --checkpoint /workspace/runs/best.ckpt \
+    --format tflite \
+    --quantization int8 \
+    --calibration-images /workspace/data/train/images/ \
+    --num-calibration 200 \
+    --output /workspace/model_int8.tflite
 ```
+
+##### Preparing Calibration Images
+
+The calibration dataset should be **representative** of your actual inference data:
+
+```shell
+# Option 1: Use a subset of training images (recommended)
+# The export command will automatically sample from the directory
+
+# Option 2: Create a dedicated calibration folder
+mkdir -p data/calibration
+# Copy diverse images that represent your use case
+cp data/train/images/image_001.jpg data/calibration/
+cp data/train/images/image_050.jpg data/calibration/
+# ... select 100-300 diverse images
+```
+
+##### Calibration Best Practices
+
+| Factor | Recommendation | Impact |
+|--------|----------------|--------|
+| **Number of images** | 100-300 | More = better accuracy, slower export |
+| **Image diversity** | Various scenes, lighting, object sizes | Better generalization |
+| **Image source** | From your training/validation set | Matches deployment distribution |
+| **Image format** | JPG, PNG, BMP supported | Automatically detected |
+
+**Tips for best INT8 accuracy:**
+
+1. **Include edge cases**: Images with small objects, crowded scenes, different lighting
+2. **Balance classes**: Include images with all object classes you want to detect
+3. **Match deployment**: Use images similar to what the model will see in production
+4. **Avoid outliers**: Don't include corrupted or unrepresentative images
+
+##### INT8 Quantization Types
+
+The export uses **per-channel quantization** by default, which provides better accuracy than per-tensor quantization:
+
+| Quantization Type | Accuracy | Speed | Compatibility |
+|-------------------|----------|-------|---------------|
+| Per-tensor | Lower | Fastest | All hardware |
+| **Per-channel** (default) | Higher | Fast | Most modern hardware |
+
+##### Expected Model Sizes
+
+| Model | FP32 | FP16 | INT8 |
+|-------|------|------|------|
+| YOLOv9-T | 10.8 MB | 5.6 MB | ~2.8 MB |
+| YOLOv9-S | 28 MB | 14 MB | ~7 MB |
+| YOLOv9-M | 80 MB | 40 MB | ~20 MB |
+| YOLOv9-C | 100 MB | 50 MB | ~25 MB |
+
+##### Troubleshooting INT8 Export
+
+**Issue: Poor detection accuracy after INT8 quantization**
+- Increase calibration images (try 300+)
+- Ensure calibration images are representative
+- Some models may not quantize well - try FP16 instead
+
+**Issue: Export fails with memory error**
+- Reduce `--num-calibration` to 50-100
+- Ensure Docker has enough memory allocated (8GB+ recommended)
+
+**Issue: Calibration takes too long**
+- Reduce `--num-calibration` (100 is usually sufficient)
+- Use smaller input size `--size 416`
+
+#### TFLite Technical Notes
+
+**Input/Output format differences:**
+- PyTorch/ONNX: NCHW format (batch, channels, height, width)
+- TFLite: NHWC format (batch, height, width, channels)
+- The conversion handles this automatically
+
+**Why onnxsim is critical:**
+The YOLO model contains `AveragePool` operations with shapes that depend on input dimensions. Without `onnxsim`, these shapes remain dynamic (`None`) and cause `onnx2tf` to fail with:
+```
+TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'
+```
+The `onnxsim` step propagates concrete shapes through the graph, resolving this issue.
+
+**Conversion pipeline:**
+```
+1. PyTorch checkpoint → Load model
+2. Model → ONNX (opset 13)
+3. ONNX → onnxsim (simplify and propagate shapes)
+4. Simplified ONNX → onnx2tf → TensorFlow SavedModel
+5. SavedModel → TFLite Converter → .tflite file
+```
+
+#### Docker Image Details
+
+The Docker image (`docker/Dockerfile.tflite-export`) is based on `pinto0309/onnx2tf:1.26.3` and includes:
+
+- TensorFlow 2.18.0
+- onnx2tf 1.26.3
+- PyTorch 2.2.0 (CPU)
+- All YOLO dependencies
+
+**Building the image:**
+```shell
+docker build --platform linux/amd64 -t yolo-tflite-export -f docker/Dockerfile.tflite-export .
+```
+
+**Image size:** ~8 GB (due to TensorFlow and PyTorch)
+
+**Note:** On Apple Silicon Macs (M1/M2/M3), Docker runs the amd64 image through Rosetta emulation. This is slower but works correctly.
 
 ## Features
 
@@ -706,8 +983,9 @@ python -m pytest tests/ --cov=yolo --cov-report=html
 | **Edge Cases** | 4 tests | Single image, small images, non-square, reproducibility |
 | **Model Modules** | 6 tests | Conv, Pool, ADown, CBLinear, SPPELAN |
 | **Utils** | 12 tests | Auto-pad, activation functions, chunk division |
+| **Export** | 16 tests | Letterbox preprocessing, calibration images, ONNX/TFLite signatures, CLI options |
 
-**Total: 65 tests** covering data augmentation, training callbacks, model components, and utilities.
+**Total: 81 tests** covering data augmentation, training callbacks, model components, export, and utilities.
 
 ## Metrics Configuration
 
