@@ -1287,14 +1287,17 @@ The training pipeline includes a comprehensive detection metrics system with aut
 
 ### Available Metrics
 
-| Metric | Config Key | Default | Description |
-|--------|------------|---------|-------------|
-| **mAP** | `log_map` | ✅ | mAP @ IoU=0.50:0.95 (COCO primary metric) |
-| **mAP50** | `log_map_50` | ✅ | mAP @ IoU=0.50 |
-| **mAP75** | `log_map_75` | ✅ | mAP @ IoU=0.75 |
-| **Precision** | `log_precision` | ✅ | Mean precision across all classes |
-| **Recall** | `log_recall` | ✅ | Mean recall across all classes |
-| **F1** | `log_f1` | ✅ | Mean F1 score across all classes |
+All validation metrics are automatically logged to TensorBoard and other loggers:
+
+| Metric | Description |
+|--------|-------------|
+| **val/mAP** | mAP @ IoU=0.50:0.95 (COCO primary metric) |
+| **val/mAP50** | mAP @ IoU=0.50 |
+| **val/mAP75** | mAP @ IoU=0.75 |
+| **val/precision** | Mean precision across all classes |
+| **val/recall** | Mean recall across all classes |
+| **val/f1** | Mean F1 score across all classes |
+| **val/AR@100** | Average Recall with max 100 detections |
 
 ### Metrics Plots
 
@@ -1312,14 +1315,6 @@ Plots are saved to `runs/<experiment>/metrics/epoch_<N>/`.
 
 ```yaml
 model:
-  # Enable/disable specific metrics
-  log_map: true           # mAP @ 0.50:0.95
-  log_map_50: true        # mAP @ 0.50
-  log_map_75: true        # mAP @ 0.75
-  log_precision: true     # Mean precision
-  log_recall: true        # Mean recall
-  log_f1: true            # Mean F1 score
-
   # Metrics plots
   save_metrics_plots: true
   metrics_plots_dir: null  # Auto: runs/<experiment>/metrics/

@@ -29,7 +29,13 @@ trainer:
         filename: "best"
         auto_insert_metric_name: false
 
-    - class_path: lightning.pytorch.callbacks.RichProgressBar
+    - class_path: yolo.training.callbacks.YOLOProgressBar
+
+    - class_path: yolo.training.callbacks.EvalDashboardCallback
+      init_args:
+        conf_prod: 0.25
+        show_trends: true
+        top_n_classes: 3
 
   logger:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger
@@ -52,11 +58,6 @@ model:
   nms_conf_threshold: 0.25
   nms_iou_threshold: 0.65
   nms_max_detections: 300
-  log_map: true
-  log_map_50: true
-  log_map_75: false
-  log_map_per_size: false
-  log_mar_100: false
 
 data:
   root: data/coco

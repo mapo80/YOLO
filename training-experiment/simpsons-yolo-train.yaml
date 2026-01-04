@@ -122,11 +122,6 @@ model:
   nms_conf_threshold: 0.25
   nms_iou_threshold: 0.65
   nms_max_detections: 300
-
-  # Metrics
-  log_map: true
-  log_map_50: true
-  log_map_75: true
   save_metrics_plots: true
 
 # -----------------------------------------------------------------------------

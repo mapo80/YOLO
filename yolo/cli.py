@@ -78,16 +78,54 @@ Examples:
     return parser
 
 
+class YOLOLightningCLI:
+    """
+    Custom LightningCLI wrapper that automatically adds required callbacks.
+
+    Automatically adds:
+    - TrainingSummaryCallback: Shows training configuration before fit
+    - ClassNamesCallback: Loads class names from dataset for metrics display
+    """
+
+    def __init__(self, model_class, datamodule_class, **kwargs):
+        from lightning.pytorch.cli import LightningCLI
+
+        class _CLI(LightningCLI):
+            def _add_callback_if_missing(self, callback_cls, *args, **cb_kwargs):
+                """Add callback if not already present."""
+                has_callback = any(
+                    isinstance(cb, callback_cls) for cb in self.trainer.callbacks
+                )
+                if not has_callback:
+                    self.trainer.callbacks.append(callback_cls(*args, **cb_kwargs))
+
+            def before_fit(self):
+                """Add callbacks before training starts."""
+                from yolo.training.callbacks import (
+                    TrainingSummaryCallback,
+                    ClassNamesCallback,
+                )
+
+                self._add_callback_if_missing(TrainingSummaryCallback)
+                self._add_callback_if_missing(ClassNamesCallback)
+
+            def before_validate(self):
+                """Add callbacks before validation starts."""
+                from yolo.training.callbacks import ClassNamesCallback
+
+                self._add_callback_if_missing(ClassNamesCallback)
+
+        _CLI(model_class, datamodule_class, **kwargs)
+
+
 def train_main(argv: Optional[List[str]] = None) -> int:
     """Run training/validation/test using LightningCLI."""
-    from lightning.pytorch.cli import LightningCLI
-
     from yolo.data.datamodule import YOLODataModule
     from yolo.training.module import YOLOModule
 
     try:
         if argv is None:
-            LightningCLI(
+            YOLOLightningCLI(
                 YOLOModule,
                 YOLODataModule,
                 save_config_kwargs={"overwrite": True},
@@ -96,7 +134,7 @@ def train_main(argv: Optional[List[str]] = None) -> int:
             old_argv = sys.argv
             try:
                 sys.argv = [old_argv[0], *argv]
-                LightningCLI(
+                YOLOLightningCLI(
                     YOLOModule,
                     YOLODataModule,
                     save_config_kwargs={"overwrite": True},

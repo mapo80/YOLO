@@ -69,13 +69,6 @@ class YOLOModule(L.LightningModule):
         nms_conf_threshold: float = 0.25,
         nms_iou_threshold: float = 0.65,
         nms_max_detections: int = 300,
-        # Metrics
-        log_map: bool = True,
-        log_map_50: bool = True,
-        log_map_75: bool = True,
-        log_precision: bool = True,
-        log_recall: bool = True,
-        log_f1: bool = True,
         # Class names for metrics (None = use indices)
         # Can be a dict {0: "name0", 1: "name1"} or list ["name0", "name1"]
         class_names: Optional[Union[Dict[int, str], List[str]]] = None,
@@ -279,34 +272,22 @@ class YOLOModule(L.LightningModule):
         # Store extended metrics for EvalDashboardCallback
         self._last_validation_metrics = metrics
 
-        log_dict = {}
+        # Log all validation metrics to loggers (TensorBoard, etc.)
+        # Note: val/mAP is required by ModelCheckpoint and EarlyStopping callbacks
+        log_dict = {
+            "val/mAP": metrics["map"],
+            "val/mAP50": metrics["map50"],
+            "val/mAP75": metrics["map75"],
+            "val/precision": metrics["precision"],
+            "val/recall": metrics["recall"],
+            "val/f1": metrics["f1"],
+        }
 
-        # Log mAP metrics
-        if self.hparams.log_map:
-            log_dict["val/mAP"] = metrics["map"]
-
-        if self.hparams.log_map_50:
-            log_dict["val/mAP50"] = metrics["map50"]
-
-        if self.hparams.log_map_75:
-            log_dict["val/mAP75"] = metrics["map75"]
-
-        # Log precision, recall, F1
-        if self.hparams.log_precision:
-            log_dict["val/precision"] = metrics["precision"]
-
-        if self.hparams.log_recall:
-            log_dict["val/recall"] = metrics["recall"]
-
-        if self.hparams.log_f1:
-            log_dict["val/f1"] = metrics["f1"]
-
-        # Log extended COCO metrics (AR, size-based AP)
+        # Add extended COCO metrics if available
         if metrics.get("ar_100", 0) >= 0:  # -1 means undefined
             log_dict["val/AR@100"] = metrics["ar_100"]
 
-        # Log to loggers (TensorBoard, etc.) but not to progress bar
-        # The EvalDashboardCallback handles the clean display
+        # Log to loggers but not to progress bar (EvalDashboard handles display)
         self.log_dict(log_dict, prog_bar=False, sync_dist=True)
 
         # Reset metrics for next epoch

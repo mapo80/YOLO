@@ -149,7 +149,13 @@ trainer:
       init_args:
         logging_interval: step
 
-    - class_path: lightning.pytorch.callbacks.RichProgressBar
+    - class_path: yolo.training.callbacks.YOLOProgressBar
+
+    - class_path: yolo.training.callbacks.EvalDashboardCallback
+      init_args:
+        conf_prod: 0.25
+        show_trends: true
+        top_n_classes: 3
 
   logger:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger

@@ -21,6 +21,7 @@ class YOLOProgressBar(RichProgressBar):
 
     Metrics shown: loss | box | cls | dfl | lr
     Epoch display: 1-indexed (Epoch 1/100 instead of Epoch 0/99)
+    Validation progress: Visible during validation phase
     """
 
     def __init__(self):
@@ -47,6 +48,58 @@ class YOLOProgressBar(RichProgressBar):
             # Padding to avoid flickering due to uneven lengths
             train_description = f"{train_description:{len(self.validation_description)}}"
         return train_description
+
+    def on_validation_batch_start(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        """Override to make validation progress bar visible during training."""
+        if self.is_disabled or not self.has_dataloader_changed(dataloader_idx):
+            return
+
+        assert self.progress is not None
+
+        if trainer.sanity_checking:
+            if self.val_sanity_progress_bar_id is not None:
+                self.progress.update(self.val_sanity_progress_bar_id, advance=0, visible=False)
+
+            self.val_sanity_progress_bar_id = self._add_task(
+                self.total_val_batches_current_dataloader,
+                self.sanity_check_description,
+                visible=False,
+            )
+        else:
+            if self.val_progress_bar_id is not None:
+                self.progress.update(self.val_progress_bar_id, advance=0, visible=False)
+
+            # Make validation progress bar VISIBLE (unlike default which hides it)
+            self.val_progress_bar_id = self._add_task(
+                self.total_val_batches_current_dataloader,
+                self.validation_description,
+                visible=True,  # Show validation progress
+            )
+
+        self.refresh()
+
+    def on_validation_epoch_end(
+        self, trainer: L.Trainer, pl_module: L.LightningModule
+    ) -> None:
+        """Override to keep validation progress bar visible until completion."""
+        # Update progress to 100% before hiding
+        if self.is_enabled and self.val_progress_bar_id is not None and trainer.state.fn == "fit":
+            assert self.progress is not None
+            # Show completed state briefly before hiding
+            total = self.progress.tasks[self.val_progress_bar_id].total
+            if total is not None:
+                self.progress.update(self.val_progress_bar_id, completed=total, visible=True)
+            self.refresh()
+            # Then hide it
+            self.progress.update(self.val_progress_bar_id, advance=0, visible=False)
+            self.refresh()
 
     def get_metrics(
         self, trainer: L.Trainer, pl_module: L.LightningModule
@@ -568,6 +621,240 @@ class EMACallback(Callback):
             logger.info(
                 f"EMA restored from checkpoint (updates={self._ema.updates})"
             )
+
+
+class TrainingSummaryCallback(Callback):
+    """
+    Callback that displays a training summary table before training starts.
+
+    Shows organized sections:
+    - Output Directories (Checkpoints, Logs, Metrics)
+    - Model (Architecture, Classes, Image Size, Weights)
+    - Dataset (Format, Root, Batch Size, Workers)
+    - Training (Epochs, Device, Precision, Optimizer, LR, Scheduler)
+    """
+
+    def on_fit_start(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+    ) -> None:
+        """Display training summary before training starts."""
+        from pathlib import Path
+        from rich.console import Console
+        from rich.table import Table
+        from rich import box
+
+        console = Console()
+
+        # Create table with unified format
+        table = Table(
+            title="Training Configuration",
+            title_style="bold cyan",
+            box=box.ROUNDED,
+            padding=(0, 1),
+            expand=True,
+        )
+        table.add_column("Setting", style="bold white", width=24, no_wrap=True)
+        table.add_column("Value", style="green", overflow="fold")
+
+        # === Output Directories Section ===
+        table.add_row("[bold yellow]Output Directories[/]", "")
+
+        # Checkpoint directory
+        ckpt_dir = self._get_checkpoint_dir(trainer)
+        table.add_row("  Checkpoints", str(ckpt_dir) if ckpt_dir else "N/A")
+
+        # Log directory
+        log_dir = self._get_log_dir(trainer)
+        table.add_row("  Logs", str(log_dir) if log_dir else "N/A")
+
+        # Metrics plots directory
+        metrics_dir = self._get_metrics_dir(trainer, pl_module)
+        table.add_row("  Metrics", str(metrics_dir) if metrics_dir else "Disabled")
+
+        # === Model Section ===
+        table.add_row("", "")  # Empty row for spacing
+        table.add_row("[bold yellow]Model[/]", "")
+
+        if hasattr(pl_module, "hparams"):
+            hparams = pl_module.hparams
+            if hasattr(hparams, "model_config"):
+                table.add_row("  Architecture", str(hparams.model_config))
+            if hasattr(hparams, "num_classes"):
+                table.add_row("  Classes", str(hparams.num_classes))
+            if hasattr(hparams, "image_size"):
+                img_sz = hparams.image_size
+                if isinstance(img_sz, (list, tuple)):
+                    table.add_row("  Image Size", f"{img_sz[0]}x{img_sz[1]}")
+                else:
+                    table.add_row("  Image Size", f"{img_sz}x{img_sz}")
+            # Weights info
+            weight_path = getattr(hparams, "weight_path", None)
+            if weight_path is True:
+                table.add_row("  Weights", "Pretrained (auto-download)")
+            elif weight_path:
+                table.add_row("  Weights", str(weight_path))
+            else:
+                table.add_row("  Weights", "From scratch")
+
+        # === Dataset Section ===
+        table.add_row("", "")
+        table.add_row("[bold yellow]Dataset[/]", "")
+
+        if trainer.datamodule and hasattr(trainer.datamodule, "hparams"):
+            dm_hparams = trainer.datamodule.hparams
+            # Format
+            data_format = getattr(dm_hparams, "format", "coco")
+            table.add_row("  Format", data_format.upper())
+            # Root
+            if hasattr(dm_hparams, "root"):
+                table.add_row("  Root", str(dm_hparams.root))
+            # Batch size
+            if hasattr(dm_hparams, "batch_size"):
+                table.add_row("  Batch Size", str(dm_hparams.batch_size))
+            # Workers
+            if hasattr(dm_hparams, "num_workers"):
+                table.add_row("  Workers", str(dm_hparams.num_workers))
+
+        # === Training Section ===
+        table.add_row("", "")
+        table.add_row("[bold yellow]Training[/]", "")
+
+        table.add_row("  Max Epochs", str(trainer.max_epochs))
+
+        # Device
+        device = self._get_device_name(trainer)
+        table.add_row("  Device", device)
+
+        # Precision
+        precision = self._get_precision_name(trainer)
+        table.add_row("  Precision", precision)
+
+        if hasattr(pl_module, "hparams"):
+            hparams = pl_module.hparams
+            # Optimizer
+            if hasattr(hparams, "optimizer"):
+                table.add_row("  Optimizer", hparams.optimizer.upper())
+            # Learning rate
+            if hasattr(hparams, "learning_rate"):
+                table.add_row("  Learning Rate", str(hparams.learning_rate))
+            # LR Scheduler
+            if hasattr(hparams, "lr_scheduler"):
+                table.add_row("  LR Scheduler", hparams.lr_scheduler)
+
+        console.print()
+        console.print(table)
+        console.print()
+
+    def _get_checkpoint_dir(self, trainer: L.Trainer) -> Optional[str]:
+        """Get checkpoint directory from ModelCheckpoint callback."""
+        for cb in trainer.callbacks:
+            if isinstance(cb, ModelCheckpoint):
+                if cb.dirpath:
+                    return cb.dirpath
+        if trainer.log_dir:
+            from pathlib import Path
+            return str(Path(trainer.log_dir) / "checkpoints")
+        return None
+
+    def _get_log_dir(self, trainer: L.Trainer) -> Optional[str]:
+        """Get log directory."""
+        if trainer.log_dir:
+            return trainer.log_dir
+        if trainer.logger and hasattr(trainer.logger, "log_dir"):
+            return trainer.logger.log_dir
+        return None
+
+    def _get_metrics_dir(self, trainer: L.Trainer, pl_module: L.LightningModule) -> Optional[str]:
+        """Get metrics plots directory."""
+        if hasattr(pl_module, "hparams"):
+            if getattr(pl_module.hparams, "save_metrics_plots", False):
+                if getattr(pl_module.hparams, "metrics_plots_dir", None):
+                    return pl_module.hparams.metrics_plots_dir
+                elif trainer.log_dir:
+                    from pathlib import Path
+                    return str(Path(trainer.log_dir) / "metrics")
+        return None
+
+    def _get_device_name(self, trainer: L.Trainer) -> str:
+        """Get clean device name."""
+        accelerator = trainer.accelerator
+        if accelerator:
+            acc_name = accelerator.__class__.__name__
+            if acc_name.endswith("Accelerator"):
+                acc_name = acc_name[:-11]
+            return acc_name.upper()
+        return "CPU"
+
+    def _get_precision_name(self, trainer: L.Trainer) -> str:
+        """Get clean precision name."""
+        precision = str(trainer.precision)
+        if precision == "32-true" or precision == "32":
+            return "FP32"
+        elif precision == "16-mixed":
+            return "FP16 Mixed"
+        elif precision == "bf16-mixed":
+            return "BF16 Mixed"
+        return precision
+
+
+class ClassNamesCallback(Callback):
+    """
+    Callback that automatically loads class names from dataset and passes them to model.
+
+    This ensures class names are available for metrics display during training,
+    showing actual class names instead of indices in the eval dashboard.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._class_names_set = False
+
+    def on_fit_start(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+    ) -> None:
+        """Load class names from datamodule at the start of training."""
+        self._update_metrics_names(trainer, pl_module)
+
+    def on_train_epoch_start(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+    ) -> None:
+        """Ensure class names are set after metrics are created."""
+        if not self._class_names_set:
+            self._update_metrics_names(trainer, pl_module)
+            self._class_names_set = True
+
+    def on_validation_start(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+    ) -> None:
+        """Ensure class names are set for validation."""
+        self._update_metrics_names(trainer, pl_module)
+
+    def _update_metrics_names(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+    ) -> None:
+        """Update metrics with class names from datamodule."""
+        # Get class names from datamodule
+        class_names = None
+        if trainer.datamodule and hasattr(trainer.datamodule, "class_names"):
+            class_names = trainer.datamodule.class_names
+
+        if not class_names:
+            return
+
+        # Update detection metrics if available
+        if hasattr(pl_module, "_det_metrics") and pl_module._det_metrics is not None:
+            pl_module._det_metrics.names = class_names
+            logger.debug(f"Set {len(class_names)} class names in detection metrics")
 
 
 class EvalDashboardCallback(Callback):

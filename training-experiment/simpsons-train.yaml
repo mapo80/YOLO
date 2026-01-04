@@ -101,15 +101,6 @@ model:
   nms_iou_threshold: 0.65
   nms_max_detections: 300
 
-  # Metrics to log
-  log_map: true
-  log_map_50: true
-  log_map_75: true
-  log_map_95: true
-  log_map_per_size: true
-  log_mar_100: true
-  log_mar_per_size: true
-
 # -----------------------------------------------------------------------------
 # Data Configuration
 # -----------------------------------------------------------------------------

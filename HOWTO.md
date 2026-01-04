@@ -317,22 +317,16 @@ When `save_metrics_plots: true` (default), the following plots are automatically
 
 Plots are saved to `runs/<experiment>/metrics/epoch_<N>/`.
 
-### Configure Metrics
+### Configure Metrics Plots
 
 ```yaml
 model:
-  # Enable/disable metrics logging
-  log_map: true
-  log_map_50: true
-  log_map_75: true
-  log_precision: true
-  log_recall: true
-  log_f1: true
-
   # Metrics plots
   save_metrics_plots: true
   metrics_plots_dir: null  # Auto: runs/<experiment>/metrics/
 ```
+
+All validation metrics (mAP, mAP50, mAP75, precision, recall, F1, AR@100) are automatically logged to TensorBoard and other loggers.
 
 ## Learning Rate Schedulers
 
