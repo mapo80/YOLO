@@ -134,8 +134,8 @@ class COCOFormatConverter:
                 "height": image_size[1],
             })
 
-            # Convert ground truth boxes
-            gt_boxes = target["boxes"].cpu().numpy() if len(target["boxes"]) else np.zeros((0, 4))
+            # Convert ground truth boxes (cast to float32 for numpy compatibility with BF16)
+            gt_boxes = target["boxes"].float().cpu().numpy() if len(target["boxes"]) else np.zeros((0, 4))
             gt_labels = target["labels"].cpu().numpy() if len(target["labels"]) else np.zeros(0)
 
             for box, label in zip(gt_boxes, gt_labels):
@@ -150,9 +150,9 @@ class COCOFormatConverter:
                     "iscrowd": 0,
                 })
 
-            # Convert predictions
-            pred_boxes = pred["boxes"].cpu().numpy() if len(pred["boxes"]) else np.zeros((0, 4))
-            pred_scores = pred["scores"].cpu().numpy() if len(pred["scores"]) else np.zeros(0)
+            # Convert predictions (cast to float32 for numpy compatibility with BF16)
+            pred_boxes = pred["boxes"].float().cpu().numpy() if len(pred["boxes"]) else np.zeros((0, 4))
+            pred_scores = pred["scores"].float().cpu().numpy() if len(pred["scores"]) else np.zeros(0)
             pred_labels = pred["labels"].cpu().numpy() if len(pred["labels"]) else np.zeros(0)
 
             for box, score, label in zip(pred_boxes, pred_scores, pred_labels):
@@ -432,11 +432,11 @@ def create_precision_recall_curves(
     all_image_ids = []
 
     for img_idx, (pred, target) in enumerate(zip(predictions, targets)):
-        pred_boxes = pred["boxes"].cpu().numpy() if len(pred["boxes"]) else np.zeros((0, 4))
-        pred_scores = pred["scores"].cpu().numpy() if len(pred["scores"]) else np.zeros(0)
+        pred_boxes = pred["boxes"].float().cpu().numpy() if len(pred["boxes"]) else np.zeros((0, 4))
+        pred_scores = pred["scores"].float().cpu().numpy() if len(pred["scores"]) else np.zeros(0)
         pred_labels = pred["labels"].cpu().numpy() if len(pred["labels"]) else np.zeros(0)
 
-        gt_boxes = target["boxes"].cpu().numpy() if len(target["boxes"]) else np.zeros((0, 4))
+        gt_boxes = target["boxes"].float().cpu().numpy() if len(target["boxes"]) else np.zeros((0, 4))
         gt_labels = target["labels"].cpu().numpy() if len(target["labels"]) else np.zeros(0)
 
         all_pred_boxes.extend(pred_boxes)
@@ -801,11 +801,11 @@ class DetMetrics:
 
         # Update confusion matrix
         for pred, target in zip(preds, targets):
-            pred_boxes = pred["boxes"].cpu().numpy() if len(pred["boxes"]) else np.zeros((0, 4))
-            pred_scores = pred["scores"].cpu().numpy() if len(pred["scores"]) else np.zeros(0)
+            pred_boxes = pred["boxes"].float().cpu().numpy() if len(pred["boxes"]) else np.zeros((0, 4))
+            pred_scores = pred["scores"].float().cpu().numpy() if len(pred["scores"]) else np.zeros(0)
             pred_labels = pred["labels"].cpu().numpy() if len(pred["labels"]) else np.zeros(0)
 
-            gt_boxes = target["boxes"].cpu().numpy() if len(target["boxes"]) else np.zeros((0, 4))
+            gt_boxes = target["boxes"].float().cpu().numpy() if len(target["boxes"]) else np.zeros((0, 4))
             gt_labels = target["labels"].cpu().numpy() if len(target["labels"]) else np.zeros(0)
 
             if len(pred_boxes) > 0:
@@ -1112,16 +1112,16 @@ class DetMetrics:
         iou_tp_list = []
 
         for pred, target in zip(self._predictions, self._targets):
-            # Filter predictions by confidence
-            pred_boxes = pred["boxes"].cpu().numpy() if len(pred["boxes"]) else np.zeros((0, 4))
-            pred_scores = pred["scores"].cpu().numpy() if len(pred["scores"]) else np.zeros(0)
+            # Filter predictions by confidence (cast to float32 for BF16 compatibility)
+            pred_boxes = pred["boxes"].float().cpu().numpy() if len(pred["boxes"]) else np.zeros((0, 4))
+            pred_scores = pred["scores"].float().cpu().numpy() if len(pred["scores"]) else np.zeros(0)
             pred_labels = pred["labels"].cpu().numpy() if len(pred["labels"]) else np.zeros(0)
 
             conf_mask = pred_scores >= conf_threshold
             pred_boxes = pred_boxes[conf_mask]
             pred_labels = pred_labels[conf_mask]
 
-            gt_boxes = target["boxes"].cpu().numpy() if len(target["boxes"]) else np.zeros((0, 4))
+            gt_boxes = target["boxes"].float().cpu().numpy() if len(target["boxes"]) else np.zeros((0, 4))
             gt_labels = target["labels"].cpu().numpy() if len(target["labels"]) else np.zeros(0)
 
             det_per_img.append(len(pred_boxes))
