@@ -218,26 +218,36 @@ Examples:
 
 
 def export_main():
-    """Export model to ONNX format."""
+    """Export model to ONNX or TFLite format."""
     parser = argparse.ArgumentParser(
-        description="YOLO Export - Export model to ONNX format",
+        description="YOLO Export - Export model to ONNX or TFLite format",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Export to ONNX
-  python -m yolo.cli export --checkpoint best.ckpt
+  python -m yolo.cli export --checkpoint best.ckpt --format onnx
 
   # Export with custom output path
   python -m yolo.cli export --checkpoint best.ckpt --output model.onnx
 
-  # Export with FP16 (CUDA only)
+  # Export with FP16 (CUDA only for ONNX)
   python -m yolo.cli export --checkpoint best.ckpt --half
 
-  # Export with dynamic batch size
+  # Export with dynamic batch size (ONNX only)
   python -m yolo.cli export --checkpoint best.ckpt --dynamic-batch
 
-  # Export without simplification
-  python -m yolo.cli export --checkpoint best.ckpt --no-simplify
+  # Export to TFLite (FP32)
+  python -m yolo.cli export --checkpoint best.ckpt --format tflite
+
+  # Export to TFLite with FP16 quantization
+  python -m yolo.cli export --checkpoint best.ckpt --format tflite --quantization fp16
+
+  # Export to TFLite with INT8 quantization
+  python -m yolo.cli export --checkpoint best.ckpt --format tflite \\
+      --quantization int8 --calibration-images /path/to/images/
+
+  # Export to TensorFlow SavedModel
+  python -m yolo.cli export --checkpoint best.ckpt --format saved_model
         """,
     )
     parser.add_argument(
@@ -250,14 +260,14 @@ Examples:
         "--output", "-o",
         type=str,
         default=None,
-        help="Output path for ONNX file (default: checkpoint path with .onnx extension)",
+        help="Output path (default: checkpoint path with appropriate extension)",
     )
     parser.add_argument(
         "--format", "-f",
         type=str,
         default="onnx",
-        choices=["onnx"],
-        help="Export format (default: onnx)",
+        choices=["onnx", "tflite", "saved_model"],
+        help="Export format: onnx, tflite, or saved_model (default: onnx)",
     )
     parser.add_argument(
         "--size",
@@ -280,12 +290,12 @@ Examples:
     parser.add_argument(
         "--dynamic-batch",
         action="store_true",
-        help="Enable dynamic batch size",
+        help="Enable dynamic batch size (ONNX only)",
     )
     parser.add_argument(
         "--half",
         action="store_true",
-        help="Export in FP16 half precision (CUDA only)",
+        help="Export in FP16 half precision (ONNX with CUDA only)",
     )
     parser.add_argument(
         "--device",
@@ -293,15 +303,35 @@ Examples:
         default=None,
         help="Device to use (cuda/cpu, default: auto)",
     )
+    # TFLite-specific arguments
+    parser.add_argument(
+        "--quantization", "-q",
+        type=str,
+        default="fp32",
+        choices=["fp32", "fp16", "int8"],
+        help="TFLite quantization mode: fp32, fp16, or int8 (default: fp32)",
+    )
+    parser.add_argument(
+        "--calibration-images",
+        type=str,
+        default=None,
+        help="Directory with calibration images for INT8 quantization",
+    )
+    parser.add_argument(
+        "--num-calibration",
+        type=int,
+        default=100,
+        help="Number of calibration images for INT8 (default: 100)",
+    )
 
     args = parser.parse_args(sys.argv[2:])  # Skip 'yolo.cli' and 'export'
-
-    # Import here to avoid slow startup
-    from yolo.tools.export import export_onnx
 
     image_size = (args.size, args.size)
 
     if args.format == "onnx":
+        # Import here to avoid slow startup
+        from yolo.tools.export import export_onnx
+
         output_path = export_onnx(
             checkpoint_path=args.checkpoint,
             output_path=args.output,
@@ -313,6 +343,32 @@ Examples:
             device=args.device,
         )
         print(f"\nExport complete: {output_path}")
+
+    elif args.format == "tflite":
+        from yolo.tools.export import export_tflite
+
+        output_path = export_tflite(
+            checkpoint_path=args.checkpoint,
+            output_path=args.output,
+            image_size=image_size,
+            quantization=args.quantization,
+            calibration_images=args.calibration_images,
+            num_calibration_images=args.num_calibration,
+            device=args.device,
+        )
+        print(f"\nExport complete: {output_path}")
+
+    elif args.format == "saved_model":
+        from yolo.tools.export import export_saved_model
+
+        output_path = export_saved_model(
+            checkpoint_path=args.checkpoint,
+            output_path=args.output,
+            image_size=image_size,
+            device=args.device,
+        )
+        print(f"\nExport complete: {output_path}")
+
     else:
         print(f"Error: Unsupported format: {args.format}")
         sys.exit(1)
