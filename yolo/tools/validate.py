@@ -4,15 +4,28 @@ Standalone validation module for YOLO models.
 This module provides functions for validating trained YOLO models on datasets
 without requiring training, computing comprehensive detection metrics.
 
+Features:
+- Full COCO metrics (mAP, AR, size-based AP)
+- Operative metrics at production confidence threshold
+- Interactive eval dashboard display
+- Per-class metrics and confusion analysis
+- Optional benchmark mode for latency/memory profiling
+
 Usage:
     python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml
     python -m yolo.cli validate --checkpoint best.ckpt --data.root dataset/ --data.format yolo
+    python -m yolo.cli validate --checkpoint best.ckpt --benchmark  # Include latency benchmark
 """
 
+import gc
 import json
+import os
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from rich.console import Console
 from rich.table import Table
@@ -24,8 +37,112 @@ from yolo.data.transforms import create_val_transforms
 from yolo.training.module import YOLOModule
 from yolo.utils.bounding_box_utils import Vec2Box, bbox_nms
 from yolo.utils.metrics import DetMetrics
+from yolo.utils.eval_dashboard import EvalDashboard, EvalConfig
 
 console = Console()
+
+
+@dataclass
+class BenchmarkResult:
+    """Container for benchmark results."""
+
+    latency_mean_ms: float
+    latency_std_ms: float
+    fps: float
+    memory_mb: Optional[float] = None
+    model_size_mb: Optional[float] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "latency_mean_ms": self.latency_mean_ms,
+            "latency_std_ms": self.latency_std_ms,
+            "fps": self.fps,
+            "memory_mb": self.memory_mb,
+            "model_size_mb": self.model_size_mb,
+        }
+
+
+def get_gpu_memory() -> Optional[float]:
+    """Get current GPU memory usage in MB."""
+    if torch.cuda.is_available():
+        return torch.cuda.memory_allocated() / 1e6
+    return None
+
+
+def run_benchmark(
+    model: torch.nn.Module,
+    device: torch.device,
+    image_size: Tuple[int, int],
+    batch_size: int = 1,
+    warmup: int = 10,
+    runs: int = 100,
+    checkpoint_path: Optional[str] = None,
+) -> BenchmarkResult:
+    """
+    Run inference benchmark on a model.
+
+    Args:
+        model: Model to benchmark
+        device: Device to run on
+        image_size: Input image size (width, height)
+        batch_size: Batch size for inference
+        warmup: Number of warmup iterations
+        runs: Number of benchmark runs
+        checkpoint_path: Path to checkpoint for model size
+
+    Returns:
+        BenchmarkResult with timing statistics
+    """
+    model.eval()
+
+    # Get model size from checkpoint if available
+    model_size_mb = None
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        model_size_mb = os.path.getsize(checkpoint_path) / 1e6
+
+    # Create dummy input
+    dummy_input = torch.randn(batch_size, 3, image_size[1], image_size[0], device=device)
+
+    # Warmup
+    with torch.no_grad():
+        for _ in range(warmup):
+            _ = model(dummy_input)
+
+    # Synchronize if CUDA
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    # Benchmark
+    latencies = []
+    with torch.no_grad():
+        for _ in range(runs):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+
+            start = time.perf_counter()
+            _ = model(dummy_input)
+
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+
+            end = time.perf_counter()
+            latencies.append((end - start) * 1000)  # Convert to ms
+
+    latencies = np.array(latencies)
+    mean_latency = float(np.mean(latencies))
+    std_latency = float(np.std(latencies))
+    fps = (batch_size * 1000) / mean_latency
+
+    # Get memory usage
+    memory_mb = get_gpu_memory()
+
+    return BenchmarkResult(
+        latency_mean_ms=mean_latency,
+        latency_std_ms=std_latency,
+        fps=fps,
+        memory_mb=memory_mb,
+        model_size_mb=model_size_mb,
+    )
 
 
 def get_device(device: Optional[str] = None) -> torch.device:
@@ -164,12 +281,17 @@ def validate(
     conf_threshold: float = 0.001,
     iou_threshold: float = 0.6,
     max_detections: int = 300,
+    conf_prod: float = 0.25,
     device: Optional[str] = None,
     output_dir: Optional[str] = None,
     save_plots: bool = True,
     save_json: bool = True,
     verbose: bool = True,
-) -> Dict[str, Union[float, Dict]]:
+    benchmark: bool = False,
+    benchmark_warmup: int = 10,
+    benchmark_runs: int = 100,
+    skip_metrics: bool = False,
+) -> Dict[str, Any]:
     """
     Run validation on a trained YOLO model.
 
@@ -183,17 +305,26 @@ def validate(
         batch_size: Batch size for validation
         num_workers: Number of data loading workers
         image_size: Target image size (width, height)
-        conf_threshold: Confidence threshold for filtering predictions
+        conf_threshold: Confidence threshold for filtering predictions (NMS)
         iou_threshold: IoU threshold for NMS
         max_detections: Maximum detections per image
+        conf_prod: Production confidence threshold for operative metrics
         device: Device to use ('cuda', 'mps', 'cpu' or None for auto)
         output_dir: Directory to save results
         save_plots: Whether to save metric plots
         save_json: Whether to save results as JSON
         verbose: Whether to print progress
+        benchmark: Whether to run latency/memory benchmark
+        benchmark_warmup: Number of warmup iterations for benchmark
+        benchmark_runs: Number of benchmark runs
+        skip_metrics: Skip metrics computation (benchmark only mode)
 
     Returns:
-        Dictionary with validation metrics
+        Dictionary with validation metrics including:
+        - COCO metrics (map, map50, map75, ar_100, etc.)
+        - Operative metrics (precision_at_conf, recall_at_conf, etc.)
+        - Per-class data and top confusions
+        - Deploy metrics (if benchmark=True)
     """
     device = get_device(device)
 
@@ -206,13 +337,44 @@ def validate(
     model.eval()
     model.to(device)
 
-    # Get class names from model
+    # Get class names from model or dataset files
     num_classes = model.hparams.num_classes
     class_names = {i: str(i) for i in range(num_classes)}
 
-    # Try to get class names from model if available
-    if hasattr(model, "_class_names") and model._class_names is not None:
-        class_names = model._class_names
+    # Try to load class names based on format
+    if data_format == "yolo":
+        # YOLO format: load from data.yaml
+        data_yaml_path = Path(data_root) / "data.yaml"
+        if data_yaml_path.exists():
+            try:
+                import yaml
+                with open(data_yaml_path) as f:
+                    data_config = yaml.safe_load(f)
+                if "names" in data_config:
+                    names_list = data_config["names"]
+                    class_names = {i: name for i, name in enumerate(names_list)}
+            except Exception:
+                pass  # Keep default numeric names
+    else:
+        # COCO format: load from annotation JSON
+        if val_ann:
+            ann_path = Path(data_root) / val_ann
+            if ann_path.exists():
+                try:
+                    with open(ann_path) as f:
+                        coco_data = json.load(f)
+                    if "categories" in coco_data:
+                        # COCO categories have 'id' and 'name' fields
+                        # Sort by id to ensure correct mapping
+                        categories = sorted(coco_data["categories"], key=lambda x: x["id"])
+                        class_names = {i: cat["name"] for i, cat in enumerate(categories)}
+                except Exception:
+                    pass  # Keep default numeric names
+
+    # Fallback: try to get class names from model if dataset files didn't provide them
+    if all(isinstance(v, str) and v.isdigit() for v in class_names.values()):
+        if hasattr(model, "_class_names") and model._class_names is not None:
+            class_names = model._class_names
 
     if verbose:
         console.print(f"[bold blue]Number of classes:[/] {num_classes}")
@@ -326,32 +488,77 @@ def validate(
     output_path = Path(output_dir) if output_dir else Path("validation_results")
     output_path.mkdir(parents=True, exist_ok=True)
 
+    # Process metrics with extended COCO evaluation
     results = metrics.process(
         save_dir=output_path if save_plots else None,
         plot=save_plots,
+        conf_prod=conf_prod,
     )
 
-    # Print results
+    # Run benchmark if requested
+    benchmark_result = None
+    if benchmark:
+        if verbose:
+            console.print("\n[bold yellow]Running inference benchmark...[/]")
+        benchmark_result = run_benchmark(
+            model=model,
+            device=device,
+            image_size=image_size,
+            batch_size=1,  # Benchmark with batch=1 for latency
+            warmup=benchmark_warmup,
+            runs=benchmark_runs,
+            checkpoint_path=checkpoint_path,
+        )
+        # Clean up
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Print results using eval dashboard
     if verbose:
-        print_results(results, metrics, class_names)
+        dashboard = EvalDashboard(EvalConfig(
+            conf_prod=conf_prod,
+            nms_iou=iou_threshold,
+            max_det=max_detections,
+        ))
+        dashboard.print(
+            metrics=results,
+            num_images=len(dataloader.dataset),
+            image_size=image_size,
+            latency_ms=benchmark_result.latency_mean_ms if benchmark_result else None,
+            memory_mb=benchmark_result.memory_mb if benchmark_result else None,
+            model_size_mb=benchmark_result.model_size_mb if benchmark_result else None,
+        )
+
+    # Build full results dict
+    full_results = {
+        "metrics": {
+            k: v for k, v in results.items()
+            if not isinstance(v, (list, dict))
+        },
+        "per_class": results.get("per_class", []),
+        "top_confusions": results.get("top_confusions", []),
+        "threshold_sweep": results.get("threshold_sweep", {}),
+        "config": {
+            "checkpoint": checkpoint_path,
+            "data_root": data_root,
+            "data_format": data_format,
+            "image_size": list(image_size),
+            "conf_threshold": conf_threshold,
+            "iou_threshold": iou_threshold,
+            "conf_prod": conf_prod,
+        },
+    }
+
+    # Add benchmark results
+    if benchmark_result:
+        full_results["deploy"] = benchmark_result.to_dict()
 
     # Save results
     if save_json:
         results_file = output_path / "results.json"
-        full_results = {
-            "metrics": results,
-            "per_class": metrics.summary(),
-            "config": {
-                "checkpoint": checkpoint_path,
-                "data_root": data_root,
-                "data_format": data_format,
-                "image_size": list(image_size),
-                "conf_threshold": conf_threshold,
-                "iou_threshold": iou_threshold,
-            },
-        }
         with open(results_file, "w") as f:
-            json.dump(full_results, f, indent=2)
+            json.dump(full_results, f, indent=2, default=str)
         if verbose:
             console.print(f"\n[green]Results saved to:[/] {results_file}")
 
@@ -361,6 +568,10 @@ def validate(
         f.write(metrics.to_csv())
     if verbose:
         console.print(f"[green]Per-class metrics saved to:[/] {csv_file}")
+
+    if verbose:
+        if save_plots:
+            console.print(f"[green]Plots saved to:[/] {output_path}")
 
     return results
 
@@ -451,60 +662,3 @@ def decode_predictions(
     return predictions
 
 
-def print_results(
-    results: Dict[str, float],
-    metrics: DetMetrics,
-    class_names: Dict[int, str],
-) -> None:
-    """
-    Print validation results in a formatted table.
-
-    Args:
-        results: Dictionary of aggregate metrics
-        metrics: DetMetrics object with per-class data
-        class_names: Dictionary mapping class indices to names
-    """
-    console.print("\n" + "=" * 60)
-    console.print("[bold green]Validation Results[/]")
-    console.print("=" * 60)
-
-    # Summary metrics table
-    summary_table = Table(title="Summary Metrics", show_header=True, header_style="bold cyan")
-    summary_table.add_column("Metric", style="cyan")
-    summary_table.add_column("Value", justify="right", style="green")
-
-    summary_table.add_row("mAP@0.5:0.95", f"{results['map']:.4f}")
-    summary_table.add_row("mAP@0.5", f"{results['map50']:.4f}")
-    summary_table.add_row("mAP@0.75", f"{results['map75']:.4f}")
-    summary_table.add_row("Precision", f"{results['precision']:.4f}")
-    summary_table.add_row("Recall", f"{results['recall']:.4f}")
-    summary_table.add_row("F1 Score", f"{results['f1']:.4f}")
-
-    console.print(summary_table)
-
-    # Per-class metrics table
-    per_class = metrics.summary()
-    if per_class:
-        class_table = Table(title="Per-Class Metrics", show_header=True, header_style="bold cyan")
-        class_table.add_column("Class", style="cyan")
-        class_table.add_column("Instances", justify="right")
-        class_table.add_column("P", justify="right")
-        class_table.add_column("R", justify="right")
-        class_table.add_column("F1", justify="right")
-        class_table.add_column("mAP50", justify="right")
-        class_table.add_column("mAP50-95", justify="right")
-
-        for row in per_class:
-            class_table.add_row(
-                str(row["Class"]),
-                str(row["Instances"]),
-                f"{row['P']:.3f}",
-                f"{row['R']:.3f}",
-                f"{row['F1']:.3f}",
-                f"{row['mAP50']:.3f}",
-                f"{row['mAP50-95']:.3f}",
-            )
-
-        console.print(class_table)
-
-    console.print("=" * 60 + "\n")

@@ -10,11 +10,9 @@ import torch
 import lightning as L
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
-from rich.console import Console
-from rich.table import Table
-from rich.text import Text
 
 from yolo.utils.logger import logger
+from yolo.utils.eval_dashboard import EvalDashboard, EvalConfig
 
 
 class YOLOProgressBar(RichProgressBar):
@@ -570,3 +568,104 @@ class EMACallback(Callback):
             logger.info(
                 f"EMA restored from checkpoint (updates={self._ema.updates})"
             )
+
+
+class EvalDashboardCallback(Callback):
+    """
+    Callback that displays comprehensive eval dashboard after each validation epoch.
+
+    Shows:
+    - Quality metrics (mAP, AP50, AP75, AR@100, size-based metrics)
+    - Operative metrics at production confidence threshold
+    - Trend sparklines (last N epochs)
+    - Threshold sweep table
+    - Per-class TOP/WORST classes
+    - Error health check (FP, FN, confusions)
+
+    Example usage in config:
+        trainer:
+          callbacks:
+            - class_path: yolo.training.callbacks.EvalDashboardCallback
+              init_args:
+                conf_prod: 0.25
+                show_trends: true
+                top_n_classes: 3
+    """
+
+    def __init__(
+        self,
+        conf_prod: float = 0.25,
+        show_trends: bool = True,
+        top_n_classes: int = 3,
+    ):
+        """
+        Initialize EvalDashboardCallback.
+
+        Args:
+            conf_prod: Production confidence threshold for operative metrics
+            show_trends: Whether to show sparkline trends
+            top_n_classes: Number of top/worst classes to display
+        """
+        super().__init__()
+        config = EvalConfig(
+            conf_prod=conf_prod,
+            show_trends=show_trends,
+            top_n_classes=top_n_classes,
+        )
+        self.dashboard = EvalDashboard(config)
+        self.conf_prod = conf_prod
+
+    def on_train_epoch_end(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+    ) -> None:
+        """Display dashboard at the end of training epoch (after validation)."""
+        # Skip if no metrics yet
+        if not trainer.callback_metrics:
+            return
+
+        # Skip during sanity check
+        if trainer.sanity_checking:
+            return
+
+        # Only print if we have validation metrics
+        if "val/mAP" not in trainer.callback_metrics:
+            return
+
+        # Get extended validation metrics from module
+        metrics = getattr(pl_module, "_last_validation_metrics", None)
+        if metrics is None:
+            return
+
+        # Get number of validation images
+        num_images = 0
+        if trainer.val_dataloaders is not None:
+            try:
+                num_images = len(trainer.val_dataloaders.dataset)
+            except (AttributeError, TypeError):
+                pass
+
+        # Get image size from module if available
+        image_size = (640, 640)
+        if hasattr(pl_module, "hparams"):
+            if hasattr(pl_module.hparams, "image_size"):
+                img_sz = pl_module.hparams.image_size
+                if isinstance(img_sz, int):
+                    image_size = (img_sz, img_sz)
+                elif isinstance(img_sz, (list, tuple)) and len(img_sz) >= 2:
+                    image_size = (img_sz[0], img_sz[1])
+
+        # Get run ID from logger
+        run_id = ""
+        if trainer.logger is not None:
+            run_id = getattr(trainer.logger, "name", "") or ""
+
+        self.dashboard.print(
+            metrics=metrics,
+            epoch=trainer.current_epoch + 1,
+            total_epochs=trainer.max_epochs,
+            run_id=run_id,
+            num_images=num_images,
+            image_size=image_size,
+        )

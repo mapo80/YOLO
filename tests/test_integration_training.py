@@ -223,14 +223,16 @@ class TestSyntheticTrainingIntegration:
         """Test confusion matrix with known inputs."""
         from yolo.utils.metrics import ConfusionMatrix
 
-        cm = ConfusionMatrix(nc=3, names={0: "cat", 1: "dog", 2: "bird"})
+        cm = ConfusionMatrix(num_classes=3, class_names={0: "cat", 1: "dog", 2: "bird"})
 
         # Perfect predictions
+        # Format: [x1, y1, x2, y2, conf, class]
         detections = [
             [100, 100, 200, 200, 0.9, 0],  # Pred cat
             [300, 300, 400, 400, 0.8, 1],  # Pred dog
             [500, 500, 600, 600, 0.7, 2],  # Pred bird
         ]
+        # Format: [class, x1, y1, x2, y2]
         labels = [
             [0, 100, 100, 200, 200],  # GT cat
             [1, 300, 300, 400, 400],  # GT dog
@@ -238,14 +240,12 @@ class TestSyntheticTrainingIntegration:
         ]
 
         import numpy as np
-        cm.process_batch(np.array(detections), np.array(labels))
+        cm.update(np.array(detections), np.array(labels))
 
-        # Check diagonal (true positives)
-        tp, fp = cm.tp_fp()
-        assert tp[0] == 1  # Cat TP
-        assert tp[1] == 1  # Dog TP
-        assert tp[2] == 1  # Bird TP
-        assert sum(fp) == 0  # No false positives
+        # Check diagonal (true positives on matrix diagonal)
+        assert cm.matrix[0, 0] == 1  # Cat TP
+        assert cm.matrix[1, 1] == 1  # Dog TP
+        assert cm.matrix[2, 2] == 1  # Bird TP
 
 
 class TestSchedulerIntegration:

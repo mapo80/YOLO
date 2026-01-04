@@ -16,7 +16,7 @@
 # Trainer Configuration
 # -----------------------------------------------------------------------------
 trainer:
-  max_epochs: 5
+  max_epochs: 50
   accelerator: auto      # Supports: cuda, mps, cpu
   devices: auto          # Auto-detect available devices
   precision: 32          # Use 32 for MPS, 16-mixed for CUDA
@@ -52,7 +52,11 @@ trainer:
 
     - class_path: yolo.training.callbacks.YOLOProgressBar
 
-    - class_path: yolo.training.callbacks.MetricsTableCallback
+    - class_path: yolo.training.callbacks.EvalDashboardCallback
+      init_args:
+        conf_prod: 0.25
+        show_trends: true
+        top_n_classes: 3
 
     # EMA: Exponential Moving Average
     - class_path: yolo.training.callbacks.EMACallback

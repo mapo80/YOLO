@@ -261,11 +261,18 @@ class YOLOModule(L.LightningModule):
             # Add epoch subdirectory
             save_dir = save_dir / f"epoch_{self.current_epoch + 1}"
 
-        # Process metrics and generate plots
+        # Get confidence threshold from hparams (default 0.25)
+        conf_prod = getattr(self.hparams, "nms_conf_threshold", 0.25)
+
+        # Process metrics and generate plots (with extended COCO metrics)
         metrics = self._det_metrics.process(
             save_dir=save_dir,
             plot=self.hparams.save_metrics_plots,
+            conf_prod=conf_prod,
         )
+
+        # Store extended metrics for EvalDashboardCallback
+        self._last_validation_metrics = metrics
 
         log_dict = {}
 
@@ -289,8 +296,12 @@ class YOLOModule(L.LightningModule):
         if self.hparams.log_f1:
             log_dict["val/f1"] = metrics["f1"]
 
+        # Log extended COCO metrics (AR, size-based AP)
+        if metrics.get("ar_100", 0) >= 0:  # -1 means undefined
+            log_dict["val/AR@100"] = metrics["ar_100"]
+
         # Log to loggers (TensorBoard, etc.) but not to progress bar
-        # The MetricsTableCallback handles the clean display
+        # The EvalDashboardCallback handles the clean display
         self.log_dict(log_dict, prog_bar=False, sync_dist=True)
 
         # Reset metrics for next epoch

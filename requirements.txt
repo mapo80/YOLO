@@ -14,7 +14,8 @@ omegaconf
 
 # Utilities
 einops
-numpy
+numpy<2.0
+scipy>=1.10
 Pillow
 opencv-python
 
@@ -24,7 +25,9 @@ rich
 wandb
 tensorboard
 
-# Visualization (optional)
+# Visualization
+seaborn>=0.12
+matplotlib>=3.5
 graphviz
 
 # HTTP requests (for weight download)
