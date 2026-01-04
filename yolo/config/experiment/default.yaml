@@ -71,6 +71,14 @@ trainer:
 
     - class_path: yolo.training.callbacks.MetricsTableCallback
 
+    # EMA: Exponential Moving Average of model weights
+    # Improves final model accuracy by averaging weights over training
+    - class_path: yolo.training.callbacks.EMACallback
+      init_args:
+        decay: 0.9999       # EMA decay rate (higher = more smoothing)
+        tau: 2000           # Warmup steps for decay ramping
+        enabled: true       # Set to false to disable EMA
+
   # Logger
   logger:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger
@@ -87,14 +95,16 @@ model:
   num_classes: 80
   image_size: [640, 640]
 
-  # Optimizer
+  # Optimizer: "sgd" (default, recommended for detection) or "adamw"
+  optimizer: sgd
   learning_rate: 0.01
-  momentum: 0.937
+  momentum: 0.937              # SGD only
   weight_decay: 0.0005
+  adamw_betas: [0.9, 0.999]    # AdamW only
 
   # Warmup
   warmup_epochs: 3
-  warmup_momentum: 0.8
+  warmup_momentum: 0.8         # SGD only
   warmup_bias_lr: 0.1
 
   # Loss weights
@@ -137,19 +147,37 @@ data:
   image_size: [640, 640]
   pin_memory: true
 
-  # Augmentation
-  mosaic_prob: 1.0
-  mixup_prob: 0.15
-  hsv_h: 0.015
-  hsv_s: 0.7
-  hsv_v: 0.4
-  degrees: 0.0
-  translate: 0.1
-  scale: 0.9
-  shear: 0.0
-  perspective: 0.0
-  flip_lr: 0.5
-  flip_ud: 0.0
+  # === Multi-Image Augmentation ===
+  # Set probability to 0.0 to disable any augmentation
 
-  # Disable mosaic for last N epochs
+  # Mosaic: combines 4 or 9 images into one
+  mosaic_prob: 1.0             # 0.0 = disabled, 1.0 = always
+  mosaic_9_prob: 0.0           # Probability of 9-way vs 4-way mosaic
+
+  # MixUp: blends two images together
+  mixup_prob: 0.15             # 0.0 = disabled
+  mixup_alpha: 32.0            # Beta distribution parameter
+
+  # CutMix: pastes rectangular region from another image
+  cutmix_prob: 0.0             # 0.0 = disabled
+
+  # === Single-Image Augmentation ===
+  # Color augmentation (HSV)
+  hsv_h: 0.015                 # Hue shift (0 = disabled)
+  hsv_s: 0.7                   # Saturation (0 = disabled)
+  hsv_v: 0.4                   # Value/brightness (0 = disabled)
+
+  # Geometric augmentation (RandomPerspective)
+  degrees: 0.0                 # Max rotation degrees (+/-), 0 = disabled
+  translate: 0.1               # Max translation as fraction of image size
+  scale: 0.9                   # Scale range (1-scale to 1+scale)
+  shear: 0.0                   # Max shear degrees (+/-), 0 = disabled
+  perspective: 0.0             # Perspective distortion, 0 = disabled
+
+  # Flip augmentation
+  flip_lr: 0.5                 # Horizontal flip probability
+  flip_ud: 0.0                 # Vertical flip probability
+
+  # === Training Schedule ===
+  # Disable mosaic/mixup/cutmix for final N epochs (improves convergence)
   close_mosaic_epochs: 15

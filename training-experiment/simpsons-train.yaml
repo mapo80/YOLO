@@ -53,6 +53,13 @@ trainer:
 
     - class_path: yolo.training.callbacks.MetricsTableCallback
 
+    # EMA: Exponential Moving Average (improves final accuracy)
+    - class_path: yolo.training.callbacks.EMACallback
+      init_args:
+        decay: 0.9999
+        tau: 2000
+        enabled: true
+
   # Logger
   logger:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger
@@ -70,9 +77,11 @@ model:
   image_size: [640, 640]
 
   # Optimizer
+  optimizer: sgd
   learning_rate: 0.01
   momentum: 0.937
   weight_decay: 0.0005
+  adamw_betas: [0.9, 0.999]
 
   # Warmup
   warmup_epochs: 3
@@ -118,13 +127,18 @@ data:
   image_size: [640, 640]
   pin_memory: true
 
-  # Augmentation - Strong augmentation for small dataset
-  mosaic_prob: 1.0
-  mixup_prob: 0.15
+  # === Multi-Image Augmentation (strong for small dataset) ===
+  mosaic_prob: 1.0             # Mosaic always on
+  mosaic_9_prob: 0.0           # Use 4-way mosaic
+  mixup_prob: 0.3              # Higher mixup for regularization
+  mixup_alpha: 32.0
+  cutmix_prob: 0.1             # Add cutmix for small dataset
+
+  # === Single-Image Augmentation ===
   hsv_h: 0.015
   hsv_s: 0.7
   hsv_v: 0.4
-  degrees: 10.0          # More rotation for cartoon images
+  degrees: 10.0                # More rotation for cartoon images
   translate: 0.1
   scale: 0.9
   shear: 0.0
@@ -132,5 +146,5 @@ data:
   flip_lr: 0.5
   flip_ud: 0.0
 
-  # Disable mosaic for last N epochs
+  # === Training Schedule ===
   close_mosaic_epochs: 10

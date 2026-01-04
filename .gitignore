@@ -153,4 +153,4 @@ node_modules/
 training-experiment/*
 !training-experiment/simpsons-train.yaml
 !training-experiment/TRAINING_GUIDE.md
-!yolo/data
+.ultralytics/
