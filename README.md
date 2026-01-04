@@ -955,6 +955,106 @@ data:
 
 See [HOWTO](docs/HOWTO.md) for detailed documentation and [Training Guide](training-experiment/TRAINING_GUIDE.md) for a complete training example.
 
+### Dataset Formats
+
+The training pipeline supports two dataset formats: **COCO** (default) and **YOLO**.
+
+#### COCO Format (Default)
+
+Standard COCO JSON annotation format. Used by default.
+
+**Directory structure:**
+```
+dataset/
+├── images/
+│   ├── train/
+│   │   └── *.jpg
+│   └── val/
+│       └── *.jpg
+└── annotations/
+    ├── instances_train.json
+    └── instances_val.json
+```
+
+**Configuration:**
+```yaml
+data:
+  root: path/to/dataset
+  train_images: images/train
+  val_images: images/val
+  train_ann: annotations/instances_train.json
+  val_ann: annotations/instances_val.json
+  batch_size: 16
+  image_size: [640, 640]
+```
+
+**Training command:**
+```shell
+python -m yolo.cli fit --config config.yaml
+```
+
+#### YOLO Format
+
+Standard YOLO `.txt` annotation format with normalized coordinates.
+
+**Directory structure:**
+```
+dataset/
+├── train/
+│   ├── images/
+│   │   └── *.jpg
+│   └── labels/
+│       └── *.txt
+└── valid/
+    ├── images/
+    │   └── *.jpg
+    └── labels/
+        └── *.txt
+```
+
+**Label file format** (one file per image, same name as image):
+```
+class_id x_center y_center width height
+class_id x_center y_center width height
+...
+```
+All coordinates are **normalized** (0-1 range).
+
+**Configuration:**
+```yaml
+data:
+  root: path/to/dataset
+  train_images: train/images
+  train_labels: train/labels
+  val_images: valid/images
+  val_labels: valid/labels
+  batch_size: 16
+  image_size: [640, 640]
+```
+
+**Training command** (note `--data.format=yolo`):
+```shell
+python -m yolo.cli fit --config config.yaml --data.format=yolo
+```
+
+#### Example Configurations
+
+See the training experiment for complete examples:
+
+| Format | Config File | Dataset |
+|--------|-------------|---------|
+| **COCO** | [simpsons-train.yaml](training-experiment/simpsons-train.yaml) | `simpsons-coco-std/` |
+| **YOLO** | [simpsons-yolo-train.yaml](training-experiment/simpsons-yolo-train.yaml) | `simpsons-yolo/` |
+
+**Quick start:**
+```shell
+# Train with COCO format
+python -m yolo.cli fit --config training-experiment/simpsons-train.yaml
+
+# Train with YOLO format
+python -m yolo.cli fit --config training-experiment/simpsons-yolo-train.yaml --data.format=yolo
+```
+
 ## Testing
 
 The project includes a comprehensive test suite to ensure correctness of all components.
