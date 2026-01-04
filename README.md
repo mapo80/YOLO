@@ -962,7 +962,7 @@ The project includes a comprehensive test suite to ensure correctness of all com
 ### Running Tests
 
 ```shell
-# Run all tests
+# Run all tests (excluding integration tests)
 python -m pytest tests/ -v
 
 # Run specific test file
@@ -970,6 +970,9 @@ python -m pytest tests/test_augmentations.py -v
 
 # Run with coverage
 python -m pytest tests/ --cov=yolo --cov-report=html
+
+# Run integration tests (require additional setup/datasets)
+python -m pytest tests/ -v --run-integration
 ```
 
 ### Test Coverage
@@ -982,11 +985,13 @@ python -m pytest tests/ --cov=yolo --cov-report=html
 | **Layer Freezing** | 14 tests | Backbone freezing, pattern matching, epoch-based unfreezing |
 | **Model Building** | 10 tests | v9-c, v9-m, v9-s, v7 models, forward pass |
 | **Bounding Box Utils** | 13 tests | IoU, transforms, NMS, anchor generation |
-| **Export** | 10 tests | Letterbox, ONNX/TFLite signatures, CLI options |
+| **Export** | 12 tests | Letterbox, ONNX/TFLite signatures, CLI options |
 | **Training Experiment** | 16 tests | Dataset loading, metrics, schedulers, freezing, export |
+| **YOLO Format Dataloader** | 30 tests | Dataset loading, transforms, collate, edge cases |
+| **Integration** | 10 tests | Full pipeline tests (run with `--run-integration`) |
 | **Other** | 40+ tests | Utils, module tests, edge cases |
 
-**Total: 209 tests** covering data augmentation, training callbacks, metrics, schedulers, layer freezing, model components, export, and utilities.
+**Total: 256 tests** covering data augmentation, training callbacks, metrics, schedulers, layer freezing, model components, export, and utilities.
 
 ### Training Experiment Tests
 

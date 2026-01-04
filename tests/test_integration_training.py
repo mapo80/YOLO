@@ -3,6 +3,12 @@ Integration tests for complete training pipeline.
 
 These tests verify end-to-end functionality using the training-experiment
 dataset (if available) or synthetic data.
+
+Run these tests explicitly with:
+    pytest tests/test_integration_training.py -v --run-integration
+
+Or run all integration tests:
+    pytest -m integration --run-integration
 """
 
 import tempfile
@@ -14,11 +20,9 @@ import torch
 import torch.nn as nn
 
 
-# Skip entire module if training-experiment dataset is not available
-pytestmark = pytest.mark.skipif(
-    not Path(__file__).resolve().parent.parent.joinpath("data", "training-experiment").exists(),
-    reason="training-experiment dataset not available",
-)
+# Mark entire module as integration tests - skipped by default
+# Use: pytest --run-integration to run these tests
+pytestmark = pytest.mark.integration
 
 
 class TestTrainingExperimentIntegration:
@@ -27,7 +31,10 @@ class TestTrainingExperimentIntegration:
     @pytest.fixture
     def dataset_path(self):
         """Get path to training-experiment dataset."""
-        return Path(__file__).resolve().parent.parent / "data" / "training-experiment"
+        path = Path(__file__).resolve().parent.parent / "data" / "training-experiment"
+        if not path.exists():
+            pytest.skip("training-experiment dataset not available")
+        return path
 
     def test_dataset_structure(self, dataset_path):
         """Verify training-experiment dataset has correct structure."""
