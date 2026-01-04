@@ -920,7 +920,10 @@ class DetMetrics:
 
             # Extract all 12 metrics from COCO evaluation
             # stats order: AP, AP50, AP75, APs, APm, APl, AR1, AR10, AR100, ARs, ARm, ARl
-            coco_stats = coco_eval.stats
+            if coco_eval.stats is not None and len(coco_eval.stats) >= 12:
+                coco_stats = coco_eval.stats
+            else:
+                logger.warning("[Metrics] COCO eval returned empty stats (no valid predictions?)")
         except Exception as e:
             logger.warning(f"[Metrics] COCO eval failed: {e}")
 
