@@ -6,7 +6,7 @@ Usage:
     python -m yolo.cli fit --config yolo/config/experiment/default.yaml
 
     # Validation
-    python -m yolo.cli validate --ckpt_path=best.ckpt
+    python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml
 
     # Or use the installed command
     yolo fit --config yolo/config/experiment/default.yaml
@@ -23,10 +23,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module=".*pkg_resources.
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=".*pkg_resources.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*pkg_resources.*")
 
-from yolo.config.config import ModelConfig, NMSConfig
-from yolo.model.yolo import YOLO, create_model
-from yolo.utils.bounding_box_utils import Anc2Box, Vec2Box, bbox_nms, create_converter
-
 __all__ = [
     # Model
     "YOLO",
@@ -40,3 +36,32 @@ __all__ = [
     "bbox_nms",
     "create_converter",
 ]
+
+_LAZY_ATTRS = {
+    # Model
+    "YOLO": ("yolo.model.yolo", "YOLO"),
+    "create_model": ("yolo.model.yolo", "create_model"),
+    # Config
+    "ModelConfig": ("yolo.config.config", "ModelConfig"),
+    "NMSConfig": ("yolo.config.config", "NMSConfig"),
+    # Utilities
+    "Vec2Box": ("yolo.utils.bounding_box_utils", "Vec2Box"),
+    "Anc2Box": ("yolo.utils.bounding_box_utils", "Anc2Box"),
+    "bbox_nms": ("yolo.utils.bounding_box_utils", "bbox_nms"),
+    "create_converter": ("yolo.utils.bounding_box_utils", "create_converter"),
+}
+
+
+def __getattr__(name: str):
+    if name not in _LAZY_ATTRS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = _LAZY_ATTRS[name]
+    from importlib import import_module
+
+    value = getattr(import_module(module_name), attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals().keys()) | set(_LAZY_ATTRS.keys()))

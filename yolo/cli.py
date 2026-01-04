@@ -3,15 +3,16 @@ YOLO Training CLI - LightningCLI entry point.
 
 Usage:
     # Training (COCO format - default)
-    python -m yolo.cli fit --config config/experiment/default.yaml
-    python -m yolo.cli fit --config config/experiment/default.yaml --model.learning_rate=0.001
+    python -m yolo.cli fit --config yolo/config/experiment/default.yaml
+    python -m yolo.cli fit --config yolo/config/experiment/default.yaml --model.learning_rate=0.001
 
     # Training (YOLO format)
     python -m yolo.cli fit --config config/yolo-format.yaml  # with data.format=yolo in YAML
     python -m yolo.cli fit --config config/default.yaml --data.format=yolo  # CLI override
 
-    # Validation
-    python -m yolo.cli validate --ckpt_path=runs/best.ckpt
+    # Standalone Validation
+    python -m yolo.cli validate --checkpoint best.ckpt --data.root dataset/ --data.format yolo
+    python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml
 
     # Inference
     python -m yolo.cli predict --checkpoint best.ckpt --source image.jpg
@@ -20,29 +21,96 @@ Usage:
     # Export
     python -m yolo.cli export --checkpoint best.ckpt --format onnx
     python -m yolo.cli export --checkpoint best.ckpt --format onnx --half --simplify
+
+    # Benchmark
+    python -m yolo.cli benchmark --checkpoint best.ckpt
+    python -m yolo.cli benchmark --checkpoint best.ckpt --formats pytorch,onnx --batch-sizes 1,8
 """
 
 import argparse
 import json
 import sys
 from pathlib import Path
-
-from lightning.pytorch.cli import LightningCLI
-
-from yolo.data.datamodule import YOLODataModule
-from yolo.training.module import YOLOModule
+from typing import List, Optional
 
 
-def train_main():
-    """Run training/validation/test using LightningCLI."""
-    cli = LightningCLI(
-        YOLOModule,
-        YOLODataModule,
-        save_config_kwargs={"overwrite": True},
+def _coerce_system_exit_code(exc: SystemExit) -> int:
+    code = exc.code
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    return 1
+
+
+def _root_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="yolo",
+        description="YOLO CLI (training via LightningCLI + utility subcommands). "
+        "Run as `yolo ...` (installed) or `python -m yolo.cli ...`.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Train
+  yolo fit --config yolo/config/experiment/default.yaml
+  python -m yolo.cli fit --config yolo/config/experiment/default.yaml
+
+  # Validate checkpoint on a dataset (standalone metrics)
+  yolo validate --checkpoint runs/best.ckpt --config config.yaml
+
+  # Inference on an image
+  yolo predict --checkpoint runs/best.ckpt --source image.jpg --no-draw --save-json
+
+  # Export checkpoint
+  yolo export --checkpoint runs/best.ckpt --format onnx --simplify
+
+  # Benchmark
+  yolo benchmark --checkpoint runs/best.ckpt --formats pytorch,onnx --batch-sizes 1,8
+        """,
     )
+    subparsers = parser.add_subparsers(title="commands", metavar="<command>")
+
+    subparsers.add_parser("fit", help="Train a model (LightningCLI).")
+    subparsers.add_parser("test", help="Test a model (LightningCLI).")
+    subparsers.add_parser("predict", help="Run inference on images.")
+    subparsers.add_parser("export", help="Export a checkpoint to ONNX/TFLite/SavedModel.")
+    subparsers.add_parser("validate", help="Standalone validation with detection metrics.")
+    subparsers.add_parser("benchmark", help="Benchmark inference performance.")
+
+    return parser
 
 
-def predict_main():
+def train_main(argv: Optional[List[str]] = None) -> int:
+    """Run training/validation/test using LightningCLI."""
+    from lightning.pytorch.cli import LightningCLI
+
+    from yolo.data.datamodule import YOLODataModule
+    from yolo.training.module import YOLOModule
+
+    try:
+        if argv is None:
+            LightningCLI(
+                YOLOModule,
+                YOLODataModule,
+                save_config_kwargs={"overwrite": True},
+            )
+        else:
+            old_argv = sys.argv
+            try:
+                sys.argv = [old_argv[0], *argv]
+                LightningCLI(
+                    YOLOModule,
+                    YOLODataModule,
+                    save_config_kwargs={"overwrite": True},
+                )
+            finally:
+                sys.argv = old_argv
+    except SystemExit as exc:
+        return _coerce_system_exit_code(exc)
+    return 0
+
+
+def predict_main(argv: Optional[List[str]] = None) -> int:
     """Run inference on images using a trained checkpoint."""
     parser = argparse.ArgumentParser(
         description="YOLO Inference - Run predictions on images",
@@ -100,14 +168,9 @@ Examples:
     )
     parser.add_argument(
         "--draw",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Draw bounding boxes on images (default: True)",
-    )
-    parser.add_argument(
-        "--no-draw",
-        action="store_true",
-        help="Do not draw bounding boxes",
     )
     parser.add_argument(
         "--device",
@@ -133,10 +196,12 @@ Examples:
         help="Save predictions to JSON file",
     )
 
-    args = parser.parse_args(sys.argv[2:])  # Skip 'yolo.cli' and 'predict'
+    try:
+        args = parser.parse_args(sys.argv[2:] if argv is None else argv)  # skip subcommand
+    except SystemExit as exc:
+        return _coerce_system_exit_code(exc)
 
-    # Handle --no-draw flag
-    draw_boxes = not args.no_draw
+    draw_boxes = bool(args.draw)
 
     # Import here to avoid slow startup for training commands
     from yolo.tools.inference import predict_directory, predict_image
@@ -217,11 +282,12 @@ Examples:
             print(f"JSON saved to: {json_path}")
 
     else:
-        print(f"Error: Source not found: {source}")
-        sys.exit(1)
+        print(f"Error: Source not found: {source}", file=sys.stderr)
+        return 1
+    return 0
 
 
-def export_main():
+def export_main(argv: Optional[List[str]] = None) -> int:
     """Export model to ONNX or TFLite format."""
     parser = argparse.ArgumentParser(
         description="YOLO Export - Export model to ONNX or TFLite format",
@@ -328,7 +394,10 @@ Examples:
         help="Number of calibration images for INT8 (default: 100)",
     )
 
-    args = parser.parse_args(sys.argv[2:])  # Skip 'yolo.cli' and 'export'
+    try:
+        args = parser.parse_args(sys.argv[2:] if argv is None else argv)  # skip subcommand
+    except SystemExit as exc:
+        return _coerce_system_exit_code(exc)
 
     image_size = (args.size, args.size)
 
@@ -374,19 +443,369 @@ Examples:
         print(f"\nExport complete: {output_path}")
 
     else:
-        print(f"Error: Unsupported format: {args.format}")
-        sys.exit(1)
+        print(f"Error: Unsupported format: {args.format}", file=sys.stderr)
+        return 1
+    return 0
 
 
-def main():
-    """Main entry point - dispatch to training, predict, or export."""
-    if len(sys.argv) > 1 and sys.argv[1] == "predict":
-        predict_main()
-    elif len(sys.argv) > 1 and sys.argv[1] == "export":
-        export_main()
-    else:
-        train_main()
+def validate_main(argv: Optional[List[str]] = None) -> int:
+    """Run standalone validation on a trained model."""
+    parser = argparse.ArgumentParser(
+        description="YOLO Validate - Run validation on a trained model",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Validate with config file
+  python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml
+
+  # Validate with direct parameters (YOLO format)
+  python -m yolo.cli validate --checkpoint best.ckpt \\
+      --data.root dataset/ --data.format yolo \\
+      --data.val_images valid/images --data.val_labels valid/labels
+
+  # Validate with direct parameters (COCO format)
+  python -m yolo.cli validate --checkpoint best.ckpt \\
+      --data.root dataset/ --data.format coco \\
+      --data.val_images val2017 --data.val_ann annotations/instances_val.json
+
+  # Save plots and JSON
+  python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml \\
+      --output results/ --save-plots --save-json
+        """,
+    )
+    parser.add_argument(
+        "--checkpoint", "-c",
+        type=str,
+        required=True,
+        help="Path to model checkpoint (.ckpt file)",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to config YAML file (for data configuration)",
+    )
+    # Data configuration (can override config file)
+    parser.add_argument(
+        "--data.root",
+        type=str,
+        default=None,
+        dest="data_root",
+        help="Root directory of the dataset",
+    )
+    parser.add_argument(
+        "--data.format",
+        type=str,
+        choices=["coco", "yolo"],
+        default="coco",
+        dest="data_format",
+        help="Dataset format: coco or yolo (default: coco)",
+    )
+    parser.add_argument(
+        "--data.val_images",
+        type=str,
+        default=None,
+        dest="val_images",
+        help="Path to validation images (relative to root)",
+    )
+    parser.add_argument(
+        "--data.val_labels",
+        type=str,
+        default=None,
+        dest="val_labels",
+        help="Path to validation labels for YOLO format (relative to root)",
+    )
+    parser.add_argument(
+        "--data.val_ann",
+        type=str,
+        default=None,
+        dest="val_ann",
+        help="Path to validation annotations for COCO format (relative to root)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        help="Batch size for validation (default: 16)",
+    )
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.001,
+        help="Confidence threshold (default: 0.001)",
+    )
+    parser.add_argument(
+        "--iou",
+        type=float,
+        default=0.6,
+        help="IoU threshold for NMS (default: 0.6)",
+    )
+    parser.add_argument(
+        "--size",
+        type=int,
+        default=640,
+        help="Input image size (default: 640)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device to use (cuda/mps/cpu, default: auto)",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default="validation_results",
+        help="Output directory for results (default: validation_results)",
+    )
+    plots_group = parser.add_mutually_exclusive_group()
+    plots_group.add_argument(
+        "--save-plots",
+        dest="save_plots",
+        action="store_true",
+        help="Save metric plots (default: True)",
+    )
+    plots_group.add_argument(
+        "--no-plots",
+        dest="save_plots",
+        action="store_false",
+        help="Do not save metric plots",
+    )
+    parser.set_defaults(save_plots=True)
+
+    json_group = parser.add_mutually_exclusive_group()
+    json_group.add_argument(
+        "--save-json",
+        dest="save_json",
+        action="store_true",
+        help="Save results as JSON (default: True)",
+    )
+    json_group.add_argument(
+        "--no-json",
+        dest="save_json",
+        action="store_false",
+        help="Do not save results as JSON",
+    )
+    parser.set_defaults(save_json=True)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of data loading workers (default: 4)",
+    )
+
+    try:
+        args = parser.parse_args(sys.argv[2:] if argv is None else argv)  # skip subcommand
+    except SystemExit as exc:
+        return _coerce_system_exit_code(exc)
+
+    # Load config if provided
+    data_root = args.data_root
+    data_format = args.data_format
+    val_images = args.val_images
+    val_labels = args.val_labels
+    val_ann = args.val_ann
+
+    if args.config:
+        from omegaconf import OmegaConf
+        config = OmegaConf.load(args.config)
+        if hasattr(config, "data"):
+            data_cfg = config.data
+            data_root = data_root or getattr(data_cfg, "root", None)
+            data_format = getattr(data_cfg, "format", data_format)
+            val_images = val_images or getattr(data_cfg, "val_images", None)
+            val_labels = val_labels or getattr(data_cfg, "val_labels", None)
+            val_ann = val_ann or getattr(data_cfg, "val_ann", None)
+
+    # Validate required parameters
+    if data_root is None:
+        print("Error: --data.root is required (or provide --config with data.root)", file=sys.stderr)
+        return 1
+
+    if val_images is None:
+        print("Error: --data.val_images is required", file=sys.stderr)
+        return 1
+
+    if data_format == "yolo" and val_labels is None:
+        print("Error: --data.val_labels is required for YOLO format", file=sys.stderr)
+        return 1
+
+    if data_format == "coco" and val_ann is None:
+        print("Error: --data.val_ann is required for COCO format", file=sys.stderr)
+        return 1
+
+    # Import and run validation
+    from yolo.tools.validate import validate
+
+    image_size = (args.size, args.size)
+    save_plots = bool(args.save_plots)
+
+    validate(
+        checkpoint_path=args.checkpoint,
+        data_root=data_root,
+        data_format=data_format,
+        val_images=val_images,
+        val_labels=val_labels,
+        val_ann=val_ann,
+        batch_size=args.batch_size,
+        num_workers=args.workers,
+        image_size=image_size,
+        conf_threshold=args.conf,
+        iou_threshold=args.iou,
+        device=args.device,
+        output_dir=args.output,
+        save_plots=save_plots,
+        save_json=bool(args.save_json),
+        verbose=True,
+    )
+    return 0
+
+
+def benchmark_main(argv: Optional[List[str]] = None) -> int:
+    """Run performance benchmarks on a model."""
+    parser = argparse.ArgumentParser(
+        description="YOLO Benchmark - Measure model inference performance",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Benchmark PyTorch model
+  python -m yolo.cli benchmark --checkpoint best.ckpt
+
+  # Benchmark ONNX model
+  python -m yolo.cli benchmark --model model.onnx
+
+  # Benchmark multiple formats
+  python -m yolo.cli benchmark --checkpoint best.ckpt --formats pytorch,onnx
+
+  # Benchmark with multiple batch sizes
+  python -m yolo.cli benchmark --checkpoint best.ckpt --batch-sizes 1,8,16
+
+  # Full benchmark
+  python -m yolo.cli benchmark --checkpoint best.ckpt \\
+      --formats pytorch,onnx,tflite --batch-sizes 1,8 \\
+      --warmup 20 --runs 200 --output benchmark.json
+        """,
+    )
+    parser.add_argument(
+        "--checkpoint", "-c",
+        type=str,
+        default=None,
+        help="Path to PyTorch checkpoint (.ckpt file)",
+    )
+    parser.add_argument(
+        "--model", "-m",
+        type=str,
+        default=None,
+        help="Path to exported model (ONNX or TFLite)",
+    )
+    parser.add_argument(
+        "--formats",
+        type=str,
+        default="pytorch",
+        help="Comma-separated list of formats to benchmark (default: pytorch)",
+    )
+    parser.add_argument(
+        "--batch-sizes",
+        type=str,
+        default="1",
+        help="Comma-separated list of batch sizes (default: 1)",
+    )
+    parser.add_argument(
+        "--size",
+        type=int,
+        default=640,
+        help="Input image size (default: 640)",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=10,
+        help="Number of warmup iterations (default: 10)",
+    )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=100,
+        help="Number of benchmark runs (default: 100)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device to use (cuda/mps/cpu, default: auto)",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default=None,
+        help="Output path for JSON results",
+    )
+
+    try:
+        args = parser.parse_args(sys.argv[2:] if argv is None else argv)  # skip subcommand
+    except SystemExit as exc:
+        return _coerce_system_exit_code(exc)
+
+    if args.checkpoint is None and args.model is None:
+        print("Error: Either --checkpoint or --model is required", file=sys.stderr)
+        return 1
+
+    # Parse formats and batch sizes
+    formats = [f.strip() for f in args.formats.split(",")]
+    batch_sizes = [int(b.strip()) for b in args.batch_sizes.split(",")]
+
+    # Import and run benchmark
+    from yolo.tools.benchmark import benchmark
+
+    image_size = (args.size, args.size)
+
+    benchmark(
+        checkpoint_path=args.checkpoint,
+        model_path=args.model,
+        formats=formats,
+        batch_sizes=batch_sizes,
+        image_size=image_size,
+        warmup=args.warmup,
+        runs=args.runs,
+        device=args.device,
+        output_path=args.output,
+        verbose=True,
+    )
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Main entry point - dispatch to training (LightningCLI) or utility subcommands."""
+    args = sys.argv[1:] if argv is None else argv
+
+    if not args or args[0] in {"-h", "--help"}:
+        _root_parser().print_help()
+        return 0
+
+    # Utility subcommands.
+    cmd = args[0]
+    if cmd == "predict":
+        return predict_main(args[1:])
+    if cmd == "export":
+        return export_main(args[1:])
+    if cmd == "validate":
+        return validate_main(args[1:])
+    if cmd == "benchmark":
+        return benchmark_main(args[1:])
+
+    # Fall back to training CLI (supports global options before the subcommand).
+    if cmd.startswith("-"):
+        return train_main(args)
+
+    # If it's not a known command, provide a clearer error than LightningCLI.
+    known = {"fit", "test", "predict", "export", "validate", "benchmark"}
+    if cmd not in known:
+        print(f"Error: Unknown command: {cmd}\n", file=sys.stderr)
+        _root_parser().print_help()
+        return 2
+
+    return train_main(args)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

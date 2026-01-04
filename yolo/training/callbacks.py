@@ -159,8 +159,12 @@ class MetricsTableCallback(Callback):
                 if ckpt_callback.best_model_score is not None:
                     best_score = ckpt_callback.best_model_score.item() if hasattr(ckpt_callback.best_model_score, "item") else ckpt_callback.best_model_score
 
-                    # Check if current is best (within floating point tolerance)
-                    is_best = abs(current_score - best_score) < 1e-6
+                    # Check if current is best: must be >= best AND actually improved
+                    # (current >= best AND (current > best OR this is the first non-zero improvement))
+                    is_best = current_score >= best_score and (
+                        current_score > best_score + 1e-6 or  # Actually improved
+                        (current_score == best_score and best_epoch is None)  # First epoch with this score
+                    )
 
                     # Extract best epoch from best_model_path if available
                     if ckpt_callback.best_model_path:
@@ -168,9 +172,12 @@ class MetricsTableCallback(Callback):
                         match = re.search(r'epoch=(\d+)', ckpt_callback.best_model_path)
                         if match:
                             best_epoch = int(match.group(1))
+                            # If we have best_epoch and score is same, not a new best
+                            if current_score <= best_score:
+                                is_best = False
                 else:
-                    # First validation, no best yet - this will be best
-                    is_best = True
+                    # First validation, no best yet - this will be best only if score > 0
+                    is_best = current_score > 0
                     best_score = current_score
 
         # Build and print the table

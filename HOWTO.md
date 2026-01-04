@@ -22,11 +22,28 @@ python -m yolo.cli fit --config yolo/config/experiment/debug.yaml
 
 ### Validation
 
+Standalone validation to evaluate a trained model on a dataset:
+
 ```bash
-# Validate a trained model
-python -m yolo.cli validate --config yolo/config/experiment/default.yaml \
-    --ckpt_path=runs/best.ckpt
+# Validate with config file
+python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml
+
+# Validate with direct parameters (YOLO format)
+python -m yolo.cli validate --checkpoint best.ckpt \
+    --data.root dataset/ --data.format yolo \
+    --data.val_images valid/images --data.val_labels valid/labels
+
+# Validate with direct parameters (COCO format)
+python -m yolo.cli validate --checkpoint best.ckpt \
+    --data.root dataset/ --data.format coco \
+    --data.val_images val2017 --data.val_ann annotations/instances_val.json
+
+# Save plots and JSON results
+python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml \
+    --output results/ --save-plots --save-json
 ```
+
+**Output**: mAP, mAP50, mAP75, precision, recall, F1, per-class metrics, confusion matrix, PR/F1 curves.
 
 ### Inference
 
@@ -468,6 +485,43 @@ python -m yolo.cli export --checkpoint best.ckpt --format saved_model
 | `--half` | FP16 precision (ONNX with CUDA) | False |
 | `--quantization` | TFLite quantization (fp32, fp16, int8) | fp32 |
 
+## Benchmark
+
+Measure model inference performance across different formats and configurations:
+
+```bash
+# Benchmark PyTorch model
+python -m yolo.cli benchmark --checkpoint best.ckpt
+
+# Benchmark ONNX model
+python -m yolo.cli benchmark --model model.onnx
+
+# Benchmark multiple formats
+python -m yolo.cli benchmark --checkpoint best.ckpt --formats pytorch,onnx
+
+# Benchmark with multiple batch sizes
+python -m yolo.cli benchmark --checkpoint best.ckpt --batch-sizes 1,8,16
+
+# Full benchmark with JSON output
+python -m yolo.cli benchmark --checkpoint best.ckpt \
+    --formats pytorch,onnx,tflite --batch-sizes 1,8 \
+    --warmup 20 --runs 200 --output benchmark.json
+```
+
+### Benchmark Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--checkpoint` | Path to PyTorch checkpoint | - |
+| `--model` | Path to exported model (ONNX/TFLite) | - |
+| `--formats` | Comma-separated formats to benchmark | pytorch |
+| `--batch-sizes` | Comma-separated batch sizes to test | 1 |
+| `--size` | Input image size | 640 |
+| `--warmup` | Number of warmup iterations | 10 |
+| `--runs` | Number of benchmark runs | 100 |
+| `--device` | Device (cuda/mps/cpu) | auto |
+| `--output` | Output path for JSON results | - |
+
 ## Project Structure
 
 ```
@@ -494,7 +548,9 @@ yolo/
 │   └── module.py             # Layer definitions
 ├── tools/
 │   ├── export.py             # Model export (ONNX, TFLite, SavedModel)
-│   └── inference.py          # Inference utilities
+│   ├── inference.py          # Inference utilities
+│   ├── validate.py           # Standalone validation
+│   └── benchmark.py          # Performance benchmarking
 └── utils/
     ├── bounding_box_utils.py # BBox utilities
     ├── metrics.py            # Detection metrics (mAP, P/R, confusion matrix)
