@@ -173,6 +173,7 @@ class MetricsTableCallback(Callback):
         pl_module: L.LightningModule,
     ) -> None:
         """Print metrics table at the end of training epoch (after validation)."""
+        logger.debug("[MetricsTable] on_train_epoch_end started")
         # Skip if no metrics yet
         if not trainer.callback_metrics:
             return
@@ -232,7 +233,9 @@ class MetricsTableCallback(Callback):
                     best_score = current_score
 
         # Build and print the table
+        logger.debug("[MetricsTable] Building table...")
         print(self._build_table(epoch, metrics, is_best, current_score, best_score, best_epoch))
+        logger.debug("[MetricsTable] on_train_epoch_end completed")
 
     def _build_table(
         self,
@@ -926,6 +929,7 @@ class EvalDashboardCallback(Callback):
         pl_module: L.LightningModule,
     ) -> None:
         """Display dashboard at the end of training epoch (after validation)."""
+        logger.debug("[EvalDashboard] on_train_epoch_end started")
         # Skip if no metrics yet
         if not trainer.callback_metrics:
             return
@@ -966,6 +970,7 @@ class EvalDashboardCallback(Callback):
         if trainer.logger is not None:
             run_id = getattr(trainer.logger, "name", "") or ""
 
+        logger.debug("[EvalDashboard] Printing dashboard...")
         self.dashboard.print(
             metrics=metrics,
             epoch=trainer.current_epoch + 1,
@@ -974,3 +979,4 @@ class EvalDashboardCallback(Callback):
             num_images=num_images,
             image_size=image_size,
         )
+        logger.debug("[EvalDashboard] on_train_epoch_end completed")
