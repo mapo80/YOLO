@@ -207,31 +207,27 @@ class MetricsTableCallback(Callback):
             primary_metrics.append(("mAP50", "val/mAP50"))
         if "val/mAP75" in metrics:
             primary_metrics.append(("mAP75", "val/mAP75"))
-        if "val/mAP95" in metrics:
-            primary_metrics.append(("mAP95", "val/mAP95"))
-        if "val/mAR100" in metrics:
-            primary_metrics.append(("mAR100", "val/mAR100"))
 
-        # Row 2: mAP per size + loss (if logged)
+        # Row 2: Precision, Recall, F1 + loss (if logged)
         secondary_metrics = []
-        if "val/mAP_small" in metrics:
-            secondary_metrics.append(("mAP_sm", "val/mAP_small"))
-        if "val/mAP_medium" in metrics:
-            secondary_metrics.append(("mAP_md", "val/mAP_medium"))
-        if "val/mAP_large" in metrics:
-            secondary_metrics.append(("mAP_lg", "val/mAP_large"))
+        if "val/precision" in metrics:
+            secondary_metrics.append(("Prec", "val/precision"))
+        if "val/recall" in metrics:
+            secondary_metrics.append(("Recall", "val/recall"))
+        if "val/f1" in metrics:
+            secondary_metrics.append(("F1", "val/f1"))
         # Add train loss
         if self._last_train_loss is not None:
             secondary_metrics.append(("loss", "_train_loss"))
 
-        # Row 3: mAR per size (if logged)
+        # Row 3: Legacy mAP per size (if logged)
         tertiary_metrics = []
-        if "val/mAR_small" in metrics:
-            tertiary_metrics.append(("mAR_sm", "val/mAR_small"))
-        if "val/mAR_medium" in metrics:
-            tertiary_metrics.append(("mAR_md", "val/mAR_medium"))
-        if "val/mAR_large" in metrics:
-            tertiary_metrics.append(("mAR_lg", "val/mAR_large"))
+        if "val/mAP_small" in metrics:
+            tertiary_metrics.append(("mAP_sm", "val/mAP_small"))
+        if "val/mAP_medium" in metrics:
+            tertiary_metrics.append(("mAP_md", "val/mAP_medium"))
+        if "val/mAP_large" in metrics:
+            tertiary_metrics.append(("mAP_lg", "val/mAP_large"))
 
         # Determine number of columns (max of all rows)
         num_cols = max(len(primary_metrics), len(secondary_metrics), len(tertiary_metrics), 1)

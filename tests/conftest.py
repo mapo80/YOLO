@@ -70,3 +70,203 @@ def sample_targets():
             "labels": torch.tensor([0, 1], dtype=torch.long),
         }
     ]
+
+
+# =============================================================================
+# Metrics Testing Fixtures
+# =============================================================================
+
+
+@pytest.fixture
+def class_names():
+    """Class names for testing (5 classes)."""
+    return {0: "cat", 1: "dog", 2: "bird", 3: "fish", 4: "horse"}
+
+
+@pytest.fixture
+def coco_class_names():
+    """COCO 80 class names subset."""
+    return {
+        0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 4: "airplane",
+        5: "bus", 6: "train", 7: "truck", 8: "boat", 9: "traffic light",
+    }
+
+
+@pytest.fixture
+def sample_predictions():
+    """Generate sample predictions for metrics testing."""
+    return [
+        {
+            "boxes": torch.tensor([
+                [100, 100, 200, 200],  # TP for class 0
+                [300, 300, 400, 400],  # TP for class 1
+                [500, 500, 600, 600],  # FP for class 2
+            ], dtype=torch.float32),
+            "scores": torch.tensor([0.9, 0.8, 0.7], dtype=torch.float32),
+            "labels": torch.tensor([0, 1, 2], dtype=torch.long),
+        }
+    ]
+
+
+@pytest.fixture
+def sample_ground_truth():
+    """Generate sample ground truth for metrics testing."""
+    return [
+        {
+            "boxes": torch.tensor([
+                [100, 100, 200, 200],  # GT class 0
+                [300, 300, 400, 400],  # GT class 1
+                [700, 700, 800, 800],  # FN class 3
+            ], dtype=torch.float32),
+            "labels": torch.tensor([0, 1, 3], dtype=torch.long),
+        }
+    ]
+
+
+@pytest.fixture
+def perfect_predictions():
+    """Predictions that perfectly match ground truth."""
+    return [
+        {
+            "boxes": torch.tensor([
+                [100, 100, 200, 200],
+                [300, 300, 400, 400],
+            ], dtype=torch.float32),
+            "scores": torch.tensor([0.95, 0.90], dtype=torch.float32),
+            "labels": torch.tensor([0, 1], dtype=torch.long),
+        }
+    ]
+
+
+@pytest.fixture
+def perfect_ground_truth():
+    """Ground truth that matches perfect predictions."""
+    return [
+        {
+            "boxes": torch.tensor([
+                [100, 100, 200, 200],
+                [300, 300, 400, 400],
+            ], dtype=torch.float32),
+            "labels": torch.tensor([0, 1], dtype=torch.long),
+        }
+    ]
+
+
+@pytest.fixture
+def multi_batch_predictions():
+    """Multiple batches of predictions for stress testing."""
+    batches = []
+    for batch_idx in range(5):
+        preds = {
+            "boxes": torch.tensor([
+                [100 + batch_idx * 10, 100, 200, 200],
+                [300 + batch_idx * 10, 300, 400, 400],
+            ], dtype=torch.float32),
+            "scores": torch.tensor([0.9 - batch_idx * 0.1, 0.8 - batch_idx * 0.05], dtype=torch.float32),
+            "labels": torch.tensor([0, 1], dtype=torch.long),
+        }
+        batches.append(preds)
+    return batches
+
+
+@pytest.fixture
+def multi_batch_ground_truth():
+    """Multiple batches of ground truth for stress testing."""
+    batches = []
+    for batch_idx in range(5):
+        gt = {
+            "boxes": torch.tensor([
+                [100 + batch_idx * 10, 100, 200, 200],
+                [300 + batch_idx * 10, 300, 400, 400],
+            ], dtype=torch.float32),
+            "labels": torch.tensor([0, 1], dtype=torch.long),
+        }
+        batches.append(gt)
+    return batches
+
+
+@pytest.fixture
+def empty_predictions():
+    """Empty predictions (no detections)."""
+    return [
+        {
+            "boxes": torch.zeros((0, 4), dtype=torch.float32),
+            "scores": torch.zeros(0, dtype=torch.float32),
+            "labels": torch.zeros(0, dtype=torch.long),
+        }
+    ]
+
+
+@pytest.fixture
+def empty_ground_truth():
+    """Empty ground truth (no objects)."""
+    return [
+        {
+            "boxes": torch.zeros((0, 4), dtype=torch.float32),
+            "labels": torch.zeros(0, dtype=torch.long),
+        }
+    ]
+
+
+@pytest.fixture
+def overlapping_boxes_predictions():
+    """Predictions with overlapping boxes (same class)."""
+    return [
+        {
+            "boxes": torch.tensor([
+                [100, 100, 200, 200],
+                [110, 110, 210, 210],  # Overlaps with first
+                [120, 120, 220, 220],  # Overlaps with both
+            ], dtype=torch.float32),
+            "scores": torch.tensor([0.95, 0.90, 0.85], dtype=torch.float32),
+            "labels": torch.tensor([0, 0, 0], dtype=torch.long),  # Same class
+        }
+    ]
+
+
+@pytest.fixture
+def overlapping_boxes_ground_truth():
+    """Ground truth for overlapping predictions."""
+    return [
+        {
+            "boxes": torch.tensor([
+                [100, 100, 200, 200],
+            ], dtype=torch.float32),
+            "labels": torch.tensor([0], dtype=torch.long),
+        }
+    ]
+
+
+@pytest.fixture
+def temp_dir(tmp_path):
+    """Temporary directory for saving plots and files."""
+    return tmp_path
+
+
+# =============================================================================
+# Training Experiment Dataset Fixtures
+# =============================================================================
+
+
+@pytest.fixture(scope="session")
+def training_experiment_path():
+    """Path to training-experiment dataset."""
+    return project_root / "data" / "training-experiment"
+
+
+@pytest.fixture(scope="session")
+def training_experiment_exists(training_experiment_path):
+    """Check if training-experiment dataset exists."""
+    return training_experiment_path.exists()
+
+
+@pytest.fixture(scope="session")
+def training_experiment_config(training_experiment_path):
+    """Load training-experiment dataset configuration if exists."""
+    if not training_experiment_path.exists():
+        return None
+
+    config_path = training_experiment_path / "dataset.yaml"
+    if config_path.exists():
+        return OmegaConf.load(config_path)
+    return None

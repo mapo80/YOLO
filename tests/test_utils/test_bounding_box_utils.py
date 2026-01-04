@@ -1,14 +1,22 @@
+"""
+Tests for bounding box utilities.
+
+These tests verify IoU calculations, bbox transformations,
+NMS, anchors, and mAP calculations.
+"""
+
 import sys
 from pathlib import Path
 
 import pytest
 import torch
-from hydra import compose, initialize
+from omegaconf import OmegaConf
 from torch import allclose, float32, isclose, tensor
 
 project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(project_root))
-from yolo import Config, NMSConfig, create_model
+
+from yolo import NMSConfig, create_model
 from yolo.config.config import AnchorConfig
 from yolo.utils.bounding_box_utils import (
     Anc2Box,
@@ -21,6 +29,15 @@ from yolo.utils.bounding_box_utils import (
 )
 
 EPS = 1e-4
+
+
+def load_model_config(model_name: str):
+    """Load model config from YAML file as OmegaConf."""
+    config_path = project_root / "yolo" / "config" / "model" / f"{model_name}.yaml"
+    if not config_path.exists():
+        pytest.skip(f"Model config {model_name}.yaml not found")
+
+    return OmegaConf.load(config_path)
 
 
 @pytest.fixture
@@ -115,11 +132,16 @@ def test_generate_anchors():
 
 
 def test_vec2box_autoanchor():
-    with initialize(config_path="../../yolo/config", version_base=None):
-        cfg: Config = compose(config_name="config", overrides=["model=v9-m"])
+    """Test Vec2Box anchor generation."""
+    cfg = load_model_config("v9-m")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = create_model(cfg.model, weight_path=None)
-    vec2box = Vec2Box(model, cfg.model.anchor, cfg.image_size, device)
+    model = create_model(cfg, weight_path=None)
+
+    # Build anchor config from model config
+    anchor_cfg = cfg.get("anchor", {})
+    image_size = [640, 640]
+
+    vec2box = Vec2Box(model, anchor_cfg, image_size, device)
     assert vec2box.strides == [8, 16, 32]
 
     vec2box.update((320, 640))
@@ -127,12 +149,24 @@ def test_vec2box_autoanchor():
     assert vec2box.scaler.shape == tuple([4200])
 
 
-def test_anc2box_autoanchor(inference_v7_cfg: Config):
+@pytest.mark.skipif(
+    not (project_root / "yolo" / "config" / "model" / "v7.yaml").exists(),
+    reason="v7.yaml not found"
+)
+def test_anc2box_autoanchor():
+    """Test Anc2Box anchor generation for v7 model."""
+    cfg = load_model_config("v7")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = create_model(inference_v7_cfg.model, weight_path=None).to(device)
-    anchor_cfg: AnchorConfig = inference_v7_cfg.model.anchor.copy()
-    del anchor_cfg.strides
-    anc2box = Anc2Box(model, anchor_cfg, inference_v7_cfg.image_size, device)
+    model = create_model(cfg, weight_path=None).to(device)
+
+    # Anc2Box expects an OmegaConf object with attributes
+    anchor_cfg = cfg.get("anchor", {})
+    # Remove strides for auto-detection
+    if "strides" in anchor_cfg:
+        anchor_cfg = OmegaConf.create({k: v for k, v in OmegaConf.to_container(anchor_cfg).items() if k != "strides"})
+
+    image_size = [640, 640]
+    anc2box = Anc2Box(model, anchor_cfg, image_size, device)
     assert anc2box.strides == [8, 16, 32]
 
     anc2box.update((320, 640))

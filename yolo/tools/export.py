@@ -365,7 +365,7 @@ def _convert_onnx_to_tflite_via_cli(
     Returns:
         True if successful, False otherwise
     """
-    # Use Ultralytics-style parameters for better compatibility
+    # Configure onnx2tf CLI with optimized parameters for YOLO models
     cmd = [
         sys.executable, "-m", "onnx2tf",
         "-i", onnx_path,
@@ -562,7 +562,7 @@ def export_tflite(
             try:
                 import onnx2tf
 
-                # Use Ultralytics-style parameters for better compatibility
+                # Configure onnx2tf with optimized parameters for YOLO models
                 h, w = image_size
                 convert_kwargs = {
                     "input_onnx_file_path": str(onnx_path),

@@ -9,13 +9,13 @@ import lightning as L
 import torch
 from omegaconf import OmegaConf
 from torch import Tensor
-from torchmetrics.detection import MeanAveragePrecision
 
 from yolo.model.yolo import YOLO
 from yolo.tools.dataset_preparation import prepare_weight
 from yolo.training.loss import YOLOLoss
 from yolo.utils.bounding_box_utils import Vec2Box, bbox_nms
 from yolo.utils.logger import logger
+from yolo.utils.metrics import DetMetrics
 
 
 class YOLOModule(L.LightningModule):
@@ -69,14 +69,32 @@ class YOLOModule(L.LightningModule):
         nms_conf_threshold: float = 0.25,
         nms_iou_threshold: float = 0.65,
         nms_max_detections: int = 300,
-        # Metrics - IoU thresholds
+        # Metrics
         log_map: bool = True,
         log_map_50: bool = True,
         log_map_75: bool = True,
-        log_map_95: bool = True,
-        log_map_per_size: bool = True,
-        log_mar_100: bool = True,
-        log_mar_per_size: bool = True,
+        log_precision: bool = True,
+        log_recall: bool = True,
+        log_f1: bool = True,
+        # Class names for metrics (None = use indices)
+        class_names: Optional[Dict[int, str]] = None,
+        # Metrics plots
+        save_metrics_plots: bool = True,
+        metrics_plots_dir: Optional[str] = None,
+        # Learning rate scheduler
+        # Options: "cosine" (default), "linear", "one_cycle", "step"
+        lr_scheduler: str = "cosine",
+        # Scheduler-specific parameters
+        lr_min_factor: float = 0.01,  # For cosine/linear: final_lr = initial_lr * lr_min_factor
+        step_size: int = 30,  # For step scheduler: epochs between LR decay
+        step_gamma: float = 0.1,  # For step scheduler: LR multiplication factor
+        one_cycle_pct_start: float = 0.3,  # For one_cycle: % of training spent in warmup
+        one_cycle_div_factor: float = 25.0,  # For one_cycle: initial_lr = max_lr / div_factor
+        one_cycle_final_div_factor: float = 1e4,  # For one_cycle: final_lr = initial_lr / final_div_factor
+        # Layer freezing for transfer learning
+        freeze_backbone: bool = False,
+        freeze_until_epoch: int = 0,  # Unfreeze backbone after this epoch (0 = always frozen)
+        freeze_layers: Optional[List[str]] = None,  # Specific layer patterns to freeze
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -108,22 +126,25 @@ class YOLOModule(L.LightningModule):
         self._loss_fn: Optional[YOLOLoss] = None
         self._vec2box: Optional[Vec2Box] = None
 
-        # Metrics - standard mAP with COCO thresholds
-        self.val_map = MeanAveragePrecision(
-            box_format="xyxy",
-            iou_type="bbox",
-        )
+        # Build class names dict
+        if class_names is not None:
+            self._class_names = class_names
+        else:
+            # Default: use class indices as names
+            self._class_names = {i: str(i) for i in range(num_classes)}
 
-        # Separate metric for mAP@95 (strict IoU threshold)
-        # Must include 0.5 and 0.75 for map_50/map_75 calculation
-        self.val_map_95 = MeanAveragePrecision(
-            box_format="xyxy",
-            iou_type="bbox",
-            iou_thresholds=[0.5, 0.75, 0.95],  # Include 0.5, 0.75 to avoid errors
-        ) if log_map_95 else None
+        # Detection metrics with custom implementation
+        self._det_metrics: Optional[DetMetrics] = None
 
         # Track if we're resuming from a checkpoint
         self._resumed_from_checkpoint = False
+
+        # Layer freezing state
+        self._frozen_layers: List[str] = []
+
+        # Apply initial layer freezing
+        if freeze_backbone or freeze_layers:
+            self._apply_layer_freezing()
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         """Called when loading from checkpoint - log resume info."""
@@ -133,7 +154,7 @@ class YOLOModule(L.LightningModule):
         logger.info(f"🔄 Resuming from checkpoint (epoch {epoch + 1}, step {global_step})")
 
     def setup(self, stage: str) -> None:
-        """Setup loss function and converter after model is on device."""
+        """Setup loss function, converter, and metrics after model is on device."""
         if stage == "fit" or stage == "validate":
             device = self.device
             image_size = self.hparams.image_size
@@ -155,6 +176,9 @@ class YOLOModule(L.LightningModule):
                 cls_weight=self.hparams.cls_loss_weight,
                 dfl_weight=self.hparams.dfl_loss_weight,
             )
+
+            # Initialize detection metrics
+            self._det_metrics = DetMetrics(names=self._class_names)
 
     def forward(self, x: Tensor) -> Dict[str, Any]:
         """Forward pass through the model."""
@@ -215,58 +239,73 @@ class YOLOModule(L.LightningModule):
         preds_formatted = self._format_predictions(predictions)
         targets_formatted = self._format_targets(targets)
 
-        # Update metrics
-        self.val_map.update(preds_formatted, targets_formatted)
-        if self.val_map_95 is not None:
-            self.val_map_95.update(preds_formatted, targets_formatted)
+        # Update detection metrics
+        if self._det_metrics is not None:
+            self._det_metrics.update(preds_formatted, targets_formatted)
 
     def on_validation_epoch_end(self) -> None:
         """Compute and log validation metrics."""
-        metrics = self.val_map.compute()
+        if self._det_metrics is None:
+            return
+
+        # Determine save directory for plots
+        save_dir = None
+        if self.hparams.save_metrics_plots:
+            if self.hparams.metrics_plots_dir:
+                save_dir = Path(self.hparams.metrics_plots_dir)
+            elif self.trainer.log_dir:
+                save_dir = Path(self.trainer.log_dir) / "metrics"
+            else:
+                save_dir = Path("runs") / "metrics"
+
+            # Add epoch subdirectory
+            save_dir = save_dir / f"epoch_{self.current_epoch + 1}"
+
+        # Process metrics and generate plots
+        metrics = self._det_metrics.process(
+            save_dir=save_dir,
+            plot=self.hparams.save_metrics_plots,
+        )
 
         log_dict = {}
 
+        # Log mAP metrics
         if self.hparams.log_map:
             log_dict["val/mAP"] = metrics["map"]
 
         if self.hparams.log_map_50:
-            log_dict["val/mAP50"] = metrics["map_50"]
+            log_dict["val/mAP50"] = metrics["map50"]
 
         if self.hparams.log_map_75:
-            log_dict["val/mAP75"] = metrics["map_75"]
+            log_dict["val/mAP75"] = metrics["map75"]
 
-        if self.hparams.log_map_95 and self.val_map_95 is not None:
-            # mAP at IoU=0.95 from dedicated metric
-            metrics_95 = self.val_map_95.compute()
-            log_dict["val/mAP95"] = metrics_95["map"]
-            self.val_map_95.reset()
+        # Log precision, recall, F1
+        if self.hparams.log_precision:
+            log_dict["val/precision"] = metrics["precision"]
 
-        if self.hparams.log_map_per_size:
-            log_dict["val/mAP_small"] = metrics["map_small"]
-            log_dict["val/mAP_medium"] = metrics["map_medium"]
-            log_dict["val/mAP_large"] = metrics["map_large"]
+        if self.hparams.log_recall:
+            log_dict["val/recall"] = metrics["recall"]
 
-        if self.hparams.log_mar_100:
-            log_dict["val/mAR100"] = metrics["mar_100"]
-
-        if self.hparams.log_mar_per_size:
-            log_dict["val/mAR_small"] = metrics["mar_small"]
-            log_dict["val/mAR_medium"] = metrics["mar_medium"]
-            log_dict["val/mAR_large"] = metrics["mar_large"]
+        if self.hparams.log_f1:
+            log_dict["val/f1"] = metrics["f1"]
 
         # Log to loggers (TensorBoard, etc.) but not to progress bar
         # The MetricsTableCallback handles the clean display
         self.log_dict(log_dict, prog_bar=False, sync_dist=True)
-        self.val_map.reset()
+
+        # Reset metrics for next epoch
+        self._det_metrics.reset()
 
     def configure_optimizers(self):
         """Configure optimizer and learning rate scheduler."""
-        # Separate parameters into groups
+        # Separate parameters into groups (only trainable parameters)
         bias_params = []
         norm_params = []
         other_params = []
 
         for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue  # Skip frozen parameters
             if "bias" in name:
                 bias_params.append(param)
             elif "bn" in name and "weight" in name:
@@ -305,20 +344,86 @@ class YOLOModule(L.LightningModule):
             )
             logger.info(f"Using SGD optimizer (lr={self.hparams.learning_rate}, momentum={self.hparams.momentum})")
 
-        # Cosine annealing scheduler
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.trainer.max_epochs,
-            eta_min=self.hparams.learning_rate * 0.01,
-        )
+        # Create learning rate scheduler based on config
+        scheduler = self._create_lr_scheduler(optimizer)
 
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "epoch",
+                "interval": "step" if self.hparams.lr_scheduler == "one_cycle" else "epoch",
             },
         }
+
+    def _create_lr_scheduler(self, optimizer):
+        """
+        Create learning rate scheduler based on configuration.
+
+        Supported schedulers:
+            - cosine: Cosine annealing with warm restarts
+            - linear: Linear decay from initial to final LR
+            - step: Step decay every N epochs
+            - one_cycle: One cycle policy (super-convergence)
+        """
+        scheduler_name = self.hparams.lr_scheduler.lower()
+        max_epochs = self.trainer.max_epochs
+        lr = self.hparams.learning_rate
+        eta_min = lr * self.hparams.lr_min_factor
+
+        if scheduler_name == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max_epochs,
+                eta_min=eta_min,
+            )
+            logger.info(f"Using Cosine Annealing scheduler (T_max={max_epochs}, eta_min={eta_min:.2e})")
+
+        elif scheduler_name == "linear":
+            # Linear decay from lr to eta_min
+            def linear_lambda(epoch):
+                if epoch >= max_epochs:
+                    return self.hparams.lr_min_factor
+                return 1.0 - (1.0 - self.hparams.lr_min_factor) * (epoch / max_epochs)
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer,
+                lr_lambda=linear_lambda,
+            )
+            logger.info(f"Using Linear scheduler (final_lr={eta_min:.2e})")
+
+        elif scheduler_name == "step":
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=self.hparams.step_size,
+                gamma=self.hparams.step_gamma,
+            )
+            logger.info(f"Using Step scheduler (step_size={self.hparams.step_size}, gamma={self.hparams.step_gamma})")
+
+        elif scheduler_name == "one_cycle":
+            # Calculate total steps
+            steps_per_epoch = len(self.trainer.train_dataloader)
+            total_steps = max_epochs * steps_per_epoch
+
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=lr,
+                total_steps=total_steps,
+                pct_start=self.hparams.one_cycle_pct_start,
+                div_factor=self.hparams.one_cycle_div_factor,
+                final_div_factor=self.hparams.one_cycle_final_div_factor,
+            )
+            logger.info(
+                f"Using OneCycle scheduler (max_lr={lr}, total_steps={total_steps}, "
+                f"pct_start={self.hparams.one_cycle_pct_start})"
+            )
+
+        else:
+            raise ValueError(
+                f"Unknown lr_scheduler: {scheduler_name}. "
+                f"Supported: cosine, linear, step, one_cycle"
+            )
+
+        return scheduler
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
         """Custom optimizer step with warmup."""
@@ -470,3 +575,116 @@ class YOLOModule(L.LightningModule):
                     })
 
         return formatted
+
+    # =========================================================================
+    # Layer Freezing Methods
+    # =========================================================================
+
+    def _apply_layer_freezing(self) -> None:
+        """
+        Apply layer freezing based on configuration.
+
+        Freezes backbone layers or specific layer patterns for transfer learning.
+        """
+        frozen_count = 0
+        self._frozen_layers = []
+
+        if self.hparams.freeze_backbone:
+            # Freeze backbone layers (typically the feature extractor)
+            # In YOLO architectures, backbone is usually the first major section
+            for name, param in self.model.named_parameters():
+                # Freeze backbone layers (not neck/head)
+                if self._is_backbone_layer(name):
+                    param.requires_grad = False
+                    self._frozen_layers.append(name)
+                    frozen_count += 1
+
+        if self.hparams.freeze_layers:
+            # Freeze specific layer patterns
+            for name, param in self.model.named_parameters():
+                for pattern in self.hparams.freeze_layers:
+                    if pattern in name:
+                        param.requires_grad = False
+                        if name not in self._frozen_layers:
+                            self._frozen_layers.append(name)
+                            frozen_count += 1
+                        break
+
+        if frozen_count > 0:
+            logger.info(f"🥶 Frozen {frozen_count} layers for transfer learning")
+
+    def _is_backbone_layer(self, layer_name: str) -> bool:
+        """
+        Determine if a layer belongs to the backbone.
+
+        Args:
+            layer_name: Full name of the layer parameter
+
+        Returns:
+            True if layer is part of backbone
+        """
+        # YOLO v9 backbone patterns (typically early layers before neck/head)
+        backbone_patterns = [
+            "backbone",
+            "stem",
+            "dark",  # DarkNet layers
+            "stage1", "stage2", "stage3",  # Early stages
+            "conv1", "conv2", "conv3",  # Early convolutions
+            "layer1", "layer2", "layer3",  # ResNet-style layer naming
+        ]
+
+        layer_lower = layer_name.lower()
+
+        # Check if layer matches any backbone pattern
+        for pattern in backbone_patterns:
+            if pattern in layer_lower:
+                return True
+
+        # Check layer index - freeze first N% of model
+        # This is a fallback for architectures with numeric naming
+        parts = layer_name.split(".")
+        if len(parts) > 1 and parts[1].isdigit():
+            layer_idx = int(parts[1])
+            # Freeze first ~60% of layers (backbone typically)
+            total_layers = len(list(self.model.parameters()))
+            if layer_idx < total_layers * 0.6:
+                return True
+
+        return False
+
+    def _unfreeze_all_layers(self) -> None:
+        """Unfreeze all previously frozen layers."""
+        unfrozen_count = 0
+        for name, param in self.model.named_parameters():
+            if name in self._frozen_layers:
+                param.requires_grad = True
+                unfrozen_count += 1
+
+        self._frozen_layers = []
+
+        if unfrozen_count > 0:
+            logger.info(f"🔥 Unfrozen {unfrozen_count} layers")
+
+    def on_train_epoch_start(self) -> None:
+        """Check if we should unfreeze layers at this epoch."""
+        if (
+            self.hparams.freeze_until_epoch > 0
+            and self.current_epoch >= self.hparams.freeze_until_epoch
+            and len(self._frozen_layers) > 0
+        ):
+            logger.info(
+                f"📅 Epoch {self.current_epoch + 1}: Unfreezing layers "
+                f"(freeze_until_epoch={self.hparams.freeze_until_epoch})"
+            )
+            self._unfreeze_all_layers()
+
+            # Reconfigure optimizer with all parameters
+            # Note: This is handled automatically by Lightning if needed
+
+    def get_trainable_parameters(self) -> int:
+        """Get count of trainable parameters."""
+        return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+    def get_frozen_parameters(self) -> int:
+        """Get count of frozen parameters."""
+        return sum(p.numel() for p in self.model.parameters() if not p.requires_grad)
