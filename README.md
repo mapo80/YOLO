@@ -148,10 +148,46 @@ This is **expected behavior** - the classification layers will be trained for yo
 
 ### Validation
 
+Standalone validation to evaluate a trained model on a dataset:
+
 ```shell
-python -m yolo.cli validate --config yolo/config/experiment/default.yaml \
-    --ckpt_path=runs/best.ckpt
+# Validate with config file
+python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml
+
+# Validate with direct parameters (YOLO format)
+python -m yolo.cli validate --checkpoint best.ckpt \
+    --data.root dataset/ --data.format yolo \
+    --data.val_images valid/images --data.val_labels valid/labels
+
+# Validate with direct parameters (COCO format)
+python -m yolo.cli validate --checkpoint best.ckpt \
+    --data.root dataset/ --data.format coco \
+    --data.val_images val2017 --data.val_ann annotations/instances_val.json
+
+# Save plots and JSON results
+python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml \
+    --output results/ --save-plots --save-json
 ```
+
+#### Validation Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--checkpoint, -c` | required | Path to model checkpoint (.ckpt) |
+| `--config` | - | Path to config YAML file |
+| `--data.root` | - | Root directory of the dataset |
+| `--data.format` | coco | Dataset format (coco or yolo) |
+| `--data.val_images` | - | Path to validation images |
+| `--data.val_labels` | - | Path to validation labels (YOLO format) |
+| `--data.val_ann` | - | Path to validation annotations (COCO format) |
+| `--batch-size` | 16 | Batch size for validation |
+| `--conf` | 0.001 | Confidence threshold |
+| `--iou` | 0.6 | IoU threshold for NMS |
+| `--output, -o` | validation_results | Output directory |
+| `--save-plots` | true | Save metric plots (PR curve, confusion matrix) |
+| `--save-json` | true | Save results as JSON |
+
+**Output**: mAP, mAP50, mAP75, precision, recall, F1, per-class metrics, confusion matrix, PR/F1 curves.
 
 ### Inference
 
@@ -547,6 +583,59 @@ docker build --platform linux/amd64 -t yolo-tflite-export -f docker/Dockerfile.t
 | **Close Mosaic** | Disable augmentation for final N epochs |
 | **Optimizer Selection** | SGD (default) or AdamW |
 | **Model Export** | ONNX, TFLite (FP32/FP16/INT8), SavedModel |
+| **Standalone Validation** | Evaluate models with full metrics, plots, JSON export |
+| **Performance Benchmark** | Profile inference speed across formats (PyTorch, ONNX, TFLite) |
+
+### Benchmark
+
+Measure model inference performance across different formats and configurations:
+
+```shell
+# Benchmark PyTorch model
+python -m yolo.cli benchmark --checkpoint best.ckpt
+
+# Benchmark ONNX model
+python -m yolo.cli benchmark --model model.onnx
+
+# Benchmark multiple formats
+python -m yolo.cli benchmark --checkpoint best.ckpt --formats pytorch,onnx
+
+# Benchmark with multiple batch sizes
+python -m yolo.cli benchmark --checkpoint best.ckpt --batch-sizes 1,8,16
+
+# Full benchmark with JSON output
+python -m yolo.cli benchmark --checkpoint best.ckpt \
+    --formats pytorch,onnx,tflite --batch-sizes 1,8 \
+    --warmup 20 --runs 200 --output benchmark.json
+```
+
+#### Benchmark Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--checkpoint, -c` | - | Path to PyTorch checkpoint (.ckpt) |
+| `--model, -m` | - | Path to exported model (ONNX or TFLite) |
+| `--formats` | pytorch | Comma-separated formats to benchmark |
+| `--batch-sizes` | 1 | Comma-separated batch sizes to test |
+| `--size` | 640 | Input image size |
+| `--warmup` | 10 | Number of warmup iterations |
+| `--runs` | 100 | Number of benchmark runs |
+| `--device` | auto | Device (cuda/mps/cpu) |
+| `--output, -o` | - | Output path for JSON results |
+
+**Sample Output:**
+
+```
+╭──────────────────────────────────────────────────────────────╮
+│                    Benchmark Results                          │
+├────────────┬────────┬─────────┬──────────────────┬───────────┤
+│ Format     │ Device │ Batch   │ Latency (ms)     │ FPS       │
+├────────────┼────────┼─────────┼──────────────────┼───────────┤
+│ PyTorch    │ cuda   │ 1       │ 8.20 ± 0.50      │ 122.0     │
+│ ONNX       │ cuda   │ 1       │ 5.10 ± 0.30      │ 196.1     │
+│ TFLite     │ cpu    │ 1       │ 85.20 ± 2.10     │ 11.7      │
+╰────────────┴────────┴─────────┴──────────────────┴───────────╯
+```
 
 ## Custom Image Loader
 
