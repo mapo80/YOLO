@@ -90,17 +90,62 @@ def prepare_dataset(dataset_cfg: dict, task: str):
 
 
 def prepare_weight(download_link: Optional[str] = None, weight_path: Path = Path("v9-c.pt")):
+    """
+    Download pretrained weights.
+
+    Supports weights from:
+    - MultimediaTechLab/YOLO releases (default)
+    - WongKinYiu/yolov9 releases (fallback for v9-e and others)
+    """
     weight_name = weight_path.name
-    if download_link is None:
-        download_link = "https://github.com/MultimediaTechLab/YOLO/releases/download/v1.0-alpha/"
-    weight_link = f"{download_link}{weight_name}"
+
+    # Primary download URLs
+    primary_urls = [
+        "https://github.com/MultimediaTechLab/YOLO/releases/download/v1.0-alpha/",
+    ]
+
+    # Fallback URLs for original YOLOv9 weights (v9-e, etc.)
+    # These use the "-converted" suffix in the original repo
+    fallback_urls = [
+        ("https://github.com/WongKinYiu/yolov9/releases/download/v0.1/", "-converted"),
+    ]
+
+    if download_link is not None:
+        primary_urls = [download_link]
+        fallback_urls = []
 
     if not weight_path.parent.is_dir():
         weight_path.parent.mkdir(parents=True, exist_ok=True)
 
     if weight_path.exists():
         logger.info(f"Weight file '{weight_path}' already exists.")
-    try:
-        download_file(weight_link, weight_path)
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"Failed to download the weight file: {e}")
+        return
+
+    # Try primary URLs first
+    for base_url in primary_urls:
+        weight_link = f"{base_url}{weight_name}"
+        try:
+            download_file(weight_link, weight_path)
+            return
+        except requests.exceptions.RequestException:
+            logger.debug(f"Primary download failed: {weight_link}")
+
+    # Try fallback URLs (with name conversion)
+    for base_url, suffix in fallback_urls:
+        # Convert v9-e.pt -> yolov9-e-converted.pt
+        base_name = weight_path.stem  # e.g., "v9-e"
+        if base_name.startswith("v9-"):
+            converted_name = f"yolov9-{base_name[3:]}{suffix}.pt"
+        elif base_name.startswith("v7"):
+            converted_name = f"yolov7{suffix}.pt"
+        else:
+            converted_name = f"{base_name}{suffix}.pt"
+
+        weight_link = f"{base_url}{converted_name}"
+        try:
+            download_file(weight_link, weight_path)
+            return
+        except requests.exceptions.RequestException:
+            logger.debug(f"Fallback download failed: {weight_link}")
+
+    logger.warning(f"Failed to download weight file: {weight_name}")
