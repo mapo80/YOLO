@@ -2,14 +2,19 @@
 Custom Lightning callbacks for YOLO training.
 """
 
+import copy
+import math
 from typing import Any, Dict, Optional, Union
 
+import torch
 import lightning as L
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
+
+from yolo.utils.logger import logger
 
 
 class YOLOProgressBar(RichProgressBar):
@@ -312,3 +317,253 @@ class MetricsTableCallback(Callback):
         lines.append(h_line("└", "┴", "┘", num_cols))
 
         return "\n" + "\n".join(lines)
+
+
+class ModelEMA:
+    """
+    Exponential Moving Average of model weights.
+
+    Maintains a shadow copy of model weights that is updated with EMA at each
+    training step. The EMA model typically achieves better accuracy than the
+    final training weights.
+
+    The decay rate ramps up during warmup to avoid overwriting initial weights
+    too slowly when the model is learning rapidly.
+
+    Formula:
+        effective_decay = decay * (1 - exp(-updates / tau))
+        ema_weights = effective_decay * ema_weights + (1 - effective_decay) * model_weights
+
+    Args:
+        model: Model to track
+        decay: Base EMA decay rate (higher = slower update, more smoothing)
+        tau: Warmup steps for decay ramping (higher = longer warmup)
+        updates: Initial update count (for checkpoint resume)
+
+    Example decay progression (decay=0.9999, tau=2000):
+        updates=0    -> effective_decay=0.000
+        updates=1000 -> effective_decay=0.393
+        updates=2000 -> effective_decay=0.632
+        updates=5000 -> effective_decay=0.918
+        updates=10000 -> effective_decay=0.993
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        decay: float = 0.9999,
+        tau: float = 2000.0,
+        updates: int = 0,
+    ):
+        # Create deep copy of model for EMA
+        self.ema = copy.deepcopy(model).eval()
+        self.decay = decay
+        self.tau = tau
+        self.updates = updates
+
+        # Disable gradients for EMA model
+        for param in self.ema.parameters():
+            param.requires_grad_(False)
+
+    def update(self, model: torch.nn.Module) -> None:
+        """
+        Update EMA weights with current model weights.
+
+        Should be called after each optimizer step.
+        """
+        self.updates += 1
+
+        # Calculate effective decay with warmup
+        d = self.decay * (1 - math.exp(-self.updates / self.tau))
+
+        # Get model state dict (handle DDP wrapper)
+        model_state = model.state_dict()
+
+        # Update EMA weights
+        with torch.no_grad():
+            for name, ema_param in self.ema.state_dict().items():
+                if name in model_state:
+                    model_param = model_state[name]
+                    # Only update float parameters (skip buffers like running_mean)
+                    if ema_param.dtype.is_floating_point:
+                        ema_param.mul_(d).add_(model_param, alpha=1 - d)
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Return state dict for checkpointing."""
+        return {
+            "ema_state_dict": self.ema.state_dict(),
+            "decay": self.decay,
+            "tau": self.tau,
+            "updates": self.updates,
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        """Load state from checkpoint."""
+        self.ema.load_state_dict(state_dict["ema_state_dict"])
+        self.decay = state_dict["decay"]
+        self.tau = state_dict["tau"]
+        self.updates = state_dict["updates"]
+
+
+class EMACallback(Callback):
+    """
+    Lightning callback for Exponential Moving Average of model weights.
+
+    Maintains a shadow copy of model weights that is updated with EMA at each
+    training step. Uses EMA weights for validation and saves them to checkpoints.
+
+    Features:
+    - Updates EMA after each training batch
+    - Swaps to EMA weights for validation (typically better metrics)
+    - Automatically saves/loads EMA state with checkpoints
+    - Fully configurable decay and warmup
+    - Can be disabled without code changes
+
+    Args:
+        decay: EMA decay rate. Higher values = more smoothing.
+            Typical values: 0.9999 (default), 0.999 (faster updates)
+        tau: Warmup steps for decay ramping. The effective decay starts at 0
+            and ramps up to `decay` over approximately `tau` steps.
+        enabled: Set to False to completely disable EMA. Useful for quick
+            experimentation or when EMA is not beneficial.
+
+    Example configuration (YAML):
+        trainer:
+          callbacks:
+            - class_path: yolo.training.callbacks.EMACallback
+              init_args:
+                decay: 0.9999
+                tau: 2000
+                enabled: true
+
+    Example CLI override:
+        # Disable EMA
+        --trainer.callbacks.X.init_args.enabled=false
+
+        # Adjust decay
+        --trainer.callbacks.X.init_args.decay=0.999
+    """
+
+    def __init__(
+        self,
+        decay: float = 0.9999,
+        tau: float = 2000.0,
+        enabled: bool = True,
+    ):
+        super().__init__()
+        self.decay = decay
+        self.tau = tau
+        self.enabled = enabled
+
+        # Runtime state
+        self._ema: Optional[ModelEMA] = None
+        self._original_state_dict: Optional[Dict[str, Any]] = None
+
+    def on_fit_start(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+    ) -> None:
+        """Initialize EMA model at the start of training."""
+        if not self.enabled:
+            return
+
+        # Initialize EMA with current model weights
+        self._ema = ModelEMA(
+            model=pl_module,
+            decay=self.decay,
+            tau=self.tau,
+            updates=0,
+        )
+        logger.info(
+            f"EMA initialized (decay={self.decay}, tau={self.tau})"
+        )
+
+    def on_train_batch_end(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        """Update EMA weights after each training step."""
+        if not self.enabled or self._ema is None:
+            return
+
+        self._ema.update(pl_module)
+
+    def on_validation_start(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+    ) -> None:
+        """Swap to EMA weights for validation."""
+        if not self.enabled or self._ema is None:
+            return
+
+        # Save original weights
+        self._original_state_dict = copy.deepcopy(pl_module.state_dict())
+
+        # Load EMA weights into model
+        pl_module.load_state_dict(self._ema.ema.state_dict())
+
+    def on_validation_end(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+    ) -> None:
+        """Restore original weights after validation."""
+        if not self.enabled or self._original_state_dict is None:
+            return
+
+        # Restore original training weights
+        pl_module.load_state_dict(self._original_state_dict)
+        self._original_state_dict = None
+
+    def on_save_checkpoint(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        checkpoint: Dict[str, Any],
+    ) -> None:
+        """Save EMA state to checkpoint."""
+        if not self.enabled or self._ema is None:
+            return
+
+        checkpoint["ema_callback"] = {
+            "ema_state": self._ema.state_dict(),
+            "decay": self.decay,
+            "tau": self.tau,
+        }
+
+    def on_load_checkpoint(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        checkpoint: Dict[str, Any],
+    ) -> None:
+        """Load EMA state from checkpoint."""
+        if not self.enabled:
+            return
+
+        if "ema_callback" not in checkpoint:
+            return
+
+        ema_data = checkpoint["ema_callback"]
+
+        # Initialize EMA if not yet created
+        if self._ema is None:
+            self._ema = ModelEMA(
+                model=pl_module,
+                decay=ema_data.get("decay", self.decay),
+                tau=ema_data.get("tau", self.tau),
+                updates=0,
+            )
+
+        # Load saved EMA state
+        if "ema_state" in ema_data:
+            self._ema.load_state_dict(ema_data["ema_state"])
+            logger.info(
+                f"EMA restored from checkpoint (updates={self._ema.updates})"
+            )

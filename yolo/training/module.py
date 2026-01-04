@@ -26,11 +26,13 @@ class YOLOModule(L.LightningModule):
         model_config: Name of model architecture (e.g., "v9-c", "v9-s")
         num_classes: Number of detection classes
         image_size: Input image size [width, height]
+        optimizer: Optimizer type ("sgd" or "adamw")
         learning_rate: Initial learning rate
-        momentum: SGD momentum
+        momentum: SGD momentum (only used with optimizer="sgd")
         weight_decay: Weight decay for regularization
+        adamw_betas: Beta coefficients for AdamW (only used with optimizer="adamw")
         warmup_epochs: Number of warmup epochs
-        warmup_momentum: Starting momentum for warmup
+        warmup_momentum: Starting momentum for warmup (SGD only)
         warmup_bias_lr: Starting bias learning rate for warmup
         box_loss_weight: Weight for box regression loss
         cls_loss_weight: Weight for classification loss
@@ -48,9 +50,11 @@ class YOLOModule(L.LightningModule):
         num_classes: int = 80,
         image_size: List[int] = [640, 640],
         # Optimizer
+        optimizer: str = "sgd",  # "sgd" or "adamw"
         learning_rate: float = 0.01,
         momentum: float = 0.937,
         weight_decay: float = 0.0005,
+        adamw_betas: List[float] = [0.9, 0.999],
         # Warmup
         warmup_epochs: int = 3,
         warmup_momentum: float = 0.8,
@@ -277,13 +281,29 @@ class YOLOModule(L.LightningModule):
             {"params": other_params},
         ]
 
-        optimizer = torch.optim.SGD(
-            param_groups,
-            lr=self.hparams.learning_rate,
-            momentum=self.hparams.momentum,
-            weight_decay=self.hparams.weight_decay,
-            nesterov=True,
-        )
+        # Select optimizer based on config
+        opt_name = self.hparams.optimizer.lower()
+
+        if opt_name == "adamw":
+            # AdamW optimizer
+            betas = tuple(self.hparams.adamw_betas)
+            optimizer = torch.optim.AdamW(
+                param_groups,
+                lr=self.hparams.learning_rate,
+                betas=betas,
+                weight_decay=self.hparams.weight_decay,
+            )
+            logger.info(f"Using AdamW optimizer (lr={self.hparams.learning_rate}, betas={betas})")
+        else:
+            # Default: SGD with Nesterov momentum
+            optimizer = torch.optim.SGD(
+                param_groups,
+                lr=self.hparams.learning_rate,
+                momentum=self.hparams.momentum,
+                weight_decay=self.hparams.weight_decay,
+                nesterov=True,
+            )
+            logger.info(f"Using SGD optimizer (lr={self.hparams.learning_rate}, momentum={self.hparams.momentum})")
 
         # Cosine annealing scheduler
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -315,7 +335,7 @@ class YOLOModule(L.LightningModule):
                 else:
                     pg["lr"] = self.hparams.learning_rate * lr_scale
 
-                # Momentum warmup
+                # Momentum warmup (only for SGD, AdamW doesn't have momentum param)
                 if "momentum" in pg:
                     pg["momentum"] = self.hparams.warmup_momentum + \
                                      (self.hparams.momentum - self.hparams.warmup_momentum) * warmup_progress

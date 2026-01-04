@@ -15,6 +15,7 @@ from torchvision.datasets import CocoDetection
 from torchvision.transforms import v2
 
 from yolo.data.loaders import DefaultImageLoader, ImageLoader
+from yolo.data.mosaic import MosaicMixupDataset
 from yolo.data.transforms import (
     LetterBox,
     YOLOTargetTransform,
@@ -83,9 +84,13 @@ class YOLODataModule(L.LightningDataModule):
         pin_memory: bool = True,
         # Custom image loader (e.g., for encrypted images)
         image_loader: Optional[ImageLoader] = None,
-        # Augmentation parameters
+        # Multi-image augmentation parameters (set prob to 0.0 to disable)
         mosaic_prob: float = 1.0,
+        mosaic_9_prob: float = 0.0,
         mixup_prob: float = 0.15,
+        mixup_alpha: float = 32.0,
+        cutmix_prob: float = 0.0,
+        # Single-image augmentation parameters
         hsv_h: float = 0.015,
         hsv_s: float = 0.7,
         hsv_v: float = 0.4,
@@ -96,20 +101,21 @@ class YOLODataModule(L.LightningDataModule):
         perspective: float = 0.0,
         flip_lr: float = 0.5,
         flip_ud: float = 0.0,
+        # Training schedule
         close_mosaic_epochs: int = 15,
     ):
         super().__init__()
         # Exclude image_loader from hyperparameters (not serializable)
         self.save_hyperparameters(ignore=["image_loader"])
 
-        self.train_dataset: Optional[CocoDetection] = None
+        self.train_dataset = None
         self.val_dataset: Optional[CocoDetection] = None
         self._mosaic_enabled = True
         self._image_loader = image_loader
 
         # Log if using custom loader
         if image_loader is not None:
-            logger.info(f"📷 Using custom image loader: {type(image_loader).__name__}")
+            logger.info(f"Using custom image loader: {type(image_loader).__name__}")
 
     def setup(self, stage: Optional[str] = None) -> None:
         """Setup datasets for training and validation."""
@@ -117,8 +123,17 @@ class YOLODataModule(L.LightningDataModule):
         image_size = tuple(self.hparams.image_size)
 
         if stage == "fit" or stage is None:
-            # Training transforms
-            train_transforms = create_train_transforms(
+            # Create base COCO dataset (without transforms - applied after mosaic)
+            base_train_dataset = CocoDetectionWrapper(
+                root=str(root / self.hparams.train_images),
+                annFile=str(root / self.hparams.train_ann),
+                transforms=None,  # Transforms applied after mosaic
+                image_size=image_size,
+                image_loader=self._image_loader,
+            )
+
+            # Create post-mosaic transforms (applied after multi-image augmentation)
+            post_transforms = create_train_transforms(
                 image_size=image_size,
                 hsv_h=self.hparams.hsv_h,
                 hsv_s=self.hparams.hsv_s,
@@ -132,12 +147,16 @@ class YOLODataModule(L.LightningDataModule):
                 flip_ud=self.hparams.flip_ud,
             )
 
-            self.train_dataset = CocoDetectionWrapper(
-                root=str(root / self.hparams.train_images),
-                annFile=str(root / self.hparams.train_ann),
-                transforms=train_transforms,
+            # Wrap with MosaicMixupDataset for multi-image augmentation
+            self.train_dataset = MosaicMixupDataset(
+                dataset=base_train_dataset,
                 image_size=image_size,
-                image_loader=self._image_loader,
+                mosaic_prob=self.hparams.mosaic_prob,
+                mosaic_9_prob=self.hparams.mosaic_9_prob,
+                mixup_prob=self.hparams.mixup_prob,
+                mixup_alpha=self.hparams.mixup_alpha,
+                cutmix_prob=self.hparams.cutmix_prob,
+                transforms=post_transforms,
             )
 
         if stage == "fit" or stage == "validate" or stage is None:
@@ -176,13 +195,20 @@ class YOLODataModule(L.LightningDataModule):
         )
 
     def on_train_epoch_start(self) -> None:
-        """Disable mosaic for last N epochs."""
-        if self.trainer.current_epoch >= self.trainer.max_epochs - self.hparams.close_mosaic_epochs:
+        """Disable mosaic augmentation for the final N epochs (close_mosaic)."""
+        if self.hparams.close_mosaic_epochs <= 0:
+            return
+
+        epochs_remaining = self.trainer.max_epochs - self.trainer.current_epoch
+        if epochs_remaining <= self.hparams.close_mosaic_epochs:
             if self._mosaic_enabled:
                 self._mosaic_enabled = False
-                # Update transforms to disable mosaic
                 if hasattr(self.train_dataset, "disable_mosaic"):
                     self.train_dataset.disable_mosaic()
+                logger.info(
+                    f"Disabling mosaic/mixup augmentation for final "
+                    f"{self.hparams.close_mosaic_epochs} epochs"
+                )
 
     @staticmethod
     def _collate_fn(batch):

@@ -4,6 +4,7 @@
 ![GitHub License](https://img.shields.io/github/license/WongKinYiu/YOLO)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch Lightning](https://img.shields.io/badge/PyTorch-Lightning-792ee5.svg)](https://lightning.ai/)
+[![Tests](https://img.shields.io/badge/tests-65%20passed-brightgreen.svg)](tests/)
 
 Welcome to the official implementation of YOLOv7[^1], YOLOv9[^2], and YOLO-RD[^3].
 
@@ -259,6 +260,11 @@ onnx2tf -i model.onnx -o tflite_output -oiqt -cind images calibration_data.npy
 | **Early Stopping** | Stop on validation plateau |
 | **Logging** | TensorBoard, WandB support |
 | **Custom Image Loader** | Support for encrypted or custom image formats |
+| **Mosaic Augmentation** | 4-way and 9-way mosaic (see [Advanced Training](#advanced-training-techniques)) |
+| **MixUp / CutMix** | Image blending augmentations |
+| **EMA** | Exponential Moving Average of model weights |
+| **Close Mosaic** | Disable augmentation for final N epochs |
+| **Optimizer Selection** | SGD (default) or AdamW |
 
 ## Custom Image Loader
 
@@ -401,6 +407,249 @@ class CachedEncryptedImageLoader(ImageLoader):
 - Serialization overhead: pickle adds some latency
 - Best for: Expensive operations (decryption, cloud storage, custom formats)
 
+## Advanced Training Techniques
+
+This implementation includes advanced training techniques that improve model accuracy and robustness. All features are configurable via YAML/CLI and can be individually enabled or disabled.
+
+### Data Augmentation
+
+#### Mosaic Augmentation
+
+Mosaic combines multiple images into a single training sample, improving detection of small objects and increasing batch diversity.
+
+| Variant | Description |
+|---------|-------------|
+| **4-way Mosaic** | Combines 4 images in a 2x2 grid |
+| **9-way Mosaic** | Combines 9 images in a 3x3 grid |
+
+**Configuration:**
+
+```yaml
+data:
+  mosaic_prob: 1.0      # 1.0 = always apply, 0.0 = disable
+  mosaic_9_prob: 0.0    # Probability of 9-way vs 4-way (0.0 = always 4-way)
+```
+
+**CLI override:**
+
+```shell
+# Disable mosaic entirely
+python -m yolo.cli fit --config config.yaml --data.mosaic_prob=0.0
+
+# Use 50% mosaic with 30% chance of 9-way
+python -m yolo.cli fit --config config.yaml \
+    --data.mosaic_prob=0.5 \
+    --data.mosaic_9_prob=0.3
+```
+
+#### MixUp Augmentation
+
+MixUp blends two images together with a random weight, creating soft labels that improve model generalization.
+
+**Configuration:**
+
+```yaml
+data:
+  mixup_prob: 0.15      # Probability of applying mixup (0.0 = disable)
+  mixup_alpha: 32.0     # Beta distribution parameter (higher = more uniform blending)
+```
+
+**CLI override:**
+
+```shell
+# Disable mixup
+python -m yolo.cli fit --config config.yaml --data.mixup_prob=0.0
+
+# Increase mixup probability
+python -m yolo.cli fit --config config.yaml --data.mixup_prob=0.3
+```
+
+#### CutMix Augmentation
+
+CutMix cuts a rectangular region from one image and pastes it onto another, combining their labels.
+
+**Configuration:**
+
+```yaml
+data:
+  cutmix_prob: 0.0      # Probability of applying cutmix (0.0 = disable)
+```
+
+**CLI override:**
+
+```shell
+# Enable cutmix with 10% probability
+python -m yolo.cli fit --config config.yaml --data.cutmix_prob=0.1
+```
+
+#### RandomPerspective
+
+Applies geometric transformations including rotation, translation, scale, shear, and perspective distortion.
+
+**Configuration:**
+
+```yaml
+data:
+  degrees: 0.0          # Max rotation degrees (+/-), 0.0 = no rotation
+  translate: 0.1        # Max translation as fraction of image size
+  scale: 0.9            # Scale range (1-scale to 1+scale)
+  shear: 0.0            # Max shear degrees (+/-), 0.0 = no shear
+  perspective: 0.0      # Perspective distortion, 0.0 = no perspective
+```
+
+**CLI override:**
+
+```shell
+# Enable rotation and shear
+python -m yolo.cli fit --config config.yaml \
+    --data.degrees=10.0 \
+    --data.shear=5.0
+
+# Disable all geometric augmentation
+python -m yolo.cli fit --config config.yaml \
+    --data.degrees=0 --data.translate=0 --data.scale=0 \
+    --data.shear=0 --data.perspective=0
+```
+
+### Close Mosaic
+
+Disables mosaic, mixup, and cutmix augmentations for the final N epochs of training. This allows the model to fine-tune on "clean" single images, improving convergence.
+
+**Configuration:**
+
+```yaml
+data:
+  close_mosaic_epochs: 15   # Disable augmentations for last 15 epochs
+```
+
+**CLI override:**
+
+```shell
+# Disable close_mosaic (use augmentation until the end)
+python -m yolo.cli fit --config config.yaml --data.close_mosaic_epochs=0
+
+# Use close_mosaic for last 20 epochs
+python -m yolo.cli fit --config config.yaml --data.close_mosaic_epochs=20
+```
+
+### Exponential Moving Average (EMA)
+
+EMA maintains a shadow copy of model weights that is updated with exponential moving average at each training step. The EMA model typically achieves better accuracy than the final training weights.
+
+**How it works:**
+- Shadow weights are updated each step: `ema = decay * ema + (1 - decay) * model`
+- Decay ramps up during warmup: `effective_decay = decay * (1 - exp(-updates / tau))`
+- EMA weights are used for validation and saved checkpoints
+
+**Configuration:**
+
+```yaml
+trainer:
+  callbacks:
+    - class_path: yolo.training.callbacks.EMACallback
+      init_args:
+        decay: 0.9999     # EMA decay rate (higher = slower update)
+        tau: 2000         # Warmup steps for decay
+        enabled: true     # Set to false to disable EMA
+```
+
+**CLI override:**
+
+```shell
+# Disable EMA
+python -m yolo.cli fit --config config.yaml \
+    --trainer.callbacks.6.init_args.enabled=false
+
+# Adjust decay rate
+python -m yolo.cli fit --config config.yaml \
+    --trainer.callbacks.6.init_args.decay=0.999
+```
+
+### Optimizer Selection
+
+Choose between SGD (default, recommended for detection) and AdamW optimizers.
+
+**Configuration:**
+
+```yaml
+model:
+  optimizer: sgd          # "sgd" or "adamw"
+
+  # SGD parameters
+  learning_rate: 0.01
+  momentum: 0.937
+  weight_decay: 0.0005
+
+  # AdamW parameters (only used if optimizer: adamw)
+  adamw_betas: [0.9, 0.999]
+```
+
+**CLI override:**
+
+```shell
+# Use AdamW optimizer
+python -m yolo.cli fit --config config.yaml --model.optimizer=adamw
+
+# Use AdamW with custom betas
+python -m yolo.cli fit --config config.yaml \
+    --model.optimizer=adamw \
+    --model.adamw_betas="[0.9, 0.99]"
+```
+
+### Recommended Configurations
+
+#### Standard Training (COCO-like datasets)
+
+```yaml
+data:
+  mosaic_prob: 1.0
+  mixup_prob: 0.15
+  cutmix_prob: 0.0
+  close_mosaic_epochs: 15
+model:
+  optimizer: sgd
+trainer:
+  callbacks:
+    - class_path: yolo.training.callbacks.EMACallback
+      init_args:
+        enabled: true
+```
+
+#### Small Dataset (< 1000 images)
+
+```yaml
+data:
+  mosaic_prob: 1.0
+  mixup_prob: 0.3         # Higher mixup for regularization
+  cutmix_prob: 0.1        # Add cutmix
+  degrees: 10.0           # Add rotation
+  close_mosaic_epochs: 10
+```
+
+#### Fast Training (reduced augmentation)
+
+```yaml
+data:
+  mosaic_prob: 0.5        # 50% mosaic
+  mixup_prob: 0.0         # No mixup
+  close_mosaic_epochs: 5
+trainer:
+  callbacks:
+    - class_path: yolo.training.callbacks.EMACallback
+      init_args:
+        enabled: false    # Disable EMA for speed
+```
+
+#### Fine-tuning (minimal augmentation)
+
+```yaml
+data:
+  mosaic_prob: 0.0        # No mosaic
+  mixup_prob: 0.0         # No mixup
+  flip_lr: 0.5            # Keep basic flip
+  close_mosaic_epochs: 0
+```
+
 ## Configuration
 
 All configuration via YAML files in `yolo/config/experiment/`:
@@ -424,6 +673,41 @@ data:
 ```
 
 See [HOWTO](docs/HOWTO.md) for detailed documentation and [Training Guide](training-experiment/TRAINING_GUIDE.md) for a complete training example.
+
+## Testing
+
+The project includes a comprehensive test suite to ensure correctness of all components.
+
+### Running Tests
+
+```shell
+# Run all tests
+python -m pytest tests/ -v
+
+# Run specific test file
+python -m pytest tests/test_augmentations.py -v
+
+# Run with coverage
+python -m pytest tests/ --cov=yolo --cov-report=html
+```
+
+### Test Coverage
+
+| Module | Tests | Description |
+|--------|-------|-------------|
+| **Mosaic4** | 4 tests | 4-way mosaic output shape, box bounds, center point range, empty boxes |
+| **Mosaic9** | 3 tests | 9-way mosaic output shape, box bounds, empty boxes |
+| **MixUp** | 3 tests | Output shape, box combination, Beta(32,32) distribution |
+| **CutMix** | 4 tests | Output shape, bbox bounds, center-based sampling, IoA threshold |
+| **RandomPerspective** | 7 tests | Transform disabled, output shape, box bounds, matrix composition, empty boxes |
+| **EMA** | 8 tests | Initialization, decay formula, warmup, state serialization, gradients disabled |
+| **EMACallback** | 3 tests | Initialization, disabled state |
+| **Integration** | 4 tests | Full pipeline, transform chains, mosaic disable |
+| **Edge Cases** | 4 tests | Single image, small images, non-square, reproducibility |
+| **Model Modules** | 6 tests | Conv, Pool, ADown, CBLinear, SPPELAN |
+| **Utils** | 12 tests | Auto-pad, activation functions, chunk division |
+
+**Total: 65 tests** covering data augmentation, training callbacks, model components, and utilities.
 
 ## Metrics Configuration
 

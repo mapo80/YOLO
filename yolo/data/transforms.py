@@ -4,8 +4,12 @@ YOLO Transforms - Using torchvision.transforms.v2 for object detection.
 These transforms handle both images and bounding boxes correctly.
 """
 
+import math
+import random
 from typing import Dict, List, Optional, Tuple
 
+import cv2
+import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor
@@ -234,6 +238,227 @@ class RandomFlip:
         return image, target
 
 
+class RandomPerspective:
+    """
+    Random perspective transformation with rotation, translation, scale, shear.
+
+    Applies affine and perspective transformations to image and updates bounding boxes.
+    All parameters can be set to 0 to disable the corresponding transformation.
+
+    Args:
+        degrees: Max rotation degrees (+/-). Set to 0 to disable rotation.
+        translate: Max translation as fraction of image size. Set to 0 to disable.
+        scale: Scale range (1-scale to 1+scale). Set to 0 to disable scaling.
+        shear: Max shear degrees (+/-). Set to 0 to disable shear.
+        perspective: Perspective distortion factor. Set to 0 to disable.
+        border: Border size for mosaic cropping (negative values crop).
+        fill_value: Fill value for padding (default: 114 gray).
+    """
+
+    def __init__(
+        self,
+        degrees: float = 0.0,
+        translate: float = 0.1,
+        scale: float = 0.5,
+        shear: float = 0.0,
+        perspective: float = 0.0,
+        border: Tuple[int, int] = (0, 0),
+        fill_value: int = 114,
+    ):
+        self.degrees = degrees
+        self.translate = translate
+        self.scale = scale
+        self.shear = shear
+        self.perspective = perspective
+        self.border = border
+        self.fill_value = fill_value
+
+    def __call__(
+        self,
+        image: Tensor,
+        target: Dict[str, Tensor],
+    ) -> Tuple[Tensor, Dict[str, Tensor]]:
+        """
+        Apply random perspective transform.
+
+        Args:
+            image: Image tensor [C, H, W] in range [0, 1]
+            target: Dict with 'boxes' and 'labels'
+
+        Returns:
+            Transformed image and updated target
+        """
+        # Skip if all transforms are disabled
+        if (
+            self.degrees == 0
+            and self.translate == 0
+            and self.scale == 0
+            and self.shear == 0
+            and self.perspective == 0
+        ):
+            return image, target
+
+        # Convert tensor to numpy for cv2
+        _, h, w = image.shape
+        img_np = (image.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+        # Calculate new image size with border
+        new_h = h + self.border[1] * 2
+        new_w = w + self.border[0] * 2
+
+        # Build transformation matrix
+        M = self._build_transform_matrix(w, h, new_w, new_h)
+
+        # Apply perspective warp
+        if self.perspective != 0:
+            img_warped = cv2.warpPerspective(
+                img_np,
+                M,
+                dsize=(new_w, new_h),
+                borderValue=(self.fill_value, self.fill_value, self.fill_value),
+            )
+        else:
+            # Use affine for speed when no perspective
+            img_warped = cv2.warpAffine(
+                img_np,
+                M[:2],
+                dsize=(new_w, new_h),
+                borderValue=(self.fill_value, self.fill_value, self.fill_value),
+            )
+
+        # Convert back to tensor
+        image_out = torch.from_numpy(img_warped).permute(2, 0, 1).float() / 255.0
+
+        # Transform bounding boxes
+        if len(target["boxes"]) > 0:
+            boxes = target["boxes"].clone()
+            labels = target["labels"].clone()
+            boxes, labels = self._transform_boxes(boxes, labels, M, new_w, new_h)
+            target = {"boxes": boxes, "labels": labels}
+
+        return image_out, target
+
+    def _build_transform_matrix(
+        self, w: int, h: int, new_w: int, new_h: int
+    ) -> np.ndarray:
+        """Build combined perspective transformation matrix."""
+        # Center matrix
+        C = np.eye(3, dtype=np.float32)
+        C[0, 2] = -w / 2  # x translation (pixels)
+        C[1, 2] = -h / 2  # y translation (pixels)
+
+        # Perspective matrix
+        P = np.eye(3, dtype=np.float32)
+        if self.perspective != 0:
+            P[2, 0] = random.uniform(-self.perspective, self.perspective)
+            P[2, 1] = random.uniform(-self.perspective, self.perspective)
+
+        # Rotation and scale matrix
+        R = np.eye(3, dtype=np.float32)
+        angle = random.uniform(-self.degrees, self.degrees)
+        scale = random.uniform(1 - self.scale, 1 + self.scale)
+        R[:2] = cv2.getRotationMatrix2D(angle=angle, center=(0, 0), scale=scale)
+
+        # Shear matrix
+        S = np.eye(3, dtype=np.float32)
+        if self.shear != 0:
+            S[0, 1] = math.tan(random.uniform(-self.shear, self.shear) * math.pi / 180)
+            S[1, 0] = math.tan(random.uniform(-self.shear, self.shear) * math.pi / 180)
+
+        # Translation matrix
+        T = np.eye(3, dtype=np.float32)
+        T[0, 2] = (
+            random.uniform(0.5 - self.translate, 0.5 + self.translate) * new_w
+        )  # x translation
+        T[1, 2] = (
+            random.uniform(0.5 - self.translate, 0.5 + self.translate) * new_h
+        )  # y translation
+
+        # Combined matrix: T @ S @ R @ P @ C
+        M = T @ S @ R @ P @ C
+        return M
+
+    def _transform_boxes(
+        self,
+        boxes: Tensor,
+        labels: Tensor,
+        M: np.ndarray,
+        new_w: int,
+        new_h: int,
+        min_area: float = 4.0,
+        min_visibility: float = 0.1,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Transform bounding boxes through the perspective matrix.
+
+        Args:
+            boxes: Boxes in xyxy format [N, 4]
+            labels: Class labels [N]
+            M: 3x3 transformation matrix
+            new_w, new_h: New image dimensions
+            min_area: Minimum box area to keep (pixels)
+            min_visibility: Minimum fraction of original box that must be visible
+
+        Returns:
+            Transformed boxes and labels (filtered)
+        """
+        n = len(boxes)
+        if n == 0:
+            return boxes, labels
+
+        # Get original box areas for visibility filtering
+        orig_areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+
+        # Convert boxes to 4 corner points
+        # corners: [N, 4, 2] - 4 corners per box, each corner is (x, y)
+        xy = torch.zeros((n, 4, 2), dtype=torch.float32)
+        xy[:, 0] = boxes[:, [0, 1]]  # top-left
+        xy[:, 1] = boxes[:, [2, 1]]  # top-right
+        xy[:, 2] = boxes[:, [2, 3]]  # bottom-right
+        xy[:, 3] = boxes[:, [0, 3]]  # bottom-left
+
+        # Reshape to [N*4, 2] for transformation
+        xy = xy.reshape(-1, 2).numpy()
+
+        # Add homogeneous coordinate
+        ones = np.ones((xy.shape[0], 1), dtype=np.float32)
+        xy_h = np.hstack([xy, ones])  # [N*4, 3]
+
+        # Transform points
+        xy_t = xy_h @ M.T  # [N*4, 3]
+
+        # Perspective division
+        xy_t = xy_t[:, :2] / (xy_t[:, 2:3] + 1e-8)  # [N*4, 2]
+
+        # Reshape back to [N, 4, 2]
+        xy_t = xy_t.reshape(n, 4, 2)
+
+        # Get new bounding boxes (axis-aligned)
+        x_coords = xy_t[:, :, 0]
+        y_coords = xy_t[:, :, 1]
+
+        new_boxes = torch.zeros((n, 4), dtype=torch.float32)
+        new_boxes[:, 0] = torch.from_numpy(x_coords.min(axis=1))
+        new_boxes[:, 1] = torch.from_numpy(y_coords.min(axis=1))
+        new_boxes[:, 2] = torch.from_numpy(x_coords.max(axis=1))
+        new_boxes[:, 3] = torch.from_numpy(y_coords.max(axis=1))
+
+        # Clip boxes to image bounds
+        new_boxes[:, [0, 2]] = new_boxes[:, [0, 2]].clamp(0, new_w)
+        new_boxes[:, [1, 3]] = new_boxes[:, [1, 3]].clamp(0, new_h)
+
+        # Filter boxes
+        new_areas = (new_boxes[:, 2] - new_boxes[:, 0]) * (
+            new_boxes[:, 3] - new_boxes[:, 1]
+        )
+        visibility = new_areas / (orig_areas + 1e-8)
+
+        # Keep boxes with sufficient area and visibility
+        valid = (new_areas >= min_area) & (visibility >= min_visibility)
+
+        return new_boxes[valid], labels[valid]
+
+
 class Compose:
     """Compose multiple transforms that handle both image and target."""
 
@@ -268,22 +493,29 @@ def create_train_transforms(
 
     Args:
         image_size: Target image size (width, height)
-        hsv_h: HSV hue augmentation
-        hsv_s: HSV saturation augmentation
-        hsv_v: HSV value augmentation
-        degrees: Rotation degrees (not implemented yet)
-        translate: Translation fraction (not implemented yet)
-        scale: Scale range (not implemented yet)
-        shear: Shear degrees (not implemented yet)
-        perspective: Perspective distortion (not implemented yet)
-        flip_lr: Horizontal flip probability
-        flip_ud: Vertical flip probability
+        hsv_h: HSV hue augmentation (0 to disable)
+        hsv_s: HSV saturation augmentation (0 to disable)
+        hsv_v: HSV value augmentation (0 to disable)
+        degrees: Max rotation degrees (+/-), 0 to disable
+        translate: Max translation as fraction of image size, 0 to disable
+        scale: Scale range (1-scale to 1+scale), 0 to disable
+        shear: Max shear degrees (+/-), 0 to disable
+        perspective: Perspective distortion factor, 0 to disable
+        flip_lr: Horizontal flip probability (0 to disable)
+        flip_ud: Vertical flip probability (0 to disable)
 
     Returns:
         Composed transform pipeline
     """
     transforms = [
         LetterBox(target_size=image_size),
+        RandomPerspective(
+            degrees=degrees,
+            translate=translate,
+            scale=scale,
+            shear=shear,
+            perspective=perspective,
+        ),
         RandomHSV(h_gain=hsv_h, s_gain=hsv_s, v_gain=hsv_v),
         RandomFlip(lr_prob=flip_lr, ud_prob=flip_ud),
     ]
