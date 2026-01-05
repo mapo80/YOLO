@@ -180,6 +180,7 @@ class YOLODataModule(L.LightningDataModule):
         close_mosaic_epochs: Disable mosaic for last N epochs
         cache_labels: Enable label caching (default: True)
         cache_images: Image caching mode - 'none', 'ram', or 'disk' (default: 'none')
+        cache_resize_images: Resize images to image_size when caching (default: True, saves RAM)
         cache_max_memory_gb: Maximum RAM for image caching in GB (default: 8.0)
         cache_refresh: Force cache regeneration (default: False)
     """
@@ -227,6 +228,7 @@ class YOLODataModule(L.LightningDataModule):
         # Caching parameters
         cache_labels: bool = True,
         cache_images: Literal["none", "ram", "disk"] = "none",
+        cache_resize_images: bool = True,
         cache_max_memory_gb: float = 8.0,
         cache_refresh: bool = False,
     ):
@@ -261,10 +263,13 @@ class YOLODataModule(L.LightningDataModule):
         image_cache = None
         if self.hparams.cache_images != "none":
             from yolo.data.cache import ImageCache
+            # Determine target size for caching (None = original size)
+            target_size = image_size if self.hparams.cache_resize_images else None
             image_cache = ImageCache(
                 mode=self.hparams.cache_images,
                 cache_dir=root,
                 max_memory_gb=self.hparams.cache_max_memory_gb,
+                target_size=target_size,
             )
 
         if stage == "fit" or stage is None:
@@ -483,7 +488,7 @@ class CocoDetectionWrapper(CocoDetection):
             self._precache_images()
 
     def _precache_images(self) -> None:
-        """Pre-load all images into RAM cache."""
+        """Pre-load all images into RAM cache (optionally resized)."""
         from tqdm import tqdm
 
         logger.info(f"Pre-caching {len(self.ids)} images to RAM...")
@@ -494,8 +499,10 @@ class CocoDetectionWrapper(CocoDetection):
             path = self.coco.loadImgs(id)[0]["file_name"]
             image_paths.append(Path(os.path.join(self.root, path)))
 
-        # Estimate memory
-        estimated_gb = self._image_cache.estimate_memory(image_paths)
+        # Estimate memory (pass image_loader for encrypted images)
+        estimated_gb = self._image_cache.estimate_memory(
+            image_paths, image_loader=self._image_loader
+        )
         if not self._image_cache.can_cache_in_ram(estimated_gb):
             logger.warning(
                 f"⚠️ Estimated {estimated_gb:.1f}GB needed for image cache, "
@@ -505,7 +512,11 @@ class CocoDetectionWrapper(CocoDetection):
             self._image_cache = None
             return
 
-        logger.info(f"Estimated memory: {estimated_gb:.1f}GB")
+        target_size = self._image_cache.target_size
+        if target_size:
+            logger.info(f"Estimated memory: {estimated_gb:.1f}GB (resized to {target_size[0]}x{target_size[1]})")
+        else:
+            logger.info(f"Estimated memory: {estimated_gb:.1f}GB (original size)")
 
         # Load all images
         for idx, id in enumerate(tqdm(self.ids, desc="Caching images")):
@@ -514,12 +525,37 @@ class CocoDetectionWrapper(CocoDetection):
 
             try:
                 img = self._image_loader(str(full_path))
+                # Resize if target_size is set (letterbox to preserve aspect ratio)
+                if target_size is not None:
+                    img = self._resize_for_cache(img, target_size)
                 img_np = np.asarray(img).copy()
                 self._image_cache.put(idx, full_path, img_np)
             except Exception as e:
                 logger.warning(f"Failed to cache image {full_path}: {e}")
 
         logger.info(f"✅ Cached {self._image_cache.size} images to RAM")
+
+    @staticmethod
+    def _resize_for_cache(img: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
+        """Resize image for caching using letterbox (preserves aspect ratio)."""
+        target_w, target_h = target_size
+        orig_w, orig_h = img.size
+
+        # Calculate scale to fit within target while preserving aspect ratio
+        scale = min(target_w / orig_w, target_h / orig_h)
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+
+        # Resize image
+        img_resized = img.resize((new_w, new_h), Image.BILINEAR)
+
+        # Create letterbox (padded) image
+        padded = Image.new("RGB", target_size, (114, 114, 114))
+        paste_x = (target_w - new_w) // 2
+        paste_y = (target_h - new_h) // 2
+        padded.paste(img_resized, (paste_x, paste_y))
+
+        return padded
 
     def _load_image(self, id: int, index: int):
         """Load image, using cache if available."""
@@ -636,13 +672,15 @@ class YOLOFormatDataset(Dataset):
             self._precache_images()
 
     def _precache_images(self) -> None:
-        """Pre-load all images into RAM cache."""
+        """Pre-load all images into RAM cache (optionally resized)."""
         from tqdm import tqdm
 
         logger.info(f"Pre-caching {len(self.image_files)} images to RAM...")
 
-        # Estimate memory
-        estimated_gb = self._image_cache.estimate_memory(self.image_files)
+        # Estimate memory (pass image_loader for encrypted images)
+        estimated_gb = self._image_cache.estimate_memory(
+            self.image_files, image_loader=self._image_loader
+        )
         if not self._image_cache.can_cache_in_ram(estimated_gb):
             logger.warning(
                 f"⚠️ Estimated {estimated_gb:.1f}GB needed for image cache, "
@@ -652,18 +690,47 @@ class YOLOFormatDataset(Dataset):
             self._image_cache = None
             return
 
-        logger.info(f"Estimated memory: {estimated_gb:.1f}GB")
+        target_size = self._image_cache.target_size
+        if target_size:
+            logger.info(f"Estimated memory: {estimated_gb:.1f}GB (resized to {target_size[0]}x{target_size[1]})")
+        else:
+            logger.info(f"Estimated memory: {estimated_gb:.1f}GB (original size)")
 
         # Load all images
         for idx, image_path in enumerate(tqdm(self.image_files, desc="Caching images")):
             try:
                 img = self._image_loader(str(image_path))
+                # Resize if target_size is set (letterbox to preserve aspect ratio)
+                if target_size is not None:
+                    img = self._resize_for_cache(img, target_size)
                 img_np = np.asarray(img).copy()
                 self._image_cache.put(idx, image_path, img_np)
             except Exception as e:
                 logger.warning(f"Failed to cache image {image_path}: {e}")
 
         logger.info(f"✅ Cached {self._image_cache.size} images to RAM")
+
+    @staticmethod
+    def _resize_for_cache(img: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
+        """Resize image for caching using letterbox (preserves aspect ratio)."""
+        target_w, target_h = target_size
+        orig_w, orig_h = img.size
+
+        # Calculate scale to fit within target while preserving aspect ratio
+        scale = min(target_w / orig_w, target_h / orig_h)
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+
+        # Resize image
+        img_resized = img.resize((new_w, new_h), Image.BILINEAR)
+
+        # Create letterbox (padded) image
+        padded = Image.new("RGB", target_size, (114, 114, 114))
+        paste_x = (target_w - new_w) // 2
+        paste_y = (target_h - new_h) // 2
+        padded.paste(img_resized, (paste_x, paste_y))
+
+        return padded
 
     def __len__(self) -> int:
         return len(self.image_files)

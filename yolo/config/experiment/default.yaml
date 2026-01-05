@@ -216,5 +216,6 @@ data:
   # Cache parsed labels for faster loading on subsequent runs
   cache_labels: true           # true = cache labels, false = parse every time
   cache_images: none           # "none", "ram" (keep in memory), "disk" (save as .npy)
+  cache_resize_images: true    # Resize images to image_size when caching (saves RAM)
   cache_max_memory_gb: 8.0     # Max RAM for image caching (only used if cache_images=ram)
   cache_refresh: false         # Force cache regeneration (delete and rebuild)

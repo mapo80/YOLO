@@ -174,6 +174,7 @@ class ImageCache:
 
     Attributes:
         mode: Caching mode ('none', 'ram', or 'disk').
+        target_size: Target image size (width, height) for resizing, or None for original.
     """
 
     def __init__(
@@ -181,6 +182,7 @@ class ImageCache:
         mode: Literal["none", "ram", "disk"] = "none",
         cache_dir: Optional[Path] = None,
         max_memory_gb: float = 8.0,
+        target_size: Optional[Tuple[int, int]] = None,
     ):
         """
         Initialize image cache.
@@ -189,22 +191,31 @@ class ImageCache:
             mode: Caching mode - 'none', 'ram', or 'disk'.
             cache_dir: Directory for disk cache (only used in disk mode).
             max_memory_gb: Maximum RAM to use for caching (only used in ram mode).
+            target_size: Target image size (width, height) for resizing. None = keep original size.
         """
         self.mode = mode
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.max_memory_gb = max_memory_gb
+        self.target_size = target_size
         self._ram_cache: Dict[int, np.ndarray] = {}
         self._enabled = mode != "none"
 
-    def estimate_memory(self, paths: List[Path], sample_size: int = 50) -> float:
+    def estimate_memory(
+        self,
+        paths: List[Path],
+        sample_size: int = 50,
+        image_loader: Optional[Any] = None,
+    ) -> float:
         """
         Estimate memory required to cache all images.
 
         Samples a subset of images to estimate total memory requirements.
+        If target_size is set, estimates based on resized dimensions.
 
         Args:
             paths: List of image paths.
             sample_size: Number of images to sample for estimation.
+            image_loader: Optional custom image loader (e.g., for encrypted images).
 
         Returns:
             Estimated memory in GB.
@@ -215,7 +226,19 @@ class ImageCache:
         if not paths:
             return 0.0
 
-        # Sample from paths
+        # If target_size is set, we know the exact memory per image
+        if self.target_size is not None:
+            w, h = self.target_size
+            bytes_per_image = w * h * 3  # RGB
+            estimated_gb = (bytes_per_image * len(paths) * 1.2) / (1024**3)
+            logger.debug(
+                f"Memory estimate (resized to {w}x{h}): "
+                f"{bytes_per_image/1024/1024:.1f}MB/img, "
+                f"total {estimated_gb:.1f}GB for {len(paths)} images"
+            )
+            return estimated_gb
+
+        # Sample from paths to estimate original image sizes
         sample_count = min(sample_size, len(paths))
         samples = random.sample(list(paths), sample_count)
         total_bytes = 0
@@ -224,11 +247,17 @@ class ImageCache:
         for path in samples:
             try:
                 path_str = str(path)
-                with Image.open(path_str) as img:
-                    # Estimate bytes: width * height * channels (assume 3 for RGB)
+                # Use custom loader if provided (for encrypted images)
+                if image_loader is not None:
+                    img = image_loader(path_str)
                     w, h = img.size
-                    total_bytes += w * h * 3
-                    valid_samples += 1
+                    img.close()
+                else:
+                    with Image.open(path_str) as img:
+                        w, h = img.size
+                # Estimate bytes: width * height * channels (assume 3 for RGB)
+                total_bytes += w * h * 3
+                valid_samples += 1
             except Exception as e:
                 logger.debug(f"Failed to sample image {path}: {e}")
                 continue
