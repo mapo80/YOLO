@@ -399,6 +399,7 @@ class YOLODataModule(L.LightningDataModule):
     def _get_dataloader_kwargs(self) -> Dict[str, Any]:
         """Get common DataLoader kwargs with optimized settings."""
         num_workers = _get_safe_num_workers(self.hparams.num_workers)
+
         kwargs = {
             "num_workers": num_workers,
             "collate_fn": self._collate_fn,
@@ -615,21 +616,35 @@ class CocoDetectionWrapper(CocoDetection):
         )
 
     def _precache_images(self) -> None:
-        """Pre-load all images into RAM cache (optionally resized)."""
+        """Pre-load all images into memory-mapped RAM cache (parallelized)."""
+        import sys
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from tqdm import tqdm
 
-        logger.info(f"Pre-caching {len(self.ids)} images to RAM...")
-
-        # Get all image paths for memory estimation
+        # Get all image paths
         image_paths = []
         for id in self.ids:
             path = self.coco.loadImgs(id)[0]["file_name"]
             image_paths.append(Path(os.path.join(self.root, path)))
 
-        # Estimate memory (pass image_loader for encrypted images)
-        estimated_gb = self._image_cache.estimate_memory(
-            image_paths, image_loader=self._image_loader
-        )
+        # Determine image shape for mmap
+        target_size = self._image_cache.target_size
+        if target_size:
+            # Fixed size when resizing
+            w, h = target_size
+            image_shape = (h, w, 3)  # HWC format
+            size_info = f"resized to {w}x{h}"
+        else:
+            # Sample first image to get shape
+            first_img = self._image_loader(str(image_paths[0]))
+            w, h = first_img.size
+            image_shape = (h, w, 3)
+            size_info = f"original size {w}x{h}"
+
+        # Calculate memory
+        bytes_per_image = image_shape[0] * image_shape[1] * image_shape[2]
+        estimated_gb = (bytes_per_image * len(self.ids)) / (1024**3)
+
         if not self._image_cache.can_cache_in_ram(estimated_gb):
             logger.warning(
                 f"⚠️ Estimated {estimated_gb:.1f}GB needed for image cache, "
@@ -639,28 +654,63 @@ class CocoDetectionWrapper(CocoDetection):
             self._image_cache = None
             return
 
-        target_size = self._image_cache.target_size
-        if target_size:
-            logger.info(f"Estimated memory: {estimated_gb:.1f}GB (resized to {target_size[0]}x{target_size[1]})")
-        else:
-            logger.info(f"Estimated memory: {estimated_gb:.1f}GB (original size)")
+        # Initialize memory-mapped cache
+        cache_dir = Path(self.root)
+        self._image_cache.initialize_ram_cache(len(self.ids), image_shape, cache_dir)
 
-        # Load all images
-        for idx, id in enumerate(tqdm(self.ids, desc="Caching images")):
-            path = self.coco.loadImgs(id)[0]["file_name"]
-            full_path = Path(os.path.join(self.root, path))
+        if not self._image_cache._enabled:
+            self._image_cache = None
+            return
 
-            try:
-                img = self._image_loader(str(full_path))
-                # Resize if target_size is set (letterbox to preserve aspect ratio)
-                if target_size is not None:
-                    img = self._resize_for_cache(img, target_size)
-                img_np = np.asarray(img).copy()
-                self._image_cache.put(idx, full_path, img_np)
-            except Exception as e:
-                logger.warning(f"Failed to cache image {full_path}: {e}")
+        # Determine number of workers for parallel loading
+        num_workers = min(os.cpu_count() or 4, 8)  # Cap at 8 workers
 
-        logger.info(f"✅ Cached {self._image_cache.size} images to RAM")
+        # Print directly to ensure visibility before Lightning takes over
+        print(f"\n📦 Pre-caching {len(self.ids)} images to RAM ({estimated_gb:.1f}GB, {size_info}, {num_workers} workers)...")
+        sys.stdout.flush()
+
+        # Prepare work items
+        work_items = [(idx, image_paths[idx], target_size) for idx in range(len(self.ids))]
+
+        # Use ThreadPoolExecutor for parallel I/O
+        # Threads work well here because:
+        # 1. PIL/OpenCV release GIL during I/O and decoding
+        # 2. We're writing to a memory-mapped file (kernel handles sync)
+        # 3. No pickle overhead like ProcessPoolExecutor
+        failed_count = 0
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(self._load_and_cache_image, idx, path, target_size): idx
+                for idx, path, target_size in work_items
+            }
+
+            with tqdm(total=len(futures), desc="Caching images", file=sys.stdout) as pbar:
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        failed_count += 1
+                        if failed_count <= 3:  # Only log first 3 failures
+                            logger.warning(f"Failed to cache image: {e}")
+                    pbar.update(1)
+
+        # Flush mmap to disk
+        if self._image_cache._mmap_array is not None:
+            self._image_cache._mmap_array.flush()
+
+        cached_count = self._image_cache.size
+        print(f"✅ Cached {cached_count} images to RAM (memory-mapped)\n")
+        if failed_count > 0:
+            print(f"⚠️ {failed_count} images failed to cache\n")
+        sys.stdout.flush()
+
+    def _load_and_cache_image(self, idx: int, path: Path, target_size: Optional[Tuple[int, int]]) -> None:
+        """Load a single image and store in cache (called by thread workers)."""
+        img = self._image_loader(str(path))
+        if target_size is not None:
+            img = self._resize_for_cache(img, target_size)
+        img_np = np.asarray(img).copy()
+        self._image_cache.put(idx, path, img_np)
 
     @staticmethod
     def _resize_for_cache(img: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
@@ -840,15 +890,29 @@ class YOLOFormatDataset(Dataset):
             self._image_loader = DefaultImageLoader()
 
     def _precache_images(self) -> None:
-        """Pre-load all images into RAM cache (optionally resized)."""
+        """Pre-load all images into memory-mapped RAM cache (parallelized)."""
+        import sys
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from tqdm import tqdm
 
-        logger.info(f"Pre-caching {len(self.image_files)} images to RAM...")
+        # Determine image shape for mmap
+        target_size = self._image_cache.target_size
+        if target_size:
+            # Fixed size when resizing
+            w, h = target_size
+            image_shape = (h, w, 3)  # HWC format
+            size_info = f"resized to {w}x{h}"
+        else:
+            # Sample first image to get shape
+            first_img = self._image_loader(str(self.image_files[0]))
+            w, h = first_img.size
+            image_shape = (h, w, 3)
+            size_info = f"original size {w}x{h}"
 
-        # Estimate memory (pass image_loader for encrypted images)
-        estimated_gb = self._image_cache.estimate_memory(
-            self.image_files, image_loader=self._image_loader
-        )
+        # Calculate memory
+        bytes_per_image = image_shape[0] * image_shape[1] * image_shape[2]
+        estimated_gb = (bytes_per_image * len(self.image_files)) / (1024**3)
+
         if not self._image_cache.can_cache_in_ram(estimated_gb):
             logger.warning(
                 f"⚠️ Estimated {estimated_gb:.1f}GB needed for image cache, "
@@ -858,25 +922,64 @@ class YOLOFormatDataset(Dataset):
             self._image_cache = None
             return
 
-        target_size = self._image_cache.target_size
-        if target_size:
-            logger.info(f"Estimated memory: {estimated_gb:.1f}GB (resized to {target_size[0]}x{target_size[1]})")
-        else:
-            logger.info(f"Estimated memory: {estimated_gb:.1f}GB (original size)")
+        # Initialize memory-mapped cache
+        cache_dir = self.images_dir.parent
+        self._image_cache.initialize_ram_cache(len(self.image_files), image_shape, cache_dir)
 
-        # Load all images
-        for idx, image_path in enumerate(tqdm(self.image_files, desc="Caching images")):
-            try:
-                img = self._image_loader(str(image_path))
-                # Resize if target_size is set (letterbox to preserve aspect ratio)
-                if target_size is not None:
-                    img = self._resize_for_cache(img, target_size)
-                img_np = np.asarray(img).copy()
-                self._image_cache.put(idx, image_path, img_np)
-            except Exception as e:
-                logger.warning(f"Failed to cache image {image_path}: {e}")
+        if not self._image_cache._enabled:
+            self._image_cache = None
+            return
 
-        logger.info(f"✅ Cached {self._image_cache.size} images to RAM")
+        # Determine number of workers for parallel loading
+        num_workers = min(os.cpu_count() or 4, 8)  # Cap at 8 workers
+
+        # Print directly to ensure visibility before Lightning takes over
+        print(f"\n📦 Pre-caching {len(self.image_files)} images to RAM ({estimated_gb:.1f}GB, {size_info}, {num_workers} workers)...")
+        sys.stdout.flush()
+
+        # Prepare work items
+        work_items = [(idx, self.image_files[idx], target_size) for idx in range(len(self.image_files))]
+
+        # Use ThreadPoolExecutor for parallel I/O
+        # Threads work well here because:
+        # 1. PIL/OpenCV release GIL during I/O and decoding
+        # 2. We're writing to a memory-mapped file (kernel handles sync)
+        # 3. No pickle overhead like ProcessPoolExecutor
+        failed_count = 0
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(self._load_and_cache_image, idx, path, target_size): idx
+                for idx, path, target_size in work_items
+            }
+
+            with tqdm(total=len(futures), desc="Caching images", file=sys.stdout) as pbar:
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        failed_count += 1
+                        if failed_count <= 3:  # Only log first 3 failures
+                            logger.warning(f"Failed to cache image: {e}")
+                    pbar.update(1)
+
+        # Flush mmap to disk
+        if self._image_cache._mmap_array is not None:
+            self._image_cache._mmap_array.flush()
+
+        cached_count = self._image_cache.size
+        print(f"✅ Cached {cached_count} images to RAM (memory-mapped)\n")
+        if failed_count > 0:
+            print(f"⚠️ {failed_count} images failed to cache\n")
+        sys.stdout.flush()
+
+    def _load_and_cache_image(self, idx: int, path: Path, target_size: Optional[Tuple[int, int]]) -> None:
+        """Load a single image and store in cache (called by thread workers)."""
+        img = self._image_loader(str(path))
+        # Resize if target_size is set (letterbox to preserve aspect ratio)
+        if target_size is not None:
+            img = self._resize_for_cache(img, target_size)
+        img_np = np.asarray(img).copy()
+        self._image_cache.put(idx, path, img_np)
 
     @staticmethod
     def _resize_for_cache(img: Image.Image, target_size: Tuple[int, int]) -> Image.Image:

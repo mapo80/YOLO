@@ -169,10 +169,13 @@ class ImageCache:
     Optional image caching for faster data loading.
 
     Supports two caching modes:
-    - RAM: Keep decoded images in memory (fastest, high memory usage)
+    - RAM: Keep decoded images in shared memory (fastest, uses SharedMemoryCache)
     - Disk: Save decoded images as .npy files (moderate speedup, persistent)
 
     For encrypted images, disk cache can also be encrypted using AES-256.
+
+    RAM cache uses memory-mapped shared memory that can be accessed by all
+    DataLoader workers without serialization overhead.
 
     Attributes:
         mode: Caching mode ('none', 'ram', or 'disk').
@@ -204,8 +207,13 @@ class ImageCache:
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.max_memory_gb = max_memory_gb
         self.target_size = target_size
-        self._ram_cache: Dict[int, np.ndarray] = {}
         self._enabled = mode != "none"
+
+        # RAM cache: use memory-mapped file for sharing between workers
+        self._mmap_file: Optional[Path] = None
+        self._mmap_array: Optional[np.ndarray] = None
+        self._mmap_index: Dict[int, int] = {}  # idx -> position in mmap
+        self._cache_count = 0
 
         # Setup encryption for disk cache
         self._crypto = None
@@ -215,6 +223,85 @@ class ImageCache:
             self._crypto = CryptoManager(key_hex=encryption_key)
             self._encrypt_disk_cache = True
             logger.info("🔒 Disk cache encryption enabled")
+
+    def initialize_ram_cache(self, num_images: int, image_shape: Tuple[int, int, int], cache_dir: Path) -> None:
+        """
+        Initialize memory-mapped file for RAM cache.
+
+        This creates a single large memory-mapped file that all workers can access
+        without serialization overhead.
+
+        Args:
+            num_images: Number of images to cache
+            image_shape: Shape of each image (H, W, C)
+            cache_dir: Directory to store the memory-mapped file
+        """
+        if self.mode != "ram":
+            return
+
+        # Create cache file path
+        self._mmap_file = cache_dir / ".image_cache.mmap"
+
+        # Calculate total size
+        h, w, c = image_shape
+        bytes_per_image = h * w * c
+        total_bytes = num_images * bytes_per_image
+
+        # Check memory limit
+        total_gb = total_bytes / (1024**3)
+        if total_gb > self.max_memory_gb:
+            logger.warning(
+                f"⚠️ RAM cache would use {total_gb:.1f}GB, exceeding limit of {self.max_memory_gb:.1f}GB. "
+                f"Disabling RAM cache."
+            )
+            self._enabled = False
+            return
+
+        # Create memory-mapped file
+        logger.debug(f"Creating memory-mapped cache: {self._mmap_file} ({total_gb:.2f}GB)")
+
+        # Create the file with the right size
+        self._mmap_array = np.memmap(
+            str(self._mmap_file),
+            dtype=np.uint8,
+            mode="w+",
+            shape=(num_images, h, w, c),
+        )
+        self._image_shape = image_shape
+
+    def __getstate__(self) -> Dict[str, Any]:
+        """
+        Prepare state for pickling (spawn multiprocessing).
+
+        For RAM cache, we pass the mmap file path so workers can open it.
+        """
+        state = self.__dict__.copy()
+        # Don't serialize the actual mmap array - workers will open it themselves
+        state["_mmap_array"] = None
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        """Restore state after unpickling."""
+        self.__dict__.update(state)
+
+        # Re-open memory-mapped file in worker
+        if self.mode == "ram" and self._mmap_file is not None and self._mmap_file.exists():
+            try:
+                # Open in read mode for workers
+                shape = (len(self._mmap_index), *self._image_shape)
+                self._mmap_array = np.memmap(
+                    str(self._mmap_file),
+                    dtype=np.uint8,
+                    mode="r",
+                    shape=shape,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to open mmap cache in worker: {e}")
+                self._mmap_array = None
+
+        # Re-initialize crypto if needed
+        if hasattr(self, "_encrypt_disk_cache") and self._encrypt_disk_cache:
+            self._crypto = None
 
     def estimate_memory(
         self,
@@ -336,7 +423,11 @@ class ImageCache:
             return None
 
         if self.mode == "ram":
-            return self._ram_cache.get(idx)
+            # Use memory-mapped array
+            if self._mmap_array is not None and idx in self._mmap_index:
+                pos = self._mmap_index[idx]
+                return np.array(self._mmap_array[pos])  # Copy from mmap
+            return None
 
         if self.mode == "disk":
             cache_path = self._get_cache_path(path)
@@ -367,7 +458,13 @@ class ImageCache:
             return
 
         if self.mode == "ram":
-            self._ram_cache[idx] = arr
+            # Store in memory-mapped array
+            if self._mmap_array is not None and idx not in self._mmap_index:
+                pos = self._cache_count
+                if pos < len(self._mmap_array):
+                    self._mmap_array[pos] = arr
+                    self._mmap_index[idx] = pos
+                    self._cache_count += 1
 
         elif self.mode == "disk":
             cache_path = self._get_cache_path(path)
@@ -383,13 +480,24 @@ class ImageCache:
                 logger.debug(f"Failed to cache image to disk: {e}")
 
     def clear(self) -> None:
-        """Clear RAM cache."""
-        self._ram_cache.clear()
+        """Clear RAM cache and remove mmap file."""
+        self._mmap_index.clear()
+        self._cache_count = 0
+        if self._mmap_array is not None:
+            del self._mmap_array
+            self._mmap_array = None
+        if self._mmap_file is not None and self._mmap_file.exists():
+            try:
+                self._mmap_file.unlink()
+            except Exception:
+                pass
 
     @property
     def size(self) -> int:
-        """Get number of cached items (RAM mode only)."""
-        return len(self._ram_cache)
+        """Get number of cached items."""
+        if self.mode == "ram":
+            return len(self._mmap_index)
+        return 0
 
 
 class LRUImageBuffer:
