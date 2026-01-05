@@ -1177,5 +1177,165 @@ class TestDataFraction:
         print(f"\nSuccessfully loaded all {len(dataset)} samples")
 
 
+class TestDataLoaderPrewarm:
+    """Tests for DataLoader worker pre-warming functionality."""
+
+    def test_prewarm_creates_train_dataloader_attribute(self):
+        """Test that prewarm creates _train_dataloader attribute."""
+        from yolo.data.datamodule import YOLODataModule
+
+        dm = YOLODataModule(
+            format="yolo",
+            root=str(YOLO_DATASET_PATH),
+            train_images="train/images",
+            train_labels="train/labels",
+            val_images="valid/images",
+            val_labels="valid/labels",
+            batch_size=4,
+            num_workers=2,  # Need workers to trigger prewarm
+            mosaic_prob=0.0,
+        )
+        dm._image_size = (320, 320)
+        dm.setup(stage="fit")
+
+        # After setup with num_workers > 0, _train_dataloader should exist
+        assert hasattr(dm, "_train_dataloader")
+
+    def test_prewarm_skipped_with_zero_workers(self):
+        """Test that prewarm is skipped when num_workers=0."""
+        from yolo.data.datamodule import YOLODataModule
+
+        dm = YOLODataModule(
+            format="yolo",
+            root=str(YOLO_DATASET_PATH),
+            train_images="train/images",
+            train_labels="train/labels",
+            val_images="valid/images",
+            val_labels="valid/labels",
+            batch_size=4,
+            num_workers=0,  # No workers = no prewarm
+            mosaic_prob=0.0,
+        )
+        dm._image_size = (320, 320)
+        dm.setup(stage="fit")
+
+        # With num_workers=0, _train_dataloader should not be set
+        assert not hasattr(dm, "_train_dataloader") or dm._train_dataloader is None
+
+    def test_train_dataloader_reuses_prewarmed_loader(self):
+        """Test that train_dataloader() reuses the pre-warmed loader."""
+        from yolo.data.datamodule import YOLODataModule
+
+        dm = YOLODataModule(
+            format="yolo",
+            root=str(YOLO_DATASET_PATH),
+            train_images="train/images",
+            train_labels="train/labels",
+            val_images="valid/images",
+            val_labels="valid/labels",
+            batch_size=4,
+            num_workers=2,
+            mosaic_prob=0.0,
+        )
+        dm._image_size = (320, 320)
+        dm.setup(stage="fit")
+
+        # Get the pre-warmed loader reference
+        prewarmed = dm._train_dataloader
+
+        # First call should return the pre-warmed loader
+        loader1 = dm.train_dataloader()
+        assert loader1 is prewarmed
+
+        # After first use, _train_dataloader should be None
+        assert dm._train_dataloader is None
+
+        # Second call should create a new loader
+        loader2 = dm.train_dataloader()
+        assert loader2 is not prewarmed
+
+    def test_prewarmed_loader_works_correctly(self):
+        """Test that the pre-warmed loader returns valid batches."""
+        from yolo.data.datamodule import YOLODataModule
+
+        dm = YOLODataModule(
+            format="yolo",
+            root=str(YOLO_DATASET_PATH),
+            train_images="train/images",
+            train_labels="train/labels",
+            val_images="valid/images",
+            val_labels="valid/labels",
+            batch_size=4,
+            num_workers=2,
+            mosaic_prob=0.0,
+        )
+        dm._image_size = (320, 320)
+        dm.setup(stage="fit")
+
+        loader = dm.train_dataloader()
+
+        # Fetch a few batches to verify it works
+        batch_count = 0
+        for images, targets in loader:
+            assert images.shape[0] == 4  # batch_size
+            assert images.shape[1] == 3  # RGB
+            assert len(targets) == 4
+            batch_count += 1
+            if batch_count >= 3:
+                break
+
+        assert batch_count == 3
+
+    def test_prewarm_with_ram_cache(self):
+        """Test that prewarm works with RAM cache enabled."""
+        from yolo.data.datamodule import YOLODataModule
+
+        dm = YOLODataModule(
+            format="yolo",
+            root=str(YOLO_DATASET_PATH),
+            train_images="train/images",
+            train_labels="train/labels",
+            val_images="valid/images",
+            val_labels="valid/labels",
+            batch_size=4,
+            num_workers=2,
+            mosaic_prob=0.0,
+            cache_images="ram",
+            cache_resize_images=True,
+            data_fraction=0.1,  # Use small fraction for faster test
+        )
+        dm._image_size = (320, 320)
+        dm.setup(stage="fit")
+
+        # Should have pre-warmed loader
+        assert hasattr(dm, "_train_dataloader")
+        assert dm._train_dataloader is not None
+
+        # Loader should work
+        loader = dm.train_dataloader()
+        images, targets = next(iter(loader))
+        assert images.shape[0] == 4
+
+    def test_prewarm_validation_stage_not_called(self):
+        """Test that prewarm is not called for validation-only stage."""
+        from yolo.data.datamodule import YOLODataModule
+
+        dm = YOLODataModule(
+            format="yolo",
+            root=str(YOLO_DATASET_PATH),
+            train_images="train/images",
+            train_labels="train/labels",
+            val_images="valid/images",
+            val_labels="valid/labels",
+            batch_size=4,
+            num_workers=2,
+        )
+        dm._image_size = (320, 320)
+        dm.setup(stage="validate")
+
+        # For validate stage only, no training dataloader is created
+        assert not hasattr(dm, "_train_dataloader") or dm._train_dataloader is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
