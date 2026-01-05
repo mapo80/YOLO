@@ -498,6 +498,13 @@ class CocoDetectionWrapper(CocoDetection):
         self.target_transform = YOLOTargetTransform(self._category_id_to_idx)
         # Use provided loader or default PIL loader
         self._image_loader = image_loader or DefaultImageLoader()
+        # Store loader class info for pickling (spawn multiprocessing)
+        self._image_loader_class = type(self._image_loader)
+        self._image_loader_state = (
+            self._image_loader.__dict__.copy()
+            if hasattr(self._image_loader, "__dict__")
+            else {}
+        )
 
         # Apply stratified sampling if data_fraction < 1.0
         if data_fraction < 1.0:
@@ -506,6 +513,27 @@ class CocoDetectionWrapper(CocoDetection):
         # Pre-cache images if using RAM cache
         if self._image_cache is not None and self._image_cache.mode == "ram":
             self._precache_images()
+
+    def __getstate__(self) -> Dict[str, Any]:
+        """Prepare state for pickling (spawn multiprocessing compatibility)."""
+        state = self.__dict__.copy()
+        # Remove the loader instance - will be recreated from class info
+        state.pop("_image_loader", None)
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        """Restore state after unpickling."""
+        self.__dict__.update(state)
+        # Recreate the image loader from stored class info
+        loader_class = state.get("_image_loader_class", DefaultImageLoader)
+        loader_state = state.get("_image_loader_state", {})
+        try:
+            self._image_loader = loader_class.__new__(loader_class)
+            if loader_state:
+                self._image_loader.__dict__.update(loader_state)
+        except Exception:
+            # Fallback to default loader
+            self._image_loader = DefaultImageLoader()
 
     def _apply_stratified_sampling(self, fraction: float) -> None:
         """
@@ -723,6 +751,13 @@ class YOLOFormatDataset(Dataset):
         self._transforms = transforms
         self.image_size = image_size
         self._image_loader = image_loader or DefaultImageLoader()
+        # Store loader class info for pickling (spawn multiprocessing)
+        self._image_loader_class = type(self._image_loader)
+        self._image_loader_state = (
+            self._image_loader.__dict__.copy()
+            if hasattr(self._image_loader, "__dict__")
+            else {}
+        )
         self._labels_cache: Optional[List[Dict[str, Any]]] = None
         self._image_cache = image_cache
 
@@ -748,6 +783,27 @@ class YOLOFormatDataset(Dataset):
         # Pre-cache images if using RAM cache
         if self._image_cache is not None and self._image_cache.mode == "ram":
             self._precache_images()
+
+    def __getstate__(self) -> Dict[str, Any]:
+        """Prepare state for pickling (spawn multiprocessing compatibility)."""
+        state = self.__dict__.copy()
+        # Remove the loader instance - will be recreated from class info
+        state.pop("_image_loader", None)
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        """Restore state after unpickling."""
+        self.__dict__.update(state)
+        # Recreate the image loader from stored class info
+        loader_class = state.get("_image_loader_class", DefaultImageLoader)
+        loader_state = state.get("_image_loader_state", {})
+        try:
+            self._image_loader = loader_class.__new__(loader_class)
+            if loader_state:
+                self._image_loader.__dict__.update(loader_state)
+        except Exception:
+            # Fallback to default loader
+            self._image_loader = DefaultImageLoader()
 
     def _precache_images(self) -> None:
         """Pre-load all images into RAM cache (optionally resized)."""

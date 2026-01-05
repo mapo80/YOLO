@@ -840,6 +840,58 @@ class TestYOLOFormatCustomLoader:
 
         assert loader.call_count == 2
 
+    def test_dataset_pickle_serialization(self):
+        """Test dataset can be pickled/unpickled (required for spawn multiprocessing)."""
+        import pickle
+        from yolo.data.datamodule import YOLOFormatDataset
+        from yolo.data.loaders import FastImageLoader
+
+        # Use FastImageLoader - a real loader class that's defined at module level
+        loader = FastImageLoader(use_mmap=False)
+
+        dataset = YOLOFormatDataset(
+            images_dir=str(YOLO_DATASET_PATH / "train" / "images"),
+            labels_dir=str(YOLO_DATASET_PATH / "train" / "labels"),
+            image_loader=loader,
+        )
+
+        # Should be able to pickle and unpickle
+        pickled = pickle.dumps(dataset)
+        restored_dataset = pickle.loads(pickled)
+
+        # Verify restored dataset works
+        assert len(restored_dataset) == len(dataset)
+        assert isinstance(restored_dataset._image_loader, FastImageLoader)
+        assert restored_dataset._image_loader.use_mmap == False
+
+        # Verify can load images
+        img, target = restored_dataset[0]
+        assert img is not None
+        assert "boxes" in target
+
+    def test_dataset_pickle_with_default_loader(self):
+        """Test dataset with default loader can be pickled."""
+        import pickle
+        from yolo.data.datamodule import YOLOFormatDataset
+        from yolo.data.loaders import DefaultImageLoader
+
+        dataset = YOLOFormatDataset(
+            images_dir=str(YOLO_DATASET_PATH / "train" / "images"),
+            labels_dir=str(YOLO_DATASET_PATH / "train" / "labels"),
+        )
+
+        # Should be able to pickle and unpickle
+        pickled = pickle.dumps(dataset)
+        restored_dataset = pickle.loads(pickled)
+
+        # Verify restored dataset works
+        assert len(restored_dataset) == len(dataset)
+        assert isinstance(restored_dataset._image_loader, DefaultImageLoader)
+
+        # Verify can load images
+        img, target = restored_dataset[0]
+        assert img is not None
+
 
 class TestYOLOFormatDataModuleHyperparams:
     """Tests for datamodule hyperparameter saving."""

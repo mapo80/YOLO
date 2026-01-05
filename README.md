@@ -54,6 +54,8 @@ All additions are built on **PyTorch Lightning** for clean, scalable training.
 | **Dataset Formats** | Native support for COCO JSON annotations and YOLO TXT format. Switch with `--data.format=yolo` |
 | **Label Caching** | Parse label files once and cache to disk. Subsequent runs load instantly with automatic invalidation on file changes |
 | **Image Caching** | Load images to RAM (`ram`) for fastest training or cache decoded images to disk (`disk`) for moderate speedup |
+| **Cache Resize** | Resize images to `image_size` during caching for reduced RAM usage (default: enabled) |
+| **Data Fraction** | Stratified sampling to use a fraction of data for quick testing (e.g., `data_fraction: 0.1` for 10%) |
 | **Custom Loaders** | Plug in custom image loaders for encrypted datasets, cloud storage, or proprietary formats |
 | **Pin Memory** | Pre-load batches to pinned (page-locked) memory for faster CPU-to-GPU transfer |
 
@@ -1167,9 +1169,14 @@ Labels are parsed from `.txt` files once and saved to a `.cache` file. On subseq
 data:
   cache_labels: true           # Enable label caching (default: true)
   cache_images: none           # "none", "ram", or "disk"
+  cache_resize_images: true    # Resize images to image_size when caching (saves RAM)
   cache_max_memory_gb: 8.0     # Max RAM for image caching
   cache_refresh: false         # Force cache regeneration
 ```
+
+**Image Resize During Caching:**
+
+When `cache_resize_images: true` (default), images are resized to `image_size` during RAM caching. This significantly reduces memory usage - a 4K image (4000x3000) takes ~36MB in RAM, but resized to 640x640 only ~1.2MB. The resize uses letterbox padding to preserve aspect ratio.
 
 **CLI override:**
 
@@ -1179,6 +1186,9 @@ python -m yolo.cli fit --config config.yaml --data.cache_labels=false
 
 # Enable RAM image caching
 python -m yolo.cli fit --config config.yaml --data.cache_images=ram
+
+# Disable image resize during caching (use original resolution)
+python -m yolo.cli fit --config config.yaml --data.cache_resize_images=false
 
 # Force cache regeneration (delete and rebuild)
 python -m yolo.cli fit --config config.yaml --data.cache_refresh=true
@@ -1190,6 +1200,44 @@ Use `--data.cache_refresh=true` to force deletion and regeneration of the cache.
 - Dataset files were modified but timestamps didn't change
 - Cache file is corrupted
 - Switching between different preprocessing configurations
+
+### Data Fraction (Quick Testing)
+
+Use `data_fraction` to train/validate on a subset of your dataset. This is useful for:
+- Quick experiments to find optimal `batch_size` and `num_workers`
+- Debugging training pipelines
+- Rapid prototyping of augmentation strategies
+
+**Stratified Sampling:** The parameter uses stratified sampling by primary class (the first label in each annotation file), ensuring each class is proportionally represented in the subset.
+
+**Configuration:**
+
+```yaml
+data:
+  data_fraction: 1.0           # 1.0 = all data (default), 0.1 = 10% per class
+```
+
+**CLI override:**
+
+```shell
+# Use 10% of data for quick testing
+python -m yolo.cli fit --config config.yaml --data.data_fraction=0.1
+
+# Use 50% of data
+python -m yolo.cli fit --config config.yaml --data.data_fraction=0.5
+```
+
+**Example: Finding Optimal DataLoader Settings**
+
+```shell
+# Quick 10% test to find best num_workers
+for workers in 0 2 4 8 12; do
+    python -m yolo.cli fit --config config.yaml \
+        --data.data_fraction=0.1 \
+        --data.num_workers=$workers \
+        --trainer.max_epochs=1
+done
+```
 
 ### Exponential Moving Average (EMA)
 
