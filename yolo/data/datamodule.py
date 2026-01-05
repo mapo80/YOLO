@@ -13,7 +13,7 @@ The format can be configured via YAML or CLI:
 
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import lightning as L
 import torch
@@ -75,7 +75,6 @@ class YOLODataModule(L.LightningDataModule):
         val_labels: Path to validation labels directory (YOLO format, relative to root)
         batch_size: Batch size for training and validation
         num_workers: Number of data loading workers
-        image_size: Target image size [width, height]
         pin_memory: Whether to pin memory for faster GPU transfer
         image_loader: Custom image loader (e.g., for encrypted images).
             Can be configured via YAML class_path or CLI.
@@ -116,7 +115,6 @@ class YOLODataModule(L.LightningDataModule):
         # DataLoader settings
         batch_size: int = 16,
         num_workers: int = 8,
-        image_size: List[int] = [640, 640],
         pin_memory: bool = True,
         # Custom image loader (e.g., for encrypted images)
         image_loader: Optional[ImageLoader] = None,
@@ -153,6 +151,8 @@ class YOLODataModule(L.LightningDataModule):
         self.val_dataset = None
         self._mosaic_enabled = True
         self._image_loader = image_loader
+        # Image size is set via CLI link from model.image_size
+        self._image_size: Tuple[int, int] = (640, 640)
 
         # Validate format
         if format not in ("coco", "yolo"):
@@ -167,7 +167,7 @@ class YOLODataModule(L.LightningDataModule):
     def setup(self, stage: Optional[str] = None) -> None:
         """Setup datasets for training and validation."""
         root = Path(self.hparams.root)
-        image_size = tuple(self.hparams.image_size)
+        image_size = self._image_size
         is_yolo_format = self.hparams.format == "yolo"
 
         if stage == "fit" or stage is None:
