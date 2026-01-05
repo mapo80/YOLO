@@ -12,6 +12,8 @@ The format can be configured via YAML or CLI:
 """
 
 import os
+import platform
+import random
 from pathlib import Path
 
 try:
@@ -21,6 +23,8 @@ except ImportError:
     # Windows doesn't have resource module
     HAS_RESOURCE = False
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+
+import numpy as np
 
 import lightning as L
 import torch
@@ -87,6 +91,21 @@ def _get_safe_num_workers(requested: int) -> int:
         return max_safe_workers
 
     return requested
+
+
+def _worker_init_fn(worker_id: int) -> None:
+    """
+    Initialize each DataLoader worker with unique random seed.
+
+    This ensures workers don't all generate the same random augmentations,
+    which can cause synchronization issues and reduce augmentation diversity.
+    """
+    # Get the base seed from PyTorch
+    worker_seed = torch.initial_seed() % 2**32
+
+    # Set different seed for each worker
+    np.random.seed(worker_seed + worker_id)
+    random.seed(worker_seed + worker_id)
 
 
 from yolo.data.mosaic import MosaicMixupDataset
@@ -238,6 +257,16 @@ class YOLODataModule(L.LightningDataModule):
         image_size = self._image_size
         is_yolo_format = self.hparams.format == "yolo"
 
+        # Setup image cache if enabled
+        image_cache = None
+        if self.hparams.cache_images != "none":
+            from yolo.data.cache import ImageCache
+            image_cache = ImageCache(
+                mode=self.hparams.cache_images,
+                cache_dir=root,
+                max_memory_gb=self.hparams.cache_max_memory_gb,
+            )
+
         if stage == "fit" or stage is None:
             # Create base dataset based on format
             if is_yolo_format:
@@ -249,6 +278,7 @@ class YOLODataModule(L.LightningDataModule):
                     image_loader=self._image_loader,
                     cache_labels=self.hparams.cache_labels,
                     cache_refresh=self.hparams.cache_refresh,
+                    image_cache=image_cache,
                 )
             else:
                 base_train_dataset = CocoDetectionWrapper(
@@ -257,6 +287,7 @@ class YOLODataModule(L.LightningDataModule):
                     transforms=None,  # Transforms applied after mosaic
                     image_size=image_size,
                     image_loader=self._image_loader,
+                    image_cache=image_cache,
                 )
 
             # Create post-mosaic transforms (applied after multi-image augmentation)
@@ -334,7 +365,16 @@ class YOLODataModule(L.LightningDataModule):
             "pin_memory": self.hparams.pin_memory,
             "persistent_workers": num_workers > 0,
             "prefetch_factor": self.hparams.prefetch_factor if num_workers > 0 else None,
+            "worker_init_fn": _worker_init_fn if num_workers > 0 else None,
         }
+
+        # Use 'spawn' multiprocessing context to avoid fork issues
+        # Fork can cause file descriptor leaks, deadlocks with CUDA, and issues
+        # with certain libraries (OpenCV, some crypto libs). Spawn is safer but
+        # slightly slower at worker startup.
+        if num_workers > 0:
+            kwargs["multiprocessing_context"] = "spawn"
+
         return kwargs
 
     def train_dataloader(self) -> DataLoader:
@@ -411,6 +451,7 @@ class CocoDetectionWrapper(CocoDetection):
         transforms: Optional transform to apply to images and targets
         image_size: Target image size (width, height)
         image_loader: Optional custom image loader (e.g., for encrypted images)
+        image_cache: Optional ImageCache for caching decoded images in RAM/disk
     """
 
     def __init__(
@@ -420,10 +461,12 @@ class CocoDetectionWrapper(CocoDetection):
         transforms: Optional[Callable] = None,
         image_size: tuple = (640, 640),
         image_loader: Optional[ImageLoader] = None,
+        image_cache: Optional[Any] = None,
     ):
         super().__init__(root, annFile)
         self._transforms = transforms
         self.image_size = image_size
+        self._image_cache = image_cache
 
         # Build category_id to 0-indexed class mapping from COCO categories
         # This handles both standard COCO (1-indexed) and custom datasets
@@ -435,19 +478,77 @@ class CocoDetectionWrapper(CocoDetection):
         # Use provided loader or default PIL loader
         self._image_loader = image_loader or DefaultImageLoader()
 
-    def _load_image(self, id: int):
-        """Override parent's _load_image to use custom loader."""
+        # Pre-cache images if using RAM cache
+        if self._image_cache is not None and self._image_cache.mode == "ram":
+            self._precache_images()
+
+    def _precache_images(self) -> None:
+        """Pre-load all images into RAM cache."""
+        from tqdm import tqdm
+
+        logger.info(f"Pre-caching {len(self.ids)} images to RAM...")
+
+        # Get all image paths for memory estimation
+        image_paths = []
+        for id in self.ids:
+            path = self.coco.loadImgs(id)[0]["file_name"]
+            image_paths.append(Path(os.path.join(self.root, path)))
+
+        # Estimate memory
+        estimated_gb = self._image_cache.estimate_memory(image_paths)
+        if not self._image_cache.can_cache_in_ram(estimated_gb):
+            logger.warning(
+                f"⚠️ Estimated {estimated_gb:.1f}GB needed for image cache, "
+                f"but max allowed is {self._image_cache.max_memory_gb:.1f}GB. "
+                f"Disabling image caching."
+            )
+            self._image_cache = None
+            return
+
+        logger.info(f"Estimated memory: {estimated_gb:.1f}GB")
+
+        # Load all images
+        for idx, id in enumerate(tqdm(self.ids, desc="Caching images")):
+            path = self.coco.loadImgs(id)[0]["file_name"]
+            full_path = Path(os.path.join(self.root, path))
+
+            try:
+                img = self._image_loader(str(full_path))
+                img_np = np.asarray(img).copy()
+                self._image_cache.put(idx, full_path, img_np)
+            except Exception as e:
+                logger.warning(f"Failed to cache image {full_path}: {e}")
+
+        logger.info(f"✅ Cached {self._image_cache.size} images to RAM")
+
+    def _load_image(self, id: int, index: int):
+        """Load image, using cache if available."""
         path = self.coco.loadImgs(id)[0]["file_name"]
-        full_path = os.path.join(self.root, path)
-        return self._image_loader(full_path)
+        full_path = Path(os.path.join(self.root, path))
+
+        # Try cache first
+        if self._image_cache is not None:
+            cached = self._image_cache.get(index, full_path)
+            if cached is not None:
+                return Image.fromarray(cached)
+
+        # Load from disk
+        img = self._image_loader(str(full_path))
+
+        # Store in cache for next time
+        if self._image_cache is not None:
+            img_np = np.asarray(img).copy()
+            self._image_cache.put(index, full_path, img_np)
+
+        return img
 
     def __getitem__(self, index: int):
         """Get image and target at index."""
         # Get image id
         id = self.ids[index]
 
-        # Load image using custom loader
-        image = self._load_image(id)
+        # Load image using custom loader (with cache)
+        image = self._load_image(id, index)
 
         # Get annotations
         target = self._load_target(id)
@@ -493,6 +594,7 @@ class YOLOFormatDataset(Dataset):
         image_loader: Optional custom image loader
         cache_labels: Enable label caching (default: True)
         cache_refresh: Force cache regeneration (default: False)
+        image_cache: Optional ImageCache for caching decoded images in RAM/disk
     """
 
     def __init__(
@@ -504,6 +606,7 @@ class YOLOFormatDataset(Dataset):
         image_loader: Optional[ImageLoader] = None,
         cache_labels: bool = True,
         cache_refresh: bool = False,
+        image_cache: Optional[Any] = None,
     ):
         self.images_dir = Path(images_dir)
         self.labels_dir = Path(labels_dir)
@@ -511,6 +614,7 @@ class YOLOFormatDataset(Dataset):
         self.image_size = image_size
         self._image_loader = image_loader or DefaultImageLoader()
         self._labels_cache: Optional[List[Dict[str, Any]]] = None
+        self._image_cache = image_cache
 
         # Find all images
         self.image_files = []
@@ -526,6 +630,40 @@ class YOLOFormatDataset(Dataset):
         # Setup label caching
         if cache_labels:
             self._setup_cache(refresh=cache_refresh)
+
+        # Pre-cache images if using RAM cache
+        if self._image_cache is not None and self._image_cache.mode == "ram":
+            self._precache_images()
+
+    def _precache_images(self) -> None:
+        """Pre-load all images into RAM cache."""
+        from tqdm import tqdm
+
+        logger.info(f"Pre-caching {len(self.image_files)} images to RAM...")
+
+        # Estimate memory
+        estimated_gb = self._image_cache.estimate_memory(self.image_files)
+        if not self._image_cache.can_cache_in_ram(estimated_gb):
+            logger.warning(
+                f"⚠️ Estimated {estimated_gb:.1f}GB needed for image cache, "
+                f"but max allowed is {self._image_cache.max_memory_gb:.1f}GB. "
+                f"Disabling image caching."
+            )
+            self._image_cache = None
+            return
+
+        logger.info(f"Estimated memory: {estimated_gb:.1f}GB")
+
+        # Load all images
+        for idx, image_path in enumerate(tqdm(self.image_files, desc="Caching images")):
+            try:
+                img = self._image_loader(str(image_path))
+                img_np = np.asarray(img).copy()
+                self._image_cache.put(idx, image_path, img_np)
+            except Exception as e:
+                logger.warning(f"Failed to cache image {image_path}: {e}")
+
+        logger.info(f"✅ Cached {self._image_cache.size} images to RAM")
 
     def __len__(self) -> int:
         return len(self.image_files)
@@ -603,11 +741,30 @@ class YOLOFormatDataset(Dataset):
 
         return {"boxes_norm": boxes_norm, "labels": labels}
 
+    def _load_image(self, index: int) -> Image.Image:
+        """Load image, using cache if available."""
+        image_path = self.image_files[index]
+
+        # Try cache first
+        if self._image_cache is not None:
+            cached = self._image_cache.get(index, image_path)
+            if cached is not None:
+                return Image.fromarray(cached)
+
+        # Load from disk
+        img = self._image_loader(str(image_path))
+
+        # Store in cache for next time
+        if self._image_cache is not None:
+            img_np = np.asarray(img).copy()
+            self._image_cache.put(index, image_path, img_np)
+
+        return img
+
     def __getitem__(self, index: int):
         """Get image and target at index."""
-        # Load image
-        image_path = self.image_files[index]
-        image = self._image_loader(str(image_path))
+        # Load image (with cache if enabled)
+        image = self._load_image(index)
         img_w, img_h = image.size
 
         # Get labels (from cache or parse on-the-fly)

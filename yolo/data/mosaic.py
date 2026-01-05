@@ -38,7 +38,10 @@ class MosaicMixupDataset(Dataset):
         cutmix_beta: Beta distribution parameter for cutmix area (default: 1.0)
         transforms: Post-augmentation transforms to apply
         fill_value: Fill value for padding (default: 114 gray)
-        buffer_size: Size of LRU buffer for caching recently accessed images (default: 64)
+        buffer_size: Size of LRU buffer for caching recently accessed images.
+            Default is 0 (disabled) because the buffer is not shared between
+            DataLoader workers - each worker gets its own copy, providing no
+            benefit with num_workers > 0.
     """
 
     def __init__(
@@ -53,7 +56,7 @@ class MosaicMixupDataset(Dataset):
         cutmix_beta: float = 1.0,
         transforms: Optional[Callable] = None,
         fill_value: int = 114,
-        buffer_size: int = 64,
+        buffer_size: int = 0,  # Disabled by default - doesn't help with multiprocessing
     ):
         self.dataset = dataset
         self.image_size = image_size
@@ -70,7 +73,9 @@ class MosaicMixupDataset(Dataset):
         self.border = (-image_size[0] // 2, -image_size[1] // 2)
 
         # LRU buffer for caching recently accessed images
-        # Improves performance for mosaic where images may be reused
+        # NOTE: This buffer is NOT shared between DataLoader workers (each worker
+        # gets its own copy), so it provides minimal benefit with num_workers > 0.
+        # It's disabled by default. Enable only for single-threaded loading.
         self._buffer_size = buffer_size
         self._buffer = None
         if buffer_size > 0:
