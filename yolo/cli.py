@@ -119,7 +119,7 @@ class YOLOLightningCLI:
                 if self.model is None or self.datamodule is None:
                     return
 
-                model_size = tuple(self.model.hparams.image_size)
+                model_size = tuple(self.model.image_size)
                 data_size = self.datamodule._image_size
 
                 if model_size != data_size:
