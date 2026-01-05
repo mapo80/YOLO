@@ -825,6 +825,34 @@ data:
 - `pin_memory`: Keep `true` for GPU training
 - `batch_size`: Larger batches improve throughput but require more VRAM
 
+### File Descriptor Limits (num_workers)
+
+When using many workers (`num_workers > 64`), you may hit the system's file descriptor limit. The training CLI **automatically detects** this and reduces workers with a warning:
+
+```
+⚠️ Reducing num_workers: 128 → 40 (ulimit -n = 1024).
+   To use 128 workers, run: ulimit -n 2920
+```
+
+**To increase the limit:**
+
+```shell
+# Check current limit
+ulimit -n
+
+# Increase for current session (Linux/macOS)
+ulimit -n 65536
+
+# Permanent increase (Linux - add to /etc/security/limits.conf)
+* soft nofile 65536
+* hard nofile 65536
+
+# Permanent increase (macOS - add to /etc/launchd.conf)
+limit maxfiles 65536 200000
+```
+
+**Formula:** Each worker uses ~15 file descriptors. For `N` workers, set `ulimit -n` to at least `N * 15 + 1000`.
+
 ### Storage Optimization
 
 | Method | Use Case | Speedup |
