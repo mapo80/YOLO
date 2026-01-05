@@ -196,7 +196,7 @@ class ImageCache:
         self._ram_cache: Dict[int, np.ndarray] = {}
         self._enabled = mode != "none"
 
-    def estimate_memory(self, paths: List[Path], sample_size: int = 30) -> float:
+    def estimate_memory(self, paths: List[Path], sample_size: int = 50) -> float:
         """
         Estimate memory required to cache all images.
 
@@ -215,23 +215,38 @@ class ImageCache:
         if not paths:
             return 0.0
 
-        samples = random.sample(paths, min(sample_size, len(paths)))
+        # Sample from paths
+        sample_count = min(sample_size, len(paths))
+        samples = random.sample(list(paths), sample_count)
         total_bytes = 0
+        valid_samples = 0
 
         for path in samples:
             try:
-                with Image.open(path) as img:
+                path_str = str(path)
+                with Image.open(path_str) as img:
                     # Estimate bytes: width * height * channels (assume 3 for RGB)
-                    total_bytes += img.size[0] * img.size[1] * 3
-            except Exception:
+                    w, h = img.size
+                    total_bytes += w * h * 3
+                    valid_samples += 1
+            except Exception as e:
+                logger.debug(f"Failed to sample image {path}: {e}")
                 continue
 
-        if not total_bytes:
+        if valid_samples == 0:
+            logger.warning("Could not sample any images for memory estimation")
             return 0.0
 
-        # Average bytes per image * total images * safety margin
-        avg_bytes = total_bytes / len(samples)
+        # Average bytes per image * total images * safety margin (1.2x)
+        avg_bytes = total_bytes / valid_samples
         estimated_gb = (avg_bytes * len(paths) * 1.2) / (1024**3)
+
+        logger.debug(
+            f"Memory estimate: {valid_samples} samples, "
+            f"avg {avg_bytes/1024/1024:.1f}MB/img, "
+            f"total {estimated_gb:.1f}GB for {len(paths)} images"
+        )
+
         return estimated_gb
 
     def can_cache_in_ram(self, estimated_gb: float) -> bool:
