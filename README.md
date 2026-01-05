@@ -716,7 +716,7 @@ For datasets with AES-256 encrypted images (.enc files), use the built-in `Encry
 pip install cryptography
 
 # Set encryption key (64 hex characters = 32 bytes for AES-256)
-export YOLO_IMAGE_ENCRYPTION_KEY=<your-64-char-hex-key>
+export YOLO_ENCRYPTION_KEY=<your-64-char-hex-key>
 ```
 
 **Configuration via YAML:**

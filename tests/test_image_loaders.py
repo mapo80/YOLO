@@ -753,7 +753,7 @@ class TestEncryptedImageLoader:
     @pytest.fixture
     def set_env_key(self, aes_key_hex, monkeypatch):
         """Set the encryption key environment variable."""
-        monkeypatch.setenv("YOLO_IMAGE_ENCRYPTION_KEY", aes_key_hex)
+        monkeypatch.setenv("YOLO_ENCRYPTION_KEY", aes_key_hex)
 
     def test_loads_encrypted_image(self, encrypted_image, set_env_key):
         """Test loading an encrypted image."""
@@ -774,17 +774,17 @@ class TestEncryptedImageLoader:
 
     def test_missing_env_key_raises_error(self, encrypted_image, monkeypatch):
         """Test that missing key raises ValueError."""
-        monkeypatch.delenv("YOLO_IMAGE_ENCRYPTION_KEY", raising=False)
+        monkeypatch.delenv("YOLO_ENCRYPTION_KEY", raising=False)
 
         loader = EncryptedImageLoader()
 
-        with pytest.raises(ValueError, match="YOLO_IMAGE_ENCRYPTION_KEY"):
+        with pytest.raises(ValueError, match="YOLO_ENCRYPTION_KEY"):
             loader(encrypted_image)
 
     def test_invalid_key_length_raises_error(self, encrypted_image, monkeypatch):
         """Test that invalid key length raises ValueError."""
         # Set a key that's too short (only 16 bytes instead of 32)
-        monkeypatch.setenv("YOLO_IMAGE_ENCRYPTION_KEY", "a" * 32)  # 16 bytes
+        monkeypatch.setenv("YOLO_ENCRYPTION_KEY", "a" * 32)  # 16 bytes
 
         loader = EncryptedImageLoader()
 
@@ -793,17 +793,17 @@ class TestEncryptedImageLoader:
 
     def test_key_caching(self, aes_key_hex, monkeypatch):
         """Test that key is cached after first retrieval."""
-        monkeypatch.setenv("YOLO_IMAGE_ENCRYPTION_KEY", aes_key_hex)
+        monkeypatch.setenv("YOLO_ENCRYPTION_KEY", aes_key_hex)
 
         loader = EncryptedImageLoader()
 
-        # First call should cache the key
-        key1 = loader._get_key()
+        # First call should cache the key (via crypto manager)
+        key1 = loader._crypto._get_key()
 
         # Modify env (should not affect cached key)
-        monkeypatch.setenv("YOLO_IMAGE_ENCRYPTION_KEY", "b" * 64)
+        monkeypatch.setenv("YOLO_ENCRYPTION_KEY", "b" * 64)
 
-        key2 = loader._get_key()
+        key2 = loader._crypto._get_key()
 
         assert key1 == key2
 
@@ -811,9 +811,10 @@ class TestEncryptedImageLoader:
         """Test that crypto modules are initialized lazily."""
         loader = EncryptedImageLoader()
 
-        assert loader._cipher_module is None
-        assert loader._algorithms is None
-        assert loader._modes is None
+        # Crypto manager is created but modules are not initialized
+        assert loader._crypto._cipher_module is None
+        assert loader._crypto._algorithms is None
+        assert loader._crypto._modes is None
 
     def test_file_handle_closed(self, encrypted_image, set_env_key):
         """Test file handles are closed after loading encrypted images."""

@@ -223,3 +223,10 @@ data:
   cache_resize_images: true    # Resize images to image_size when caching (saves RAM)
   cache_max_memory_gb: 8.0     # Max RAM for image caching (only used if cache_images=ram)
   cache_refresh: false         # Force cache regeneration (delete and rebuild)
+  cache_encrypt: false         # Encrypt disk cache files (.npy.enc) - requires encryption_key
+
+  # === Encryption ===
+  # AES-256 key for encrypted images (.enc) and/or encrypted disk cache
+  # Key: 64-char hex string (32-byte AES-256 key)
+  # Can also be set via YOLO_ENCRYPTION_KEY environment variable
+  encryption_key: null         # null = use env var, or "your-64-char-hex-key"

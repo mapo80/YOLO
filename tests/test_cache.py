@@ -328,6 +328,103 @@ class TestImageCache:
         assert abs(estimated_gb - expected_gb) < 0.01  # Within 0.01 GB
 
 
+class TestImageCacheEncryption:
+    """Tests for encrypted disk cache."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        """Create temporary directory for cache tests."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def test_key(self):
+        """Generate a test encryption key (64 hex chars = 32 bytes)."""
+        return "0123456789abcdef" * 4  # 64 hex chars
+
+    def test_encrypted_disk_cache_creates_enc_files(self, temp_dir, test_key):
+        """Test that encrypted disk cache creates .npy.enc files."""
+        cache = ImageCache(mode="disk", cache_dir=temp_dir, encryption_key=test_key)
+
+        arr = np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8)
+        img_path = temp_dir / "image.jpg"
+        enc_path = temp_dir / "image.npy.enc"
+        npy_path = temp_dir / "image.npy"
+
+        cache.put(0, img_path, arr)
+
+        # Should create .npy.enc, not .npy
+        assert enc_path.exists()
+        assert not npy_path.exists()
+
+    def test_encrypted_disk_cache_roundtrip(self, temp_dir, test_key):
+        """Test encrypted disk cache can save and load correctly."""
+        cache = ImageCache(mode="disk", cache_dir=temp_dir, encryption_key=test_key)
+
+        arr = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        img_path = temp_dir / "image.jpg"
+
+        cache.put(0, img_path, arr)
+        retrieved = cache.get(0, img_path)
+
+        assert retrieved is not None
+        np.testing.assert_array_equal(retrieved, arr)
+
+    def test_encrypted_file_is_actually_encrypted(self, temp_dir, test_key):
+        """Test that the .npy.enc file is actually encrypted (not plain numpy)."""
+        cache = ImageCache(mode="disk", cache_dir=temp_dir, encryption_key=test_key)
+
+        arr = np.zeros((50, 50, 3), dtype=np.uint8)  # All zeros for easy detection
+        img_path = temp_dir / "image.jpg"
+        enc_path = temp_dir / "image.npy.enc"
+
+        cache.put(0, img_path, arr)
+
+        # Read raw bytes
+        with open(enc_path, "rb") as f:
+            raw_data = f.read()
+
+        # Should NOT start with numpy magic number (0x93NUMPY)
+        assert not raw_data.startswith(b"\x93NUMPY")
+
+        # Encrypted data should look random (high entropy)
+        # Check that it's not just zeros
+        unique_bytes = len(set(raw_data))
+        assert unique_bytes > 50  # Encrypted data should have variety
+
+    def test_plain_disk_cache_not_encrypted(self, temp_dir):
+        """Test that disk cache without key creates plain .npy files."""
+        cache = ImageCache(mode="disk", cache_dir=temp_dir, encryption_key=None)
+
+        arr = np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8)
+        img_path = temp_dir / "image.jpg"
+        npy_path = temp_dir / "image.npy"
+        enc_path = temp_dir / "image.npy.enc"
+
+        cache.put(0, img_path, arr)
+
+        # Should create .npy, not .npy.enc
+        assert npy_path.exists()
+        assert not enc_path.exists()
+
+    def test_encrypted_cache_wrong_key_fails(self, temp_dir, test_key):
+        """Test that decryption fails with wrong key."""
+        # Create cache with original key
+        cache1 = ImageCache(mode="disk", cache_dir=temp_dir, encryption_key=test_key)
+
+        arr = np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8)
+        img_path = temp_dir / "image.jpg"
+        cache1.put(0, img_path, arr)
+
+        # Try to read with different key
+        wrong_key = "fedcba9876543210" * 4
+        cache2 = ImageCache(mode="disk", cache_dir=temp_dir, encryption_key=wrong_key)
+
+        # Should return None (decryption fails gracefully)
+        result = cache2.get(0, img_path)
+        assert result is None
+
+
 class TestLRUImageBuffer:
     """Tests for LRUImageBuffer class."""
 

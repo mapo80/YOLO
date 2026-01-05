@@ -235,15 +235,20 @@ class YOLODataModule(L.LightningDataModule):
         cache_resize_images: bool = True,
         cache_max_memory_gb: float = 8.0,
         cache_refresh: bool = False,
+        cache_encrypt: bool = False,
+        # Encryption key for encrypted images (.enc) and/or encrypted cache
+        # Can also be set via YOLO_ENCRYPTION_KEY environment variable
+        encryption_key: Optional[str] = None,
     ):
         super().__init__()
-        # Exclude image_loader from hyperparameters (not serializable)
-        self.save_hyperparameters(ignore=["image_loader"])
+        # Exclude image_loader and encryption_key from hyperparameters (not serializable)
+        self.save_hyperparameters(ignore=["image_loader", "encryption_key"])
 
         self.train_dataset = None
         self.val_dataset = None
         self._mosaic_enabled = True
         self._image_loader = image_loader
+        self._encryption_key = encryption_key
         # Image size is set via CLI link from model.image_size
         self._image_size: Tuple[int, int] = (640, 640)
 
@@ -257,6 +262,10 @@ class YOLODataModule(L.LightningDataModule):
         if image_loader is not None:
             logger.info(f"Using custom image loader: {type(image_loader).__name__}")
 
+        # Log encryption status
+        if encryption_key is not None:
+            logger.info("🔐 Encryption key configured")
+
     def setup(self, stage: Optional[str] = None) -> None:
         """Setup datasets for training and validation."""
         root = Path(self.hparams.root)
@@ -268,14 +277,16 @@ class YOLODataModule(L.LightningDataModule):
         if self.hparams.cache_images != "none":
             from yolo.data.cache import ImageCache
 
-            # Security warning: disk cache with custom loader (e.g., encrypted images)
-            # saves decrypted images as .npy files on disk
-            if self.hparams.cache_images == "disk" and self._image_loader is not None:
-                logger.warning(
-                    "⚠️  SECURITY WARNING: Using disk cache with custom image loader. "
-                    "Decrypted images will be saved as .npy files on disk! "
-                    "Use cache_images='ram' instead for encrypted images."
-                )
+            # Determine encryption key for cache (only if cache_encrypt is True)
+            cache_encryption_key = None
+            if self.hparams.cache_encrypt and self.hparams.cache_images == "disk":
+                if self._encryption_key is None:
+                    raise ValueError(
+                        "cache_encrypt=True requires encryption_key to be set. "
+                        "Either set data.encryption_key in YAML or YOLO_ENCRYPTION_KEY env var."
+                    )
+                cache_encryption_key = self._encryption_key
+                logger.info("🔒 Disk cache encryption enabled")
 
             # Determine target size for caching (None = original size)
             target_size = image_size if self.hparams.cache_resize_images else None
@@ -284,6 +295,7 @@ class YOLODataModule(L.LightningDataModule):
                 cache_dir=root,
                 max_memory_gb=self.hparams.cache_max_memory_gb,
                 target_size=target_size,
+                encryption_key=cache_encryption_key,
             )
 
         # Get data fraction for sampling
