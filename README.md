@@ -834,24 +834,75 @@ When using many workers (`num_workers > 64`), you may hit the system's file desc
    To use 128 workers, run: ulimit -n 2920
 ```
 
+**Recommended ulimit values:**
+
+| num_workers | ulimit min | ulimit recommended |
+|-------------|------------|-------------------|
+| 8 | 1,120 | 2,000 |
+| 16 | 1,240 | 4,000 |
+| 32 | 1,480 | 8,000 |
+| 64 | 1,960 | 16,000 |
+| 128 | 2,920 | 32,000 |
+| 256 | 4,840 | **65,536** |
+
+**Formula:** `ulimit = num_workers × 15 + 1000`
+
 **To increase the limit:**
 
 ```shell
-# Check current limit
-ulimit -n
+# Check current limits
+ulimit -Sn  # soft limit (current)
+ulimit -Hn  # hard limit (maximum)
 
 # Increase for current session (Linux/macOS)
 ulimit -n 65536
-
-# Permanent increase (Linux - add to /etc/security/limits.conf)
-* soft nofile 65536
-* hard nofile 65536
-
-# Permanent increase (macOS - add to /etc/launchd.conf)
-limit maxfiles 65536 200000
 ```
 
-**Formula:** Each worker uses ~15 file descriptors. For `N` workers, set `ulimit -n` to at least `N * 15 + 1000`.
+> **Note:** If you get `cannot modify limit: Operation not permitted`, the hard limit is too low. You need root access to increase it.
+
+**Permanent increase (Linux):**
+
+```shell
+# Add to /etc/security/limits.conf (requires root)
+sudo bash -c 'echo "* soft nofile 65536" >> /etc/security/limits.conf'
+sudo bash -c 'echo "* hard nofile 65536" >> /etc/security/limits.conf'
+
+# Logout and login again for changes to take effect
+```
+
+**Permanent increase (macOS):**
+
+```shell
+# Add to /etc/launchd.conf (requires root)
+sudo bash -c 'echo "limit maxfiles 65536 200000" >> /etc/launchd.conf'
+
+# Reboot for changes to take effect
+```
+
+**Docker:**
+
+```shell
+# Via docker run
+docker run --ulimit nofile=65536:65536 ...
+
+# Via docker-compose.yml
+services:
+  training:
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+```
+
+**Kubernetes:**
+
+```yaml
+# In pod spec
+securityContext:
+  sysctls:
+    - name: fs.file-max
+      value: "65536"
+```
 
 ### Storage Optimization
 
