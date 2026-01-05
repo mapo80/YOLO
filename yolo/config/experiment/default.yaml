@@ -175,6 +175,7 @@ data:
   batch_size: 16
   num_workers: 8
   pin_memory: true
+  prefetch_factor: 4        # Batches to prefetch per worker (increase if GPU stalls)
 
   # === Multi-Image Augmentation ===
   # Set probability to 0.0 to disable any augmentation

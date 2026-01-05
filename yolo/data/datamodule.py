@@ -142,6 +142,7 @@ class YOLODataModule(L.LightningDataModule):
         batch_size: Batch size for training and validation
         num_workers: Number of data loading workers
         pin_memory: Whether to pin memory for faster GPU transfer
+        prefetch_factor: Number of batches to prefetch per worker (default: 4)
         image_loader: Custom image loader (e.g., for encrypted images).
             Can be configured via YAML class_path or CLI.
         # Augmentation parameters
@@ -182,6 +183,7 @@ class YOLODataModule(L.LightningDataModule):
         batch_size: int = 16,
         num_workers: int = 8,
         pin_memory: bool = True,
+        prefetch_factor: int = 4,
         # Custom image loader (e.g., for encrypted images)
         image_loader: Optional[ImageLoader] = None,
         # Multi-image augmentation parameters (set prob to 0.0 to disable)
@@ -331,7 +333,7 @@ class YOLODataModule(L.LightningDataModule):
             "collate_fn": self._collate_fn,
             "pin_memory": self.hparams.pin_memory,
             "persistent_workers": num_workers > 0,
-            "prefetch_factor": 2 if num_workers > 0 else None,
+            "prefetch_factor": self.hparams.prefetch_factor if num_workers > 0 else None,
         }
         return kwargs
 
