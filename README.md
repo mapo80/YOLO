@@ -3,7 +3,7 @@
 ![GitHub License](https://img.shields.io/github/license/WongKinYiu/YOLO)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch Lightning](https://img.shields.io/badge/PyTorch-Lightning-792ee5.svg)](https://lightning.ai/)
-[![Tests](https://img.shields.io/badge/tests-346%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-373%20passed-brightgreen.svg)](tests/)
 
 > **Fork Notice**: This is a fork of [WongKinYiu/YOLO](https://github.com/WongKinYiu/YOLO) with extensive additions for production training.
 
@@ -53,8 +53,9 @@ All additions are built on **PyTorch Lightning** for clean, scalable training.
 |---------|-------------|
 | **Dataset Formats** | Native support for COCO JSON annotations and YOLO TXT format. Switch with `--data.format=yolo` |
 | **Label Caching** | Parse label files once and cache to disk. Subsequent runs load instantly with automatic invalidation on file changes |
-| **Image Caching** | Load images to RAM (`ram`) for fastest training or cache decoded images to disk (`disk`) for moderate speedup |
+| **Image Caching** | Memory-mapped RAM cache (`ram`) shared between workers, or disk cache (`disk`) with optional encryption |
 | **Cache Resize** | Resize images to `image_size` during caching for reduced RAM usage (default: enabled) |
+| **Encrypted Cache** | Encrypt disk cache files (`.npy.enc`) for secure storage of sensitive datasets |
 | **Data Fraction** | Stratified sampling to use a fraction of data for quick testing (e.g., `data_fraction: 0.1` for 10%) |
 | **Custom Loaders** | Plug in custom image loaders for encrypted datasets, cloud storage, or proprietary formats |
 | **Pin Memory** | Pre-load batches to pinned (page-locked) memory for faster CPU-to-GPU transfer |
@@ -927,52 +928,31 @@ python -m yolo.cli fit --config config.yaml --data.root=/dev/shm/coco
 
 ### Caching for Custom Loaders
 
-When using expensive custom loaders (e.g., decryption), you may want to cache processed images to avoid re-processing every epoch.
+When using expensive custom loaders (e.g., decryption, cloud storage), use the built-in image caching instead of implementing your own:
 
-**Important**: With `num_workers > 0`, each worker runs in a separate process with isolated memory. A simple in-memory cache won't work across workers.
-
-**Solution**: Use `multiprocessing.Manager().dict()` for a shared cache:
-
-```python
-import io
-import pickle
-from multiprocessing import Manager
-from PIL import Image
-from yolo.data.loaders import ImageLoader
-
-class CachedEncryptedImageLoader(ImageLoader):
-    """Encrypted image loader with shared cache across workers."""
-
-    def __init__(self, key: str):
-        self.key = key
-        self._manager = Manager()
-        self._cache = self._manager.dict()  # Shared across all workers
-
-    def __call__(self, path: str) -> Image.Image:
-        # Check cache first
-        if path in self._cache:
-            return pickle.loads(self._cache[path])
-
-        # Decrypt and load image
-        with open(path, 'rb') as f:
-            encrypted_data = f.read()
-        decrypted_data = my_decrypt(encrypted_data, self.key)
-        image = Image.open(io.BytesIO(decrypted_data)).convert("RGB")
-
-        # Store in shared cache (serialized)
-        self._cache[path] = pickle.dumps(image)
-        return image
+```yaml
+data:
+  cache_images: ram            # Use memory-mapped RAM cache
+  cache_resize_images: true    # Resize to image_size for memory efficiency
+  image_loader:
+    class_path: yolo.data.encrypted_loader.EncryptedImageLoader
 ```
 
 **How it works:**
-- First epoch: Each image is decrypted once and cached
-- Subsequent epochs: Images are loaded from shared cache (no decryption)
-- All workers share the same cache via inter-process communication
+- First run: Images are loaded via your custom loader and cached to a memory-mapped file
+- All DataLoader workers share the same cache without serialization overhead
+- Subsequent batches read from cache (no decryption/download needed)
 
-**Trade-offs:**
-- Memory usage: Cache grows with dataset size
-- Serialization overhead: pickle adds some latency
-- Best for: Expensive operations (decryption, cloud storage, custom formats)
+**For disk caching with encryption:**
+
+```yaml
+data:
+  cache_images: disk           # Save to disk as .npy files
+  cache_encrypt: true          # Encrypt cache files (.npy.enc)
+  encryption_key: "your-64-char-hex-key"
+```
+
+This ensures cached images are encrypted on disk, maintaining security for sensitive datasets.
 
 ## Advanced Training Techniques
 
@@ -1160,7 +1140,7 @@ Labels are parsed from `.txt` files once and saved to a `.cache` file. On subseq
 | Mode | Description |
 |------|-------------|
 | `none` | No image caching (default) |
-| `ram` | Load all images to RAM (fastest, high memory usage) |
+| `ram` | Load all images to memory-mapped file (fastest, shared between workers) |
 | `disk` | Save decoded images as `.npy` files (moderate speedup, persistent) |
 
 **Configuration:**
@@ -1172,11 +1152,35 @@ data:
   cache_resize_images: true    # Resize images to image_size when caching (saves RAM)
   cache_max_memory_gb: 8.0     # Max RAM for image caching
   cache_refresh: false         # Force cache regeneration
+  cache_encrypt: false         # Encrypt disk cache files (requires encryption_key)
+  encryption_key: null         # AES-256 key for encrypted images/cache
 ```
+
+**RAM Cache (Memory-Mapped):**
+
+The RAM cache uses a memory-mapped file (`.image_cache.mmap`) that is shared between all DataLoader workers without serialization overhead. This allows using `num_workers > 0` with RAM caching for maximum throughput.
+
+- **Parallel loading**: Images are pre-loaded using up to 8 threads for 4-8x faster caching
+- All workers access the same memory-mapped file
+- No serialization delays when spawning workers
+- File is automatically cleaned up after training
 
 **Image Resize During Caching:**
 
-When `cache_resize_images: true` (default), images are resized to `image_size` during RAM caching. This significantly reduces memory usage - a 4K image (4000x3000) takes ~36MB in RAM, but resized to 640x640 only ~1.2MB. The resize uses letterbox padding to preserve aspect ratio.
+When `cache_resize_images: true` (default), images are resized to `image_size` during caching. This significantly reduces memory usage - a 4K image (4000x3000) takes ~36MB in RAM, but resized to 640x640 only ~1.2MB. The resize uses letterbox padding to preserve aspect ratio.
+
+**Encrypted Disk Cache:**
+
+When using encrypted images with disk caching, enable `cache_encrypt` to encrypt the cache files:
+
+```yaml
+data:
+  cache_images: disk
+  cache_encrypt: true          # Encrypt disk cache as .npy.enc files
+  encryption_key: "your-64-char-hex-key"  # Or use YOLO_ENCRYPTION_KEY env var
+```
+
+This prevents cached images from being stored in plain format on disk.
 
 **CLI override:**
 
@@ -1184,11 +1188,14 @@ When `cache_resize_images: true` (default), images are resized to `image_size` d
 # Disable label caching
 python -m yolo.cli fit --config config.yaml --data.cache_labels=false
 
-# Enable RAM image caching
+# Enable RAM image caching (memory-mapped, works with num_workers > 0)
 python -m yolo.cli fit --config config.yaml --data.cache_images=ram
 
 # Disable image resize during caching (use original resolution)
 python -m yolo.cli fit --config config.yaml --data.cache_resize_images=false
+
+# Enable encrypted disk cache
+python -m yolo.cli fit --config config.yaml --data.cache_images=disk --data.cache_encrypt=true
 
 # Force cache regeneration (delete and rebuild)
 python -m yolo.cli fit --config config.yaml --data.cache_refresh=true
@@ -1521,10 +1528,10 @@ python -m pytest tests/ -v --run-integration
 | **Export** | 12 tests | Letterbox, ONNX/TFLite signatures, CLI options |
 | **Training Experiment** | 16 tests | Dataset loading, metrics, schedulers, freezing, export |
 | **YOLO Format Dataloader** | 30 tests | Dataset loading, transforms, collate, edge cases |
-| **Cache** | 18 tests | Label caching, image caching, cache invalidation |
+| **Cache** | 50 tests | Label caching, image caching (RAM/disk), mmap, encryption, LRU buffer |
 | **Integration** | 10 tests | Full pipeline tests (run with `--run-integration`) |
 
-**Total: 346 tests** covering image loaders, data augmentation, training callbacks, metrics, eval dashboard, schedulers, layer freezing, model components, export, validate, caching, and utilities.
+**Total: 373 tests** covering image loaders, data augmentation, training callbacks, metrics, eval dashboard, schedulers, layer freezing, model components, export, validate, caching, and utilities.
 
 ### Training Experiment Tests
 

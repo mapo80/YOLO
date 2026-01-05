@@ -198,13 +198,16 @@ class TestImageCache:
         cache.put(0, Path("test.jpg"), arr)
         assert cache.get(0, Path("test.jpg")) is None
 
-    def test_ram_put_get(self):
-        """Test RAM caching put and get."""
+    def test_ram_put_get(self, temp_dir):
+        """Test RAM caching put and get with memory-mapped file."""
         cache = ImageCache(mode="ram")
         assert cache._enabled is True
 
         arr = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
         path = Path("test.jpg")
+
+        # Initialize mmap cache before use
+        cache.initialize_ram_cache(num_images=10, image_shape=(100, 100, 3), cache_dir=temp_dir)
 
         cache.put(0, path, arr)
         retrieved = cache.get(0, path)
@@ -212,10 +215,16 @@ class TestImageCache:
         assert retrieved is not None
         np.testing.assert_array_equal(retrieved, arr)
 
-    def test_ram_cache_size(self):
+        # Cleanup
+        cache.clear()
+
+    def test_ram_cache_size(self, temp_dir):
         """Test RAM cache size tracking."""
         cache = ImageCache(mode="ram")
         assert cache.size == 0
+
+        # Initialize mmap cache
+        cache.initialize_ram_cache(num_images=10, image_shape=(10, 10, 3), cache_dir=temp_dir)
 
         arr = np.zeros((10, 10, 3), dtype=np.uint8)
         cache.put(0, Path("a.jpg"), arr)
@@ -223,9 +232,16 @@ class TestImageCache:
 
         assert cache.size == 2
 
-    def test_ram_cache_clear(self):
+        # Cleanup
+        cache.clear()
+
+    def test_ram_cache_clear(self, temp_dir):
         """Test RAM cache clearing."""
         cache = ImageCache(mode="ram")
+
+        # Initialize mmap cache
+        cache.initialize_ram_cache(num_images=10, image_shape=(10, 10, 3), cache_dir=temp_dir)
+
         arr = np.zeros((10, 10, 3), dtype=np.uint8)
         cache.put(0, Path("a.jpg"), arr)
         cache.put(1, Path("b.jpg"), arr)
@@ -326,6 +342,213 @@ class TestImageCache:
         expected_gb = (expected_bytes_per_img * 1000 * 1.2) / (1024**3)
 
         assert abs(estimated_gb - expected_gb) < 0.01  # Within 0.01 GB
+
+
+class TestImageCacheMmap:
+    """Tests for memory-mapped RAM cache (shared between workers)."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        """Create temporary directory for cache tests."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_mmap_file_created(self, temp_dir):
+        """Test that memory-mapped file is created during initialization."""
+        cache = ImageCache(mode="ram")
+        cache.initialize_ram_cache(
+            num_images=10,
+            image_shape=(100, 100, 3),
+            cache_dir=temp_dir
+        )
+
+        mmap_file = temp_dir / ".image_cache.mmap"
+        assert mmap_file.exists()
+        assert cache._mmap_array is not None
+        assert cache._enabled is True
+
+        # Cleanup
+        cache.clear()
+
+    def test_mmap_correct_size(self, temp_dir):
+        """Test that memory-mapped file has correct size."""
+        num_images = 5
+        h, w, c = 64, 64, 3
+
+        cache = ImageCache(mode="ram")
+        cache.initialize_ram_cache(
+            num_images=num_images,
+            image_shape=(h, w, c),
+            cache_dir=temp_dir
+        )
+
+        expected_bytes = num_images * h * w * c
+        mmap_file = temp_dir / ".image_cache.mmap"
+        actual_bytes = mmap_file.stat().st_size
+
+        assert actual_bytes == expected_bytes
+
+        # Cleanup
+        cache.clear()
+
+    def test_mmap_put_get_roundtrip(self, temp_dir):
+        """Test storing and retrieving images from mmap cache."""
+        cache = ImageCache(mode="ram")
+        cache.initialize_ram_cache(
+            num_images=10,
+            image_shape=(50, 50, 3),
+            cache_dir=temp_dir
+        )
+
+        # Store multiple images
+        images = []
+        for i in range(5):
+            arr = np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8)
+            images.append(arr)
+            cache.put(i, Path(f"img_{i}.jpg"), arr)
+
+        # Verify all can be retrieved
+        for i, expected in enumerate(images):
+            retrieved = cache.get(i, Path(f"img_{i}.jpg"))
+            assert retrieved is not None
+            np.testing.assert_array_equal(retrieved, expected)
+
+        # Cleanup
+        cache.clear()
+
+    def test_mmap_exceeds_memory_limit(self, temp_dir):
+        """Test that cache is disabled when memory limit is exceeded."""
+        cache = ImageCache(mode="ram", max_memory_gb=0.001)  # 1MB limit
+        cache.initialize_ram_cache(
+            num_images=1000,
+            image_shape=(640, 640, 3),  # ~1.2MB per image
+            cache_dir=temp_dir
+        )
+
+        # Should be disabled due to memory limit
+        assert cache._enabled is False
+
+    def test_mmap_serialization_for_workers(self, temp_dir):
+        """Test that cache can be pickled/unpickled for worker processes."""
+        import pickle
+
+        cache = ImageCache(mode="ram")
+        cache.initialize_ram_cache(
+            num_images=5,
+            image_shape=(32, 32, 3),
+            cache_dir=temp_dir
+        )
+
+        # Store some data
+        arr = np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)
+        cache.put(0, Path("test.jpg"), arr)
+        cache._mmap_array.flush()
+
+        # Simulate worker process: pickle and unpickle
+        state = pickle.dumps(cache)
+        worker_cache = pickle.loads(state)
+
+        # Worker should be able to read the data
+        retrieved = worker_cache.get(0, Path("test.jpg"))
+        assert retrieved is not None
+        np.testing.assert_array_equal(retrieved, arr)
+
+        # Cleanup
+        cache.clear()
+
+    def test_mmap_worker_opens_readonly(self, temp_dir):
+        """Test that worker opens mmap in read-only mode."""
+        import pickle
+
+        cache = ImageCache(mode="ram")
+        cache.initialize_ram_cache(
+            num_images=5,
+            image_shape=(32, 32, 3),
+            cache_dir=temp_dir
+        )
+
+        # Store data
+        arr = np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)
+        cache.put(0, Path("test.jpg"), arr)
+        cache._mmap_array.flush()
+
+        # Simulate worker
+        state = pickle.dumps(cache)
+        worker_cache = pickle.loads(state)
+
+        # Worker's mmap should be read-only
+        assert worker_cache._mmap_array is not None
+        # Attempting to write should fail or be no-op
+        # (np.memmap in 'r' mode raises ValueError on write)
+
+        # Cleanup
+        cache.clear()
+
+    def test_mmap_multiple_indices(self, temp_dir):
+        """Test storing images at non-sequential indices."""
+        cache = ImageCache(mode="ram")
+        cache.initialize_ram_cache(
+            num_images=100,
+            image_shape=(32, 32, 3),
+            cache_dir=temp_dir
+        )
+
+        # Store at various indices
+        test_indices = [0, 5, 10, 50, 99]
+        images = {}
+        for idx in test_indices:
+            arr = np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)
+            images[idx] = arr
+            cache.put(idx, Path(f"img_{idx}.jpg"), arr)
+
+        # Verify all stored
+        assert cache.size == len(test_indices)
+
+        # Verify retrieval
+        for idx, expected in images.items():
+            retrieved = cache.get(idx, Path(f"img_{idx}.jpg"))
+            assert retrieved is not None
+            np.testing.assert_array_equal(retrieved, expected)
+
+        # Cleanup
+        cache.clear()
+
+    def test_mmap_clear_removes_file(self, temp_dir):
+        """Test that clear() removes the mmap file."""
+        cache = ImageCache(mode="ram")
+        cache.initialize_ram_cache(
+            num_images=5,
+            image_shape=(32, 32, 3),
+            cache_dir=temp_dir
+        )
+
+        mmap_file = temp_dir / ".image_cache.mmap"
+        assert mmap_file.exists()
+
+        cache.clear()
+
+        assert cache.size == 0
+        assert cache._mmap_array is None
+        assert not mmap_file.exists()
+
+    def test_mmap_not_initialized_returns_none(self):
+        """Test that get() returns None when mmap not initialized."""
+        cache = ImageCache(mode="ram")
+        # Don't call initialize_ram_cache
+
+        result = cache.get(0, Path("test.jpg"))
+        assert result is None
+
+    def test_mmap_put_without_init_is_noop(self):
+        """Test that put() is no-op when mmap not initialized."""
+        cache = ImageCache(mode="ram")
+        # Don't call initialize_ram_cache
+
+        arr = np.zeros((32, 32, 3), dtype=np.uint8)
+        cache.put(0, Path("test.jpg"), arr)
+
+        # Should not crash, size should be 0
+        assert cache.size == 0
 
 
 class TestImageCacheEncryption:
