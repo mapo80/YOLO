@@ -719,6 +719,18 @@ class TrainingSummaryCallback(Callback):
             # Workers
             if hasattr(dm_hparams, "num_workers"):
                 table.add_row("  Workers", str(dm_hparams.num_workers))
+            # Data fraction (if not 100%)
+            data_fraction = getattr(dm_hparams, "data_fraction", 1.0)
+            if data_fraction < 1.0:
+                table.add_row("  Data Fraction", f"{data_fraction * 100:.0f}%")
+            # Caching
+            cache_images = getattr(dm_hparams, "cache_images", "none")
+            if cache_images != "none":
+                cache_resize = getattr(dm_hparams, "cache_resize_images", True)
+                cache_info = cache_images.upper()
+                if cache_resize:
+                    cache_info += " (resized)"
+                table.add_row("  Image Cache", cache_info)
 
         # === Training Section ===
         table.add_row("", "")
