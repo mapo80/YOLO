@@ -41,6 +41,34 @@ def suppress_stdout():
         sys.stdout = old_stdout
 
 
+@contextlib.contextmanager
+def show_spinner(message: str = "Processing..."):
+    """Show animated spinner during long operations."""
+    import threading
+    import time
+
+    spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    stop_event = threading.Event()
+
+    def spin():
+        idx = 0
+        while not stop_event.is_set():
+            char = spinner_chars[idx % len(spinner_chars)]
+            print(f"\r{char} {message}", end="", flush=True)
+            idx += 1
+            time.sleep(0.1)
+
+    spinner_thread = threading.Thread(target=spin, daemon=True)
+    spinner_thread.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        spinner_thread.join(timeout=0.5)
+        # Clear line
+        print(f"\r{' ' * (len(message) + 3)}\r", end="", flush=True)
+
+
 def compute_iou_matrix(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
     """
     Compute IoU between two sets of bounding boxes.
@@ -911,23 +939,24 @@ class DetMetrics:
 
         logger.debug(f"[Metrics] Processing {len(self._predictions)} predictions...")
 
-        # Compute COCO metrics
+        # Compute COCO metrics with spinner for user feedback
         coco_stats = np.zeros(12)  # 12 standard COCO metrics
         try:
-            _t0 = _time.time()
-            coco_gt = self.coco_converter.get_coco_gt()
-            coco_dt = self.coco_converter.get_coco_dt(coco_gt)
-            logger.debug(f"[Metrics] COCO conversion done in {_time.time() - _t0:.2f}s")
+            with show_spinner("Computing COCO metrics..."):
+                _t0 = _time.time()
+                coco_gt = self.coco_converter.get_coco_gt()
+                coco_dt = self.coco_converter.get_coco_dt(coco_gt)
+                logger.debug(f"[Metrics] COCO conversion done in {_time.time() - _t0:.2f}s")
 
-            _t0 = _time.time()
-            coco_eval = COCOeval(coco_gt, coco_dt, 'bbox')
-            coco_eval.evaluate()
-            coco_eval.accumulate()
-            logger.debug(f"[Metrics] COCO eval done in {_time.time() - _t0:.2f}s")
+                _t0 = _time.time()
+                coco_eval = COCOeval(coco_gt, coco_dt, 'bbox')
+                coco_eval.evaluate()
+                coco_eval.accumulate()
+                logger.debug(f"[Metrics] COCO eval done in {_time.time() - _t0:.2f}s")
 
-            # Suppress verbose COCO output - metrics are shown in EvalDashboard
-            with suppress_stdout():
-                coco_eval.summarize()
+                # Suppress verbose COCO output - metrics are shown in EvalDashboard
+                with suppress_stdout():
+                    coco_eval.summarize()
 
             # Extract all 12 metrics from COCO evaluation
             # stats order: AP, AP50, AP75, APs, APm, APl, AR1, AR10, AR100, ARs, ARm, ARl
