@@ -212,6 +212,10 @@ data:
   # Disable mosaic/mixup/cutmix for final N epochs (improves convergence)
   close_mosaic_epochs: 15
 
+  # === Dataset Sampling ===
+  # Use a fraction of data for quick testing (stratified by class)
+  data_fraction: 1.0           # 1.0 = all data, 0.1 = 10% per class, etc.
+
   # === Dataset Caching ===
   # Cache parsed labels for faster loading on subsequent runs
   cache_labels: true           # true = cache labels, false = parse every time
