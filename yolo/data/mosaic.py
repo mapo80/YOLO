@@ -115,14 +115,18 @@ class MosaicMixupDataset(Dataset):
 
         Uses LRU buffer to cache recently accessed images for faster
         mosaic operations when the same images are reused.
+
+        Note: Images are stored as numpy arrays in the buffer to avoid
+        PIL file handle leaks. This is important for large batch sizes
+        with many workers.
         """
         # Check buffer first
         if self._buffer is not None:
             cached = self._buffer.get(index)
             if cached is not None:
-                # Return deep copy to prevent modifications
-                img, target = cached
-                return img.copy(), {
+                # Cached as (numpy_array, target), convert back to PIL
+                img_np, target = cached
+                return Image.fromarray(img_np), {
                     "boxes": target["boxes"].clone(),
                     "labels": target["labels"].clone(),
                 }
@@ -130,9 +134,11 @@ class MosaicMixupDataset(Dataset):
         # Load from dataset
         img, target = self.dataset[index]
 
-        # Store in buffer
+        # Store in buffer as numpy to avoid file handle leaks
+        # PIL images may hold file handles; numpy arrays don't
         if self._buffer is not None:
-            self._buffer.put(index, (img, target))
+            img_np = np.asarray(img).copy()  # Ensure contiguous copy
+            self._buffer.put(index, (img_np, target))
 
         return img, target
 
