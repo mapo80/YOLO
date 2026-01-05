@@ -1160,7 +1160,7 @@ data:
 
 The RAM cache uses a memory-mapped file (`.image_cache.mmap`) that is shared between all DataLoader workers without serialization overhead. This allows using `num_workers > 0` with RAM caching for maximum throughput.
 
-- **Parallel loading**: Images are pre-loaded using up to 8 threads for 4-8x faster caching
+- **Parallel loading**: Images are pre-loaded using all available CPU threads for maximum caching speed
 - All workers access the same memory-mapped file
 - No serialization delays when spawning workers
 - File is automatically cleaned up after training

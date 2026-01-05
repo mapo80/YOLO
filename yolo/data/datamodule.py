@@ -718,7 +718,7 @@ class CocoDetectionWrapper(CocoDetection):
             return
 
         # Determine number of workers for parallel loading
-        num_workers = min(os.cpu_count() or 4, 8)  # Cap at 8 workers
+        num_workers = os.cpu_count() or 4  # Use all available CPUs for I/O-bound caching
 
         console.print(f"\n[bold]📦 Pre-caching {len(self.ids)} images[/bold] ({estimated_gb:.1f}GB, {size_info}, {num_workers} workers)")
 
@@ -982,7 +982,7 @@ class YOLOFormatDataset(Dataset):
             return
 
         # Determine number of workers for parallel loading
-        num_workers = min(os.cpu_count() or 4, 8)  # Cap at 8 workers
+        num_workers = os.cpu_count() or 4  # Use all available CPUs for I/O-bound caching
 
         console.print(f"\n[bold]📦 Pre-caching {len(self.image_files)} images[/bold] ({estimated_gb:.1f}GB, {size_info}, {num_workers} workers)")
 
