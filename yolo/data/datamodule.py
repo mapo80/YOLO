@@ -383,6 +383,63 @@ class YOLODataModule(L.LightningDataModule):
             # Extract class names from dataset
             self._extract_class_names(is_yolo_format)
 
+        # Pre-warm DataLoader workers (only for fit stage with num_workers > 0)
+        if stage == "fit" or stage is None:
+            self._prewarm_dataloader_workers()
+
+    def _prewarm_dataloader_workers(self) -> None:
+        """Pre-warm DataLoader workers to avoid delay at first training step.
+
+        With 'spawn' multiprocessing, worker creation is slow. By fetching one batch
+        here, we force worker initialization during setup() instead of during training.
+        """
+        import sys
+        import threading
+        import time
+
+        num_workers = _get_safe_num_workers(self.hparams.num_workers)
+        if num_workers == 0:
+            return
+
+        # Spinner animation
+        spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        stop_spinner = threading.Event()
+
+        def spin():
+            idx = 0
+            while not stop_spinner.is_set():
+                char = spinner_chars[idx % len(spinner_chars)]
+                print(f"\r{char} Initializing {num_workers} DataLoader workers (spawn)...", end="", flush=True)
+                idx += 1
+                time.sleep(0.1)
+
+        # Start spinner in background
+        spinner_thread = threading.Thread(target=spin, daemon=True)
+        spinner_thread.start()
+
+        try:
+            # Create a temporary DataLoader and fetch one batch to force worker init
+            temp_loader = DataLoader(
+                self.train_dataset,
+                batch_size=self.hparams.batch_size,
+                shuffle=False,  # No shuffle for faster first batch
+                drop_last=True,
+                **self._get_dataloader_kwargs(),
+            )
+
+            # Fetch first batch to initialize workers
+            _ = next(iter(temp_loader))
+
+            # Store the loader for reuse (workers are persistent)
+            self._train_dataloader = temp_loader
+
+        finally:
+            # Stop spinner and clear line
+            stop_spinner.set()
+            spinner_thread.join(timeout=0.5)
+            print(f"\r✅ DataLoader workers initialized ({num_workers} workers)     ")
+            sys.stdout.flush()
+
     def _extract_class_names(self, is_yolo_format: bool) -> None:
         """Extract class names from dataset for metrics display."""
         from yolo.data.class_names import load_class_names
@@ -420,6 +477,12 @@ class YOLODataModule(L.LightningDataModule):
 
     def train_dataloader(self) -> DataLoader:
         """Create training dataloader."""
+        # Reuse pre-warmed loader if available (workers already initialized)
+        if hasattr(self, "_train_dataloader") and self._train_dataloader is not None:
+            loader = self._train_dataloader
+            self._train_dataloader = None  # Only reuse once, then create new
+            return loader
+
         return DataLoader(
             self.train_dataset,
             batch_size=self.hparams.batch_size,
