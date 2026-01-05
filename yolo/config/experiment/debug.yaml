@@ -67,7 +67,7 @@ data:
   val_ann: annotations/instances_val2017.json
   batch_size: 4
   num_workers: 4
-  image_size: [640, 640]
+  # image_size: inherited from model.image_size
   pin_memory: true
   mosaic_prob: 0.0
   mixup_prob: 0.0

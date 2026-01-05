@@ -85,12 +85,24 @@ class YOLOLightningCLI:
     Automatically adds:
     - TrainingSummaryCallback: Shows training configuration before fit
     - ClassNamesCallback: Loads class names from dataset for metrics display
+
+    Links model.image_size to data.image_size so you only need to specify it once.
     """
 
     def __init__(self, model_class, datamodule_class, **kwargs):
         from lightning.pytorch.cli import LightningCLI
 
         class _CLI(LightningCLI):
+            def add_arguments_to_parser(self, parser):
+                """Link model.image_size to data.image_size."""
+                # This makes data.image_size inherit from model.image_size
+                # User only needs to set model.image_size in config
+                parser.link_arguments(
+                    "model.image_size",
+                    "data.image_size",
+                    apply_on="instantiate",
+                )
+
             def _add_callback_if_missing(self, callback_cls, *args, **cb_kwargs):
                 """Add callback if not already present."""
                 has_callback = any(
