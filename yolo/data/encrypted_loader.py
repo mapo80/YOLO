@@ -13,6 +13,7 @@ Performance optimizations:
 Usage with YOLOV9MIT:
     Configure in YAML:
         data:
+          encryption_key: "your-64-char-hex-key"  # or use env var
           image_loader:
             class_path: yolo.data.encrypted_loader.EncryptedImageLoader
 
@@ -20,21 +21,18 @@ Usage with YOLOV9MIT:
         --data.image_loader.class_path=yolo.data.encrypted_loader.EncryptedImageLoader
 
 Environment:
-    Set YOLO_IMAGE_ENCRYPTION_KEY with the hex-encoded AES-256 key:
-        export YOLO_IMAGE_ENCRYPTION_KEY=<64-char-hex-key>
+    Set YOLO_ENCRYPTION_KEY with the hex-encoded AES-256 key:
+        export YOLO_ENCRYPTION_KEY=<64-char-hex-key>
 """
 
 import io
-import os
 from pathlib import Path
 from typing import Optional, Union
 
 from PIL import Image
 
 from yolo.data.loaders import ImageLoader
-
-# Environment variable name for the encryption key
-ENV_KEY_NAME = "YOLO_IMAGE_ENCRYPTION_KEY"
+from yolo.data.crypto import CryptoManager
 
 
 class EncryptedImageLoader(ImageLoader):
@@ -42,8 +40,13 @@ class EncryptedImageLoader(ImageLoader):
     High-performance image loader for AES-256 encrypted images.
 
     Supports both encrypted (.enc) and regular image files.
-    For .enc files, decrypts using the key from YOLO_IMAGE_ENCRYPTION_KEY env var.
+    For .enc files, decrypts using the configured encryption key.
     For regular files, loads normally with PIL.
+
+    The encryption key can be provided via:
+    1. Constructor parameter (key_hex)
+    2. YOLO_ENCRYPTION_KEY environment variable
+    3. YAML config: data.encryption_key
 
     Optimized for:
     - Large batch sizes (128+)
@@ -51,56 +54,37 @@ class EncryptedImageLoader(ImageLoader):
     - High-throughput training
 
     Args:
+        key_hex: Hex-encoded 32-byte AES key (64 chars). If None, uses env var.
         use_opencv: Use OpenCV for faster image decoding (default: True if available)
 
     Usage:
         # In YAML config:
         data:
+          encryption_key: "your-64-char-hex-key"
           image_loader:
             class_path: yolo.data.encrypted_loader.EncryptedImageLoader
             init_args:
               use_opencv: true
     """
 
-    def __init__(self, use_opencv: bool = True):
-        self._key: Optional[bytes] = None
+    def __init__(self, key_hex: Optional[str] = None, use_opencv: bool = True):
+        self._crypto = CryptoManager(key_hex=key_hex)
         self._use_opencv = use_opencv
         self._cv2 = None  # Lazy import
-        # Lazy import cryptography
-        self._cipher_module = None
-        self._algorithms = None
-        self._modes = None
-        self._backend = None
 
     def __getstate__(self):
         """Prepare state for pickling (required for spawn multiprocessing)."""
-        # Only save serializable config, not lazy-loaded modules
         return {
-            "_key": self._key,
+            "_crypto": self._crypto.__getstate__(),
             "_use_opencv": self._use_opencv,
         }
 
     def __setstate__(self, state):
         """Restore state after unpickling."""
-        self._key = state.get("_key")
+        self._crypto = CryptoManager()
+        self._crypto.__setstate__(state.get("_crypto", {}))
         self._use_opencv = state.get("_use_opencv", True)
-        # Reset lazy-loaded modules (will be re-initialized on first use)
         self._cv2 = None
-        self._cipher_module = None
-        self._algorithms = None
-        self._modes = None
-        self._backend = None
-
-    def _init_crypto(self):
-        """Lazy initialize cryptography modules."""
-        if self._cipher_module is None:
-            from cryptography.hazmat.backends import default_backend
-            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-            self._cipher_module = Cipher
-            self._algorithms = algorithms
-            self._modes = modes
-            self._backend = default_backend()
 
     def _get_cv2(self):
         """Lazy import cv2 to avoid import overhead if not used."""
@@ -112,60 +96,6 @@ class EncryptedImageLoader(ImageLoader):
             except ImportError:
                 self._cv2 = False  # Mark as unavailable
         return self._cv2 if self._cv2 else None
-
-    def _get_key(self) -> bytes:
-        """
-        Get the AES-256 encryption key from environment variable.
-
-        The key is cached after first retrieval for performance.
-
-        Returns:
-            bytes: 32-byte AES key
-
-        Raises:
-            ValueError: If YOLO_IMAGE_ENCRYPTION_KEY is not set
-        """
-        if self._key is None:
-            key_hex = os.environ.get(ENV_KEY_NAME)
-            if not key_hex:
-                raise ValueError(
-                    f"Environment variable {ENV_KEY_NAME} not set. "
-                    f"Export the key with: export {ENV_KEY_NAME}=<64-char-hex-key>"
-                )
-            self._key = bytes.fromhex(key_hex)
-            if len(self._key) != 32:
-                raise ValueError(f"Key must be 32 bytes (64 hex chars), got {len(self._key)} bytes")
-        return self._key
-
-    def _decrypt(self, encrypted_data: bytes) -> bytes:
-        """
-        Decrypt data using AES-256-CBC.
-
-        Input format: IV (16 bytes) + encrypted_data
-
-        Args:
-            encrypted_data: IV + ciphertext
-
-        Returns:
-            Decrypted plaintext bytes
-        """
-        self._init_crypto()
-        key = self._get_key()
-
-        # Extract IV and ciphertext
-        iv = encrypted_data[:16]
-        ciphertext = encrypted_data[16:]
-
-        # Create cipher and decrypt
-        cipher = self._cipher_module(
-            self._algorithms.AES(key), self._modes.CBC(iv), backend=self._backend
-        )
-        decryptor = cipher.decryptor()
-        padded_data = decryptor.update(ciphertext) + decryptor.finalize()
-
-        # Remove PKCS7 padding
-        padding_length = padded_data[-1]
-        return padded_data[:-padding_length]
 
     def _decode_image_opencv(self, image_bytes: bytes) -> Optional[Image.Image]:
         """Decode image bytes using OpenCV (faster than PIL)."""
@@ -216,7 +146,7 @@ class EncryptedImageLoader(ImageLoader):
             with open(path_str, "rb") as f:
                 encrypted_data = f.read()
 
-            decrypted = self._decrypt(encrypted_data)
+            decrypted = self._crypto.decrypt(encrypted_data)
 
             # Try OpenCV first (faster), fallback to PIL
             img = self._decode_image_opencv(decrypted)

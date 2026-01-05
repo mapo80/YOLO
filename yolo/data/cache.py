@@ -172,9 +172,12 @@ class ImageCache:
     - RAM: Keep decoded images in memory (fastest, high memory usage)
     - Disk: Save decoded images as .npy files (moderate speedup, persistent)
 
+    For encrypted images, disk cache can also be encrypted using AES-256.
+
     Attributes:
         mode: Caching mode ('none', 'ram', or 'disk').
         target_size: Target image size (width, height) for resizing, or None for original.
+        encrypt_disk_cache: Whether to encrypt disk cache files.
     """
 
     def __init__(
@@ -183,6 +186,7 @@ class ImageCache:
         cache_dir: Optional[Path] = None,
         max_memory_gb: float = 8.0,
         target_size: Optional[Tuple[int, int]] = None,
+        encryption_key: Optional[str] = None,
     ):
         """
         Initialize image cache.
@@ -192,6 +196,9 @@ class ImageCache:
             cache_dir: Directory for disk cache (only used in disk mode).
             max_memory_gb: Maximum RAM to use for caching (only used in ram mode).
             target_size: Target image size (width, height) for resizing. None = keep original size.
+            encryption_key: Hex-encoded AES-256 key for encrypting disk cache.
+                If provided, disk cache files will be saved as .npy.enc (encrypted).
+                If None, disk cache files will be saved as plain .npy files.
         """
         self.mode = mode
         self.cache_dir = Path(cache_dir) if cache_dir else None
@@ -199,6 +206,15 @@ class ImageCache:
         self.target_size = target_size
         self._ram_cache: Dict[int, np.ndarray] = {}
         self._enabled = mode != "none"
+
+        # Setup encryption for disk cache
+        self._crypto = None
+        self._encrypt_disk_cache = False
+        if encryption_key is not None and mode == "disk":
+            from yolo.data.crypto import CryptoManager
+            self._crypto = CryptoManager(key_hex=encryption_key)
+            self._encrypt_disk_cache = True
+            logger.info("🔒 Disk cache encryption enabled")
 
     def estimate_memory(
         self,
@@ -299,6 +315,12 @@ class ImageCache:
             logger.warning("psutil not available, assuming RAM caching is feasible")
             return estimated_gb < self.max_memory_gb
 
+    def _get_cache_path(self, path: Path) -> Path:
+        """Get cache file path for an image."""
+        if self._encrypt_disk_cache:
+            return path.with_suffix(".npy.enc")
+        return path.with_suffix(".npy")
+
     def get(self, idx: int, path: Path) -> Optional[np.ndarray]:
         """
         Get cached image if available.
@@ -317,10 +339,16 @@ class ImageCache:
             return self._ram_cache.get(idx)
 
         if self.mode == "disk":
-            npy_path = path.with_suffix(".npy")
-            if npy_path.exists():
+            cache_path = self._get_cache_path(path)
+            if cache_path.exists():
                 try:
-                    return np.load(npy_path)
+                    if self._encrypt_disk_cache:
+                        # Load and decrypt
+                        with open(cache_path, "rb") as f:
+                            encrypted_data = f.read()
+                        return self._crypto.decrypt_array(encrypted_data)
+                    else:
+                        return np.load(cache_path)
                 except Exception:
                     return None
 
@@ -342,9 +370,15 @@ class ImageCache:
             self._ram_cache[idx] = arr
 
         elif self.mode == "disk":
-            npy_path = path.with_suffix(".npy")
+            cache_path = self._get_cache_path(path)
             try:
-                np.save(npy_path, arr, allow_pickle=False)
+                if self._encrypt_disk_cache:
+                    # Encrypt and save
+                    encrypted_data = self._crypto.encrypt_array(arr)
+                    with open(cache_path, "wb") as f:
+                        f.write(encrypted_data)
+                else:
+                    np.save(cache_path, arr, allow_pickle=False)
             except Exception as e:
                 logger.debug(f"Failed to cache image to disk: {e}")
 
