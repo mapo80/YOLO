@@ -178,6 +178,8 @@ class YOLODataModule(L.LightningDataModule):
         flip_lr: Horizontal flip probability
         flip_ud: Vertical flip probability
         close_mosaic_epochs: Disable mosaic for last N epochs
+        data_fraction: Fraction of data to use (default: 1.0). Uses stratified sampling
+            to maintain class distribution. Useful for quick testing.
         cache_labels: Enable label caching (default: True)
         cache_images: Image caching mode - 'none', 'ram', or 'disk' (default: 'none')
         cache_resize_images: Resize images to image_size when caching (default: True, saves RAM)
@@ -225,6 +227,8 @@ class YOLODataModule(L.LightningDataModule):
         flip_ud: float = 0.0,
         # Training schedule
         close_mosaic_epochs: int = 15,
+        # Data sampling
+        data_fraction: float = 1.0,
         # Caching parameters
         cache_labels: bool = True,
         cache_images: Literal["none", "ram", "disk"] = "none",
@@ -272,6 +276,11 @@ class YOLODataModule(L.LightningDataModule):
                 target_size=target_size,
             )
 
+        # Get data fraction for sampling
+        data_fraction = self.hparams.data_fraction
+        if data_fraction < 1.0:
+            logger.info(f"Using {data_fraction*100:.1f}% of data (stratified by class)")
+
         if stage == "fit" or stage is None:
             # Create base dataset based on format
             if is_yolo_format:
@@ -284,6 +293,7 @@ class YOLODataModule(L.LightningDataModule):
                     cache_labels=self.hparams.cache_labels,
                     cache_refresh=self.hparams.cache_refresh,
                     image_cache=image_cache,
+                    data_fraction=data_fraction,
                 )
             else:
                 base_train_dataset = CocoDetectionWrapper(
@@ -293,6 +303,7 @@ class YOLODataModule(L.LightningDataModule):
                     image_size=image_size,
                     image_loader=self._image_loader,
                     image_cache=image_cache,
+                    data_fraction=data_fraction,
                 )
 
             # Create post-mosaic transforms (applied after multi-image augmentation)
@@ -335,6 +346,7 @@ class YOLODataModule(L.LightningDataModule):
                     image_loader=self._image_loader,
                     cache_labels=self.hparams.cache_labels,
                     cache_refresh=self.hparams.cache_refresh,
+                    data_fraction=data_fraction,
                 )
             else:
                 self.val_dataset = CocoDetectionWrapper(
@@ -343,6 +355,7 @@ class YOLODataModule(L.LightningDataModule):
                     transforms=val_transforms,
                     image_size=image_size,
                     image_loader=self._image_loader,
+                    data_fraction=data_fraction,
                 )
 
             # Extract class names from dataset
@@ -457,6 +470,8 @@ class CocoDetectionWrapper(CocoDetection):
         image_size: Target image size (width, height)
         image_loader: Optional custom image loader (e.g., for encrypted images)
         image_cache: Optional ImageCache for caching decoded images in RAM/disk
+        data_fraction: Fraction of data to use (default: 1.0). Uses stratified
+            sampling by primary class to maintain class distribution.
     """
 
     def __init__(
@@ -467,6 +482,7 @@ class CocoDetectionWrapper(CocoDetection):
         image_size: tuple = (640, 640),
         image_loader: Optional[ImageLoader] = None,
         image_cache: Optional[Any] = None,
+        data_fraction: float = 1.0,
     ):
         super().__init__(root, annFile)
         self._transforms = transforms
@@ -477,15 +493,70 @@ class CocoDetectionWrapper(CocoDetection):
         # This handles both standard COCO (1-indexed) and custom datasets
         categories = self.coco.loadCats(self.coco.getCatIds())
         sorted_cats = sorted(categories, key=lambda x: x["id"])
-        category_id_to_idx = {cat["id"]: idx for idx, cat in enumerate(sorted_cats)}
+        self._category_id_to_idx = {cat["id"]: idx for idx, cat in enumerate(sorted_cats)}
 
-        self.target_transform = YOLOTargetTransform(category_id_to_idx)
+        self.target_transform = YOLOTargetTransform(self._category_id_to_idx)
         # Use provided loader or default PIL loader
         self._image_loader = image_loader or DefaultImageLoader()
+
+        # Apply stratified sampling if data_fraction < 1.0
+        if data_fraction < 1.0:
+            self._apply_stratified_sampling(data_fraction)
 
         # Pre-cache images if using RAM cache
         if self._image_cache is not None and self._image_cache.mode == "ram":
             self._precache_images()
+
+    def _apply_stratified_sampling(self, fraction: float) -> None:
+        """
+        Apply stratified sampling to reduce dataset size while preserving class distribution.
+
+        For each image, the primary class is determined from annotations.
+        Then, a fraction of images is sampled from each class proportionally.
+
+        Args:
+            fraction: Fraction of data to keep (0.0 to 1.0)
+        """
+        from collections import defaultdict
+
+        if fraction >= 1.0:
+            return
+
+        # Group image ids by primary class
+        class_to_ids: Dict[int, List[int]] = defaultdict(list)
+
+        for img_id in self.ids:
+            # Get annotations for this image
+            ann_ids = self.coco.getAnnIds(imgIds=img_id)
+            anns = self.coco.loadAnns(ann_ids)
+
+            if anns:
+                # Primary class: first annotation's category (mapped to 0-indexed)
+                cat_id = anns[0]["category_id"]
+                primary_class = self._category_id_to_idx.get(cat_id, -1)
+            else:
+                primary_class = -1  # Background/empty
+
+            class_to_ids[primary_class].append(img_id)
+
+        # Sample from each class
+        sampled_ids = []
+        for class_id, ids in sorted(class_to_ids.items()):
+            n_samples = max(1, int(len(ids) * fraction))
+            sampled = random.sample(ids, min(n_samples, len(ids)))
+            sampled_ids.extend(sampled)
+
+        # Sort to maintain some order consistency
+        sampled_ids.sort()
+
+        # Update ids list
+        original_count = len(self.ids)
+        self.ids = sampled_ids
+
+        logger.info(
+            f"Stratified sampling: {original_count} → {len(self.ids)} images "
+            f"({len(class_to_ids)} classes, {fraction*100:.1f}%)"
+        )
 
     def _precache_images(self) -> None:
         """Pre-load all images into RAM cache (optionally resized)."""
@@ -631,6 +702,8 @@ class YOLOFormatDataset(Dataset):
         cache_labels: Enable label caching (default: True)
         cache_refresh: Force cache regeneration (default: False)
         image_cache: Optional ImageCache for caching decoded images in RAM/disk
+        data_fraction: Fraction of data to use (default: 1.0). Uses stratified
+            sampling by primary class to maintain class distribution.
     """
 
     def __init__(
@@ -643,6 +716,7 @@ class YOLOFormatDataset(Dataset):
         cache_labels: bool = True,
         cache_refresh: bool = False,
         image_cache: Optional[Any] = None,
+        data_fraction: float = 1.0,
     ):
         self.images_dir = Path(images_dir)
         self.labels_dir = Path(labels_dir)
@@ -663,9 +737,13 @@ class YOLOFormatDataset(Dataset):
 
         logger.info(f"Found {len(self.image_files)} images in {images_dir}")
 
-        # Setup label caching
+        # Setup label caching (needed before stratified sampling)
         if cache_labels:
             self._setup_cache(refresh=cache_refresh)
+
+        # Apply stratified sampling if data_fraction < 1.0
+        if data_fraction < 1.0:
+            self._apply_stratified_sampling(data_fraction)
 
         # Pre-cache images if using RAM cache
         if self._image_cache is not None and self._image_cache.mode == "ram":
@@ -734,6 +812,59 @@ class YOLOFormatDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.image_files)
+
+    def _apply_stratified_sampling(self, fraction: float) -> None:
+        """
+        Apply stratified sampling to reduce dataset size while preserving class distribution.
+
+        For each image, the primary class is determined (first label or most frequent).
+        Then, a fraction of images is sampled from each class proportionally.
+
+        Args:
+            fraction: Fraction of data to keep (0.0 to 1.0)
+        """
+        from collections import defaultdict
+
+        if fraction >= 1.0:
+            return
+
+        # Group images by primary class
+        class_to_indices: Dict[int, List[int]] = defaultdict(list)
+
+        for idx, image_path in enumerate(self.image_files):
+            # Get labels for this image
+            if self._labels_cache is not None:
+                labels = self._labels_cache[idx].get("labels", [])
+            else:
+                parsed = self._parse_label_file(image_path)
+                labels = parsed.get("labels", [])
+
+            # Primary class: first label, or -1 for background/empty
+            primary_class = labels[0] if labels else -1
+            class_to_indices[primary_class].append(idx)
+
+        # Sample from each class
+        sampled_indices = []
+        for class_id, indices in sorted(class_to_indices.items()):
+            n_samples = max(1, int(len(indices) * fraction))
+            # Random sample without replacement
+            sampled = random.sample(indices, min(n_samples, len(indices)))
+            sampled_indices.extend(sampled)
+
+        # Sort to maintain some order consistency
+        sampled_indices.sort()
+
+        # Update image_files and labels_cache
+        original_count = len(self.image_files)
+        self.image_files = [self.image_files[i] for i in sampled_indices]
+
+        if self._labels_cache is not None:
+            self._labels_cache = [self._labels_cache[i] for i in sampled_indices]
+
+        logger.info(
+            f"Stratified sampling: {original_count} → {len(self.image_files)} images "
+            f"({len(class_to_indices)} classes, {fraction*100:.1f}%)"
+        )
 
     def _setup_cache(self, refresh: bool = False) -> None:
         """

@@ -962,5 +962,143 @@ class TestYOLOFormatDatasetIntegration:
         assert epoch2_first_batch is not None
 
 
+class TestDataFraction:
+    """Tests for data_fraction parameter (stratified sampling)."""
+
+    def test_data_fraction_reduces_dataset_size(self):
+        """Test that data_fraction=0.5 roughly halves dataset size."""
+        from yolo.data.datamodule import YOLOFormatDataset
+
+        # Full dataset
+        dataset_full = YOLOFormatDataset(
+            images_dir=str(YOLO_DATASET_PATH / "train" / "images"),
+            labels_dir=str(YOLO_DATASET_PATH / "train" / "labels"),
+            data_fraction=1.0,
+        )
+
+        # Half dataset
+        dataset_half = YOLOFormatDataset(
+            images_dir=str(YOLO_DATASET_PATH / "train" / "images"),
+            labels_dir=str(YOLO_DATASET_PATH / "train" / "labels"),
+            data_fraction=0.5,
+        )
+
+        full_size = len(dataset_full)
+        half_size = len(dataset_half)
+
+        # Should be roughly half (allow some variance due to stratification)
+        assert half_size < full_size
+        assert half_size >= full_size * 0.3  # At least 30%
+        assert half_size <= full_size * 0.7  # At most 70%
+
+        print(f"\nFull dataset: {full_size}, Half dataset: {half_size}")
+        print(f"Actual fraction: {half_size / full_size:.2%}")
+
+    def test_data_fraction_small_subset(self):
+        """Test with small data fraction (10%)."""
+        from yolo.data.datamodule import YOLOFormatDataset
+
+        dataset_full = YOLOFormatDataset(
+            images_dir=str(YOLO_DATASET_PATH / "train" / "images"),
+            labels_dir=str(YOLO_DATASET_PATH / "train" / "labels"),
+            data_fraction=1.0,
+        )
+
+        dataset_small = YOLOFormatDataset(
+            images_dir=str(YOLO_DATASET_PATH / "train" / "images"),
+            labels_dir=str(YOLO_DATASET_PATH / "train" / "labels"),
+            data_fraction=0.1,
+        )
+
+        full_size = len(dataset_full)
+        small_size = len(dataset_small)
+
+        # Should be much smaller
+        assert small_size < full_size * 0.3
+        assert small_size > 0  # At least 1 sample per class
+
+        print(f"\nFull: {full_size}, 10% subset: {small_size}")
+        print(f"Actual fraction: {small_size / full_size:.2%}")
+
+    def test_data_fraction_one_keeps_all(self):
+        """Test that data_fraction=1.0 keeps all data."""
+        from yolo.data.datamodule import YOLOFormatDataset
+
+        dataset1 = YOLOFormatDataset(
+            images_dir=str(YOLO_DATASET_PATH / "train" / "images"),
+            labels_dir=str(YOLO_DATASET_PATH / "train" / "labels"),
+            data_fraction=1.0,
+        )
+
+        dataset2 = YOLOFormatDataset(
+            images_dir=str(YOLO_DATASET_PATH / "train" / "images"),
+            labels_dir=str(YOLO_DATASET_PATH / "train" / "labels"),
+            # No data_fraction specified, defaults to 1.0
+        )
+
+        assert len(dataset1) == len(dataset2)
+
+    def test_data_fraction_in_datamodule(self):
+        """Test data_fraction works through YOLODataModule."""
+        from yolo.data.datamodule import YOLODataModule
+
+        dm_full = YOLODataModule(
+            format="yolo",
+            root=str(YOLO_DATASET_PATH),
+            train_images="train/images",
+            train_labels="train/labels",
+            val_images="valid/images",
+            val_labels="valid/labels",
+            batch_size=4,
+            num_workers=0,
+            data_fraction=1.0,
+        )
+        dm_full._image_size = (320, 320)
+        dm_full.setup(stage="fit")
+
+        dm_subset = YOLODataModule(
+            format="yolo",
+            root=str(YOLO_DATASET_PATH),
+            train_images="train/images",
+            train_labels="train/labels",
+            val_images="valid/images",
+            val_labels="valid/labels",
+            batch_size=4,
+            num_workers=0,
+            data_fraction=0.5,
+        )
+        dm_subset._image_size = (320, 320)
+        dm_subset.setup(stage="fit")
+
+        # Access underlying datasets
+        full_train_size = len(dm_full.train_dataset.dataset)
+        subset_train_size = len(dm_subset.train_dataset.dataset)
+
+        assert subset_train_size < full_train_size
+        print(f"\nDataModule train size: full={full_train_size}, subset={subset_train_size}")
+
+    def test_data_fraction_samples_are_valid(self):
+        """Test that sampled data can be loaded correctly."""
+        from yolo.data.datamodule import YOLOFormatDataset
+
+        dataset = YOLOFormatDataset(
+            images_dir=str(YOLO_DATASET_PATH / "train" / "images"),
+            labels_dir=str(YOLO_DATASET_PATH / "train" / "labels"),
+            data_fraction=0.2,
+        )
+
+        # Load all samples to verify they work
+        for i in range(len(dataset)):
+            image, target = dataset[i]
+
+            assert isinstance(image, Image.Image)
+            assert "boxes" in target
+            assert "labels" in target
+            assert target["boxes"].dim() == 2
+            assert target["labels"].dim() == 1
+
+        print(f"\nSuccessfully loaded all {len(dataset)} samples")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
