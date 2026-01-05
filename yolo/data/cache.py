@@ -184,7 +184,9 @@ class ImageCache:
     """
 
     # Cache version for compatibility checking
-    CACHE_VERSION = "3.0.0"
+    # v3.0.0: Initial LMDB implementation
+    # v3.1.0: Fast hash computation (sampled paths instead of all)
+    CACHE_VERSION = "3.1.0"
 
     # Dtype mapping for efficient serialization
     DTYPE_TO_ID = {
@@ -204,6 +206,7 @@ class ImageCache:
         target_size: Optional[Tuple[int, int]] = None,
         encryption_key: Optional[str] = None,
         cache_suffix: Optional[str] = None,
+        refresh: bool = False,
     ):
         """
         Initialize image cache.
@@ -215,12 +218,14 @@ class ImageCache:
             target_size: Target image size (width, height) for resizing. None = keep original size.
             encryption_key: Hex-encoded AES-256 key for encrypting cached values.
             cache_suffix: Optional suffix for cache folder (e.g., "640x640_f0.1").
+            refresh: Force cache regeneration (delete existing cache).
         """
         self.mode = mode
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.max_memory_gb = max_memory_gb
         self.target_size = target_size
         self.cache_suffix = cache_suffix
+        self._refresh = refresh
         self._enabled = mode != "none"
 
         # LMDB environment
@@ -231,7 +236,7 @@ class ImageCache:
         self._cached_indices: set = set()
         self._initialized = False
 
-        # Setup encryption
+        # Setup encryption (key is NEVER stored - read from env var in workers)
         self._crypto = None
         self._encrypt_cache = False
         if encryption_key is not None and mode != "none":
@@ -293,8 +298,16 @@ class ImageCache:
             self._enabled = False
             return False
 
-        # Check if valid cache exists
-        if self._validate_existing_cache(paths):
+        # Force refresh: delete existing cache
+        if self._refresh and self._db_path.exists():
+            import shutil
+            shutil.rmtree(self._db_path)
+            self._refresh_requested = True
+        else:
+            self._refresh_requested = False
+
+        # Check if valid cache exists (skip if refresh requested)
+        if not self._refresh and self._validate_existing_cache(paths):
             self._open_db(readonly=True)
             self._load_cached_indices()
             self._initialized = True
@@ -327,8 +340,11 @@ class ImageCache:
         return max(100 * 1024 * 1024, total_size)
 
     def _validate_existing_cache(self, paths: List[Path]) -> bool:
-        """Check if existing cache is valid."""
+        """Check if existing cache is valid. Sets _invalidation_reason if invalid."""
+        self._invalidation_reason: Optional[str] = None
+
         if not self._db_path or not self._db_path.exists():
+            self._invalidation_reason = "cache not found"
             return False
 
         try:
@@ -346,32 +362,44 @@ class ImageCache:
                 meta_data = txn.get(b"__metadata__")
                 if meta_data is None:
                     env.close()
+                    self._invalidation_reason = "missing metadata"
                     return False
 
                 meta = pickle.loads(meta_data)
 
                 # Validate version
                 if meta.get("version") != self.CACHE_VERSION:
-                    logger.debug(f"Cache version mismatch: {meta.get('version')}")
+                    old_version = meta.get("version", "unknown")
+                    self._invalidation_reason = f"version changed ({old_version} → {self.CACHE_VERSION})"
                     env.close()
                     return False
 
                 # Validate suffix
                 if meta.get("cache_suffix") != self.cache_suffix:
-                    logger.debug("Cache suffix mismatch")
+                    self._invalidation_reason = "settings changed (size/fraction)"
+                    env.close()
+                    return False
+
+                # Validate encryption setting
+                cached_encrypted = meta.get("encrypted", False)
+                if cached_encrypted != self._encrypt_cache:
+                    old_enc = "encrypted" if cached_encrypted else "unencrypted"
+                    new_enc = "encrypted" if self._encrypt_cache else "unencrypted"
+                    self._invalidation_reason = f"encryption changed ({old_enc} → {new_enc})"
                     env.close()
                     return False
 
                 # Validate number of images
-                if meta.get("num_images") != len(paths):
-                    logger.debug("Cache image count mismatch")
+                cached_count = meta.get("num_images", 0)
+                if cached_count != len(paths):
+                    self._invalidation_reason = f"image count changed ({cached_count:,} → {len(paths):,})"
                     env.close()
                     return False
 
                 # Validate path hash
                 expected_hash = self._compute_paths_hash(paths)
                 if meta.get("paths_hash") != expected_hash:
-                    logger.debug("Cache paths hash mismatch")
+                    self._invalidation_reason = "image files changed"
                     env.close()
                     return False
 
@@ -383,10 +411,33 @@ class ImageCache:
             return False
 
     def _compute_paths_hash(self, paths: List[Path]) -> str:
-        """Compute hash of image paths for validation."""
+        """
+        Compute hash of image paths for validation.
+
+        Uses a fast approach: hash count + first/last paths + sampled paths.
+        This avoids iterating through all 100k+ paths while still detecting changes.
+        """
         hasher = hashlib.md5()
-        for path in sorted(paths):
-            hasher.update(str(path).encode())
+
+        # Include count (detects additions/removals)
+        hasher.update(f"count:{len(paths)}".encode())
+
+        if not paths:
+            return hasher.hexdigest()
+
+        # Sort once for consistent ordering
+        sorted_paths = sorted(paths)
+
+        # Hash first and last paths (detects boundary changes)
+        hasher.update(str(sorted_paths[0]).encode())
+        hasher.update(str(sorted_paths[-1]).encode())
+
+        # Sample ~100 paths evenly distributed (detects changes in middle)
+        n_samples = min(100, len(sorted_paths))
+        step = max(1, len(sorted_paths) // n_samples)
+        for i in range(0, len(sorted_paths), step):
+            hasher.update(str(sorted_paths[i]).encode())
+
         return hasher.hexdigest()
 
     def _open_db(self, readonly: bool, map_size: int = 0):
@@ -433,6 +484,7 @@ class ImageCache:
             "num_images": len(paths),
             "paths_hash": self._compute_paths_hash(paths),
             "target_size": self.target_size,
+            "encrypted": self._encrypt_cache,
         }
 
         with self._env.begin(write=True) as txn:
@@ -483,6 +535,7 @@ class ImageCache:
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
         """Restore state after unpickling."""
+        import os
         self.__dict__.update(state)
 
         # Re-open LMDB in read-only mode for workers
@@ -493,10 +546,17 @@ class ImageCache:
                 logger.warning(f"Failed to open cache in worker: {e}")
                 self._env = None
 
-        # Re-initialize crypto if needed
+        # Re-initialize crypto from environment variable (key is NEVER pickled)
         if self._encrypt_cache:
-            # Note: encryption_key needs to be passed separately or stored
-            self._crypto = None
+            encryption_key = os.environ.get("YOLO_ENCRYPTION_KEY")
+            if encryption_key:
+                from yolo.data.crypto import CryptoManager
+                self._crypto = CryptoManager(key_hex=encryption_key)
+            else:
+                logger.warning(
+                    "Encrypted cache but YOLO_ENCRYPTION_KEY not set in worker. "
+                    "Cache reads will fail."
+                )
 
     def _serialize(self, arr: np.ndarray) -> bytes:
         """Serialize numpy array to bytes with compact header."""
