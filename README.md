@@ -3,7 +3,7 @@
 ![GitHub License](https://img.shields.io/github/license/WongKinYiu/YOLO)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch Lightning](https://img.shields.io/badge/PyTorch-Lightning-792ee5.svg)](https://lightning.ai/)
-[![Tests](https://img.shields.io/badge/tests-289%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-346%20passed-brightgreen.svg)](tests/)
 
 > **Fork Notice**: This is a fork of [WongKinYiu/YOLO](https://github.com/WongKinYiu/YOLO) with extensive additions for production training.
 
@@ -687,11 +687,79 @@ docker build --platform linux/amd64 -t yolo-tflite-export -f docker/Dockerfile.t
 | **Standalone Validation** | Eval dashboard with full COCO metrics, plots, JSON export |
 | **Integrated Benchmark** | Measure latency/memory during validation with `--benchmark` |
 
-## Custom Image Loader
+## Image Loaders
 
-For datasets with special image formats (e.g., encrypted images), you can provide a custom image loader.
+The training pipeline includes multiple high-performance image loaders optimized for different use cases.
+
+### Available Loaders
+
+| Loader | Description | Dependencies |
+|--------|-------------|--------------|
+| **DefaultImageLoader** | Standard PIL loader with proper file handle management | None (included) |
+| **FastImageLoader** | OpenCV-based with memory-mapped I/O for large files | `opencv-python` |
+| **TurboJPEGLoader** | Ultra-fast JPEG loading (2-4x speedup) | `PyTurboJPEG`, libjpeg-turbo |
+| **EncryptedImageLoader** | AES-256 encrypted images (.enc files) | `cryptography` |
+
+All loaders are optimized for:
+- Large batch sizes (128+)
+- Many DataLoader workers
+- Proper file handle management (no "Too many open files" errors)
+
+### Built-in Encrypted Image Loader
+
+For datasets with AES-256 encrypted images (.enc files), use the built-in `EncryptedImageLoader`:
+
+```shell
+# Install cryptography dependency
+pip install cryptography
+
+# Set encryption key (64 hex characters = 32 bytes for AES-256)
+export YOLO_IMAGE_ENCRYPTION_KEY=<your-64-char-hex-key>
+```
+
+**Configuration via YAML:**
+
+```yaml
+data:
+  root: data/encrypted-dataset
+  image_loader:
+    class_path: yolo.data.encrypted_loader.EncryptedImageLoader
+    init_args:
+      use_opencv: true  # Use OpenCV for faster decoding (default: true)
+```
+
+**Configuration via CLI:**
+
+```shell
+python -m yolo.cli fit --config config.yaml \
+    --data.image_loader.class_path=yolo.data.encrypted_loader.EncryptedImageLoader
+```
+
+The loader automatically handles:
+- Encrypted files (`.enc` extension): decrypts using AES-256-CBC
+- Regular files: loads normally with optimal performance
+
+### High-Performance Loaders
+
+For maximum throughput on standard datasets:
+
+```yaml
+# OpenCV-based loader (good for large batch sizes)
+data:
+  image_loader:
+    class_path: yolo.data.loaders.FastImageLoader
+    init_args:
+      use_mmap: true  # Memory-mapped I/O for files >1MB
+
+# TurboJPEG loader (fastest for JPEG datasets)
+data:
+  image_loader:
+    class_path: yolo.data.loaders.TurboJPEGLoader
+```
 
 ### Creating a Custom Loader
+
+For special formats (cloud storage, proprietary formats), create a custom loader:
 
 ```python
 # my_loaders.py
@@ -699,50 +767,45 @@ import io
 from PIL import Image
 from yolo.data.loaders import ImageLoader
 
-class EncryptedImageLoader(ImageLoader):
-    """Loader for AES-encrypted images."""
+class CloudStorageLoader(ImageLoader):
+    """Loader for images from cloud storage."""
 
-    def __init__(self, key: str):
-        self.key = key
+    def __init__(self, bucket: str):
+        self.bucket = bucket
+        self._client = None  # Lazy init
 
     def __call__(self, path: str) -> Image.Image:
-        with open(path, 'rb') as f:
-            encrypted_data = f.read()
+        # Download from cloud
+        data = self._get_client().download(self.bucket, path)
 
-        # Your decryption logic here
-        decrypted_data = my_decrypt(encrypted_data, self.key)
-        return Image.open(io.BytesIO(decrypted_data)).convert("RGB")
+        # IMPORTANT: Use context manager and load() for proper handle management
+        with io.BytesIO(data) as buf:
+            with Image.open(buf) as img:
+                img.load()  # Force load into memory
+                return img.convert("RGB")
 ```
+
+**Important for custom loaders:**
+- Always use context managers (`with` statements) for file operations
+- Call `img.load()` before the context manager closes to force data into memory
+- This prevents "Too many open files" errors with large batch sizes
 
 ### Configuration via YAML
 
 ```yaml
 data:
-  root: data/encrypted-dataset
+  root: data/cloud-dataset
   image_loader:
-    class_path: my_loaders.EncryptedImageLoader
+    class_path: my_loaders.CloudStorageLoader
     init_args:
-      key: "my-secret-key"
-```
-
-### Configuration via CLI
-
-```shell
-# Full configuration via CLI
-python -m yolo.cli fit --config config.yaml \
-    --data.image_loader.class_path=my_loaders.EncryptedImageLoader \
-    --data.image_loader.init_args.key="my-secret-key"
-
-# Override just the key (if loader is already in YAML)
-python -m yolo.cli fit --config config.yaml \
-    --data.image_loader.init_args.key="different-key"
+      bucket: "my-training-bucket"
 ```
 
 ### Notes
 
 - Custom loaders must return a PIL Image in RGB mode
 - The loader must be picklable for multi-worker data loading (`num_workers > 0`)
-- When using a custom loader, a log message will confirm: `📷 Using custom image loader: EncryptedImageLoader`
+- When using a custom loader, a log message will confirm: `📷 Using custom image loader: CloudStorageLoader`
 
 ## Data Loading Performance
 
@@ -1317,6 +1380,7 @@ python -m pytest tests/ -v --run-integration
 
 | Module | Tests | Description |
 |--------|-------|-------------|
+| **Image Loaders** | 45 tests | DefaultImageLoader, FastImageLoader, TurboJPEGLoader, EncryptedImageLoader, file handle leaks, stress tests |
 | **Augmentations** | 44 tests | Mosaic4/9, MixUp, CutMix, RandomPerspective, EMA |
 | **Metrics** | 33 tests | IoU, AP computation, confusion matrix, DetMetrics, plot generation |
 | **Eval Dashboard** | 26 tests | Dashboard rendering, trends, sparklines, sections |
@@ -1328,10 +1392,10 @@ python -m pytest tests/ -v --run-integration
 | **Export** | 12 tests | Letterbox, ONNX/TFLite signatures, CLI options |
 | **Training Experiment** | 16 tests | Dataset loading, metrics, schedulers, freezing, export |
 | **YOLO Format Dataloader** | 30 tests | Dataset loading, transforms, collate, edge cases |
+| **Cache** | 18 tests | Label caching, image caching, cache invalidation |
 | **Integration** | 10 tests | Full pipeline tests (run with `--run-integration`) |
-| **Other** | 40+ tests | Utils, module tests, edge cases |
 
-**Total: 257 tests** covering data augmentation, training callbacks, metrics, eval dashboard, schedulers, layer freezing, model components, export, validate, and utilities.
+**Total: 346 tests** covering image loaders, data augmentation, training callbacks, metrics, eval dashboard, schedulers, layer freezing, model components, export, validate, caching, and utilities.
 
 ### Training Experiment Tests
 
