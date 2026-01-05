@@ -44,3 +44,6 @@ onnxsim>=0.4.0
 # Image Loaders (optional performance/encryption)
 cryptography>=41.0.0  # For EncryptedImageLoader (AES-256)
 PyTurboJPEG>=1.7.0    # For TurboJPEGLoader (requires libjpeg-turbo)
+
+# Caching
+lmdb>=1.4.0           # For unified RAM/Disk image cache

@@ -220,8 +220,10 @@ data:
   # Cache parsed labels for faster loading on subsequent runs
   cache_labels: true           # true = cache labels, false = parse every time
   cache_images: none           # "none", "ram" (keep in memory), "disk" (save as .npy)
+  cache_dir: null              # Directory for disk cache (null = same as images directory)
   cache_resize_images: true    # Resize images to image_size when caching (saves RAM)
   cache_max_memory_gb: 8.0     # Max RAM for image caching (only used if cache_images=ram)
+  cache_workers: null          # Parallel workers for caching (null = auto, uses all CPU threads)
   cache_refresh: false         # Force cache regeneration (delete and rebuild)
   cache_encrypt: false         # Encrypt disk cache files (.npy.enc) - requires encryption_key
 
