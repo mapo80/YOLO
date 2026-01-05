@@ -399,23 +399,33 @@ class YOLODataModule(L.LightningDataModule):
         if num_workers == 0:
             return
 
-        with spinner(f"Initializing {num_workers} DataLoader workers (spawn)..."):
-            # Create a temporary DataLoader and fetch one batch to force worker init
-            temp_loader = DataLoader(
+        with spinner(f"Initializing {num_workers * 2} DataLoader workers (train + val)..."):
+            # Pre-warm TRAIN dataloader
+            train_loader = DataLoader(
                 self.train_dataset,
                 batch_size=self.hparams.batch_size,
                 shuffle=False,  # No shuffle for faster first batch
                 drop_last=True,
                 **self._get_dataloader_kwargs(),
             )
-
             # Fetch first batch to initialize workers
-            _ = next(iter(temp_loader))
+            _ = next(iter(train_loader))
+            # Store for reuse
+            self._train_dataloader = train_loader
 
-            # Store the loader for reuse (workers are persistent)
-            self._train_dataloader = temp_loader
+            # Pre-warm VALIDATION dataloader (needed for sanity check)
+            val_loader = DataLoader(
+                self.val_dataset,
+                batch_size=self.hparams.batch_size,
+                shuffle=False,
+                **self._get_dataloader_kwargs(),
+            )
+            # Fetch first batch to initialize workers
+            _ = next(iter(val_loader))
+            # Store for reuse
+            self._val_dataloader = val_loader
 
-        console.print(f"[green]✓[/green] DataLoader workers initialized ({num_workers} workers)")
+        console.print(f"[green]✓[/green] DataLoader workers initialized ({num_workers} train + {num_workers} val)")
 
     def _extract_class_names(self, is_yolo_format: bool) -> None:
         """Extract class names from dataset for metrics display."""
@@ -470,6 +480,12 @@ class YOLODataModule(L.LightningDataModule):
 
     def val_dataloader(self) -> DataLoader:
         """Create validation dataloader."""
+        # Reuse pre-warmed loader if available (workers already initialized)
+        if hasattr(self, "_val_dataloader") and self._val_dataloader is not None:
+            loader = self._val_dataloader
+            self._val_dataloader = None  # Only reuse once, then create new
+            return loader
+
         return DataLoader(
             self.val_dataset,
             batch_size=self.hparams.batch_size,
