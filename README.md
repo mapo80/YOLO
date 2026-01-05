@@ -9,6 +9,43 @@
 
 This repository extends the official YOLOv7[^1], YOLOv9[^2], and YOLO-RD[^3] implementation with a **robust CLI for training, validation, and export**.
 
+---
+
+## Table of Contents
+
+- [What's Different From the Original?](#whats-different-from-the-original)
+- [Features](#features)
+- [Papers](#papers)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+  - [Training](#training)
+  - [Pretrained Weights](#pretrained-weights)
+  - [Validation](#validation)
+  - [Inference](#inference)
+  - [Export](#export)
+- [Image Loaders](#image-loaders)
+- [Data Loading Performance](#data-loading-performance)
+- [Advanced Training Techniques](#advanced-training-techniques)
+  - [Data Augmentation](#data-augmentation)
+  - [Dataset Caching](#dataset-caching)
+  - [Data Fraction](#data-fraction-quick-testing)
+  - [EMA](#exponential-moving-average-ema)
+  - [Optimizer Selection](#optimizer-selection)
+- [Configuration](#configuration)
+  - [Dataset Formats](#dataset-formats)
+- [Testing](#testing)
+- [Metrics](#metrics)
+- [Learning Rate Schedulers](#learning-rate-schedulers)
+- [Layer Freezing](#layer-freezing-transfer-learning)
+- [Checkpoints](#checkpoints)
+- [Early Stopping](#early-stopping)
+- [Performance](#performance)
+- [Project Structure](#project-structure)
+- [Citations](#citations)
+- [License](#license)
+
+---
+
 ## What's Different From the Original?
 
 The original repository focuses on model architecture and research contributions. This fork adds:
@@ -1225,6 +1262,33 @@ The disk cache uses OS-managed memory-mapping with lazy loading. Pages are loade
 - **OS-managed**: The operating system handles page caching
 - **Persistent**: Cache survives restarts and can be reused
 
+**Cache and DataLoader Workers:**
+
+The `num_workers` parameter is **not modified** based on cache type. Both RAM and Disk caches use LMDB which supports concurrent reads from multiple processes:
+
+| Cache Mode | DataLoader Behavior |
+|------------|---------------------|
+| **RAM** | All workers share the same memory-mapped LMDB. Data is already in RAM, so workers read concurrently with minimal I/O. Recommended: keep default `num_workers`. |
+| **Disk** | Workers read from disk via memory-mapping. OS caches frequently accessed pages. On **fast SSD**: keep default `num_workers`. On **slow HDD**: consider reducing `num_workers` to 2-4 to avoid I/O contention. |
+| **None** | Workers load images from disk on each access. Higher `num_workers` helps parallelize I/O. |
+
+> **Tip**: If using disk cache on external/slow storage, consider setting `cache_dir` to a faster drive (SSD or NVMe) for better performance.
+
+**Switching Between RAM and Disk Modes:**
+
+Both `ram` and `disk` modes use the same LMDB format, so you can switch between them without rebuilding the cache:
+
+| First Run | Second Run | Result |
+|-----------|------------|--------|
+| `disk` | `ram` | Reuses cache, pre-faults pages into RAM |
+| `ram` | `disk` | Reuses cache, lazy OS-managed loading |
+| `ram` | `ram` | Reuses cache, pre-faults pages into RAM |
+| `disk` | `disk` | Reuses cache, lazy OS-managed loading |
+
+This allows you to:
+1. Create the cache once with `disk` mode (lower memory during creation)
+2. Reuse it with `ram` mode for fastest training (instant page loading)
+
 **Image Resize During Caching:**
 
 When `cache_resize_images: true` (default), images are resized to `image_size` during caching. This significantly reduces memory usage - a 4K image (4000x3000) takes ~36MB in RAM, but resized to 640x640 only ~1.2MB. The resize uses letterbox padding to preserve aspect ratio.
@@ -1241,6 +1305,31 @@ data:
 ```
 
 This ensures cached images are encrypted in the LMDB database, maintaining security for sensitive datasets. Note: LMDB metadata (keys, sizes) remains visible; only values are encrypted.
+
+**Performance Characteristics:**
+
+The LMDB-based cache implementation provides excellent performance for deep learning workloads:
+
+| Aspect | Implementation | Benefit |
+|--------|----------------|---------|
+| **Storage** | LMDB with memory-mapping | Zero-copy reads, no syscall per access |
+| **Concurrency** | Multi-reader single-writer | Perfect for DataLoader workers (spawn mode) |
+| **Serialization** | Compact header (2 + 4×ndim bytes) + raw bytes | Minimal overhead, fast encode/decode |
+| **Encryption** | AES-256-GCM on values only | Strong security, key never serialized |
+| **Multiprocessing** | Automatic reconnection in workers | Transparent pickling support |
+
+*Estimated storage for 137K images at 256×256×3 (uint8):*
+- Uncompressed: ~27 GB
+- With resize from original: typically 3-5× smaller cache than raw images
+
+**Comparison with Alternatives:**
+
+| Solution | Pros | Cons |
+|----------|------|------|
+| **LMDB** (current) | Zero-copy, multi-reader, battle-tested | Requires map_size estimation |
+| HDF5 | Good compression, scientific standard | GIL contention in multiprocess |
+| SQLite | Single-file, portable | Slower for binary blobs |
+| Individual files | Simple, no dependencies | Slow on many small files |
 
 **CLI override:**
 
@@ -1276,6 +1365,23 @@ Use `--data.cache_refresh=true` to force deletion and regeneration of the cache.
 - Dataset files were modified but timestamps didn't change
 - Cache file is corrupted
 - Switching between different preprocessing configurations
+
+**Automatic Cache Invalidation:**
+
+The cache is automatically invalidated (and rebuilt) when any of these settings change:
+
+| Change | Message |
+|--------|---------|
+| Cache version upgrade | `version changed (3.0.0 → 3.1.0)` |
+| Image count changed | `image count changed (100,000 → 117,266)` |
+| Image files changed | `image files changed` |
+| Size or fraction changed | `settings changed (size/fraction)` |
+| Encryption setting changed | `encryption changed (unencrypted → encrypted)` |
+
+Settings that do **not** invalidate the cache:
+- `batch_size` - only affects DataLoader batching
+- `num_workers` - only affects parallel loading
+- `cache_max_memory_gb` - only affects RAM mode limits
 
 ### Data Fraction (Quick Testing)
 

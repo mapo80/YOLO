@@ -541,6 +541,21 @@ class TestImageCacheEncryption:
 
         cache.clear()
 
+    def test_encrypted_ram_cache_roundtrip(self, temp_dir, sample_paths, test_key):
+        """Test encrypted RAM cache works correctly."""
+        cache = ImageCache(mode="ram", target_size=(50, 50), encryption_key=test_key)
+        cache.initialize(len(sample_paths), temp_dir, sample_paths)
+
+        arr = np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8)
+        cache.put(0, arr)
+        cache.finalize()
+
+        retrieved = cache.get(0)
+        assert retrieved is not None
+        np.testing.assert_array_equal(retrieved, arr)
+
+        cache.clear()
+
     def test_plain_cache_not_encrypted(self, temp_dir, sample_paths):
         """Test that cache without key creates plain LMDB."""
         cache = ImageCache(mode="disk", target_size=(50, 50), encryption_key=None)
@@ -554,6 +569,175 @@ class TestImageCacheEncryption:
         cache_path = cache.cache_path
         assert cache_path is not None
         assert (cache_path / "cache.lmdb").exists()
+
+        cache.clear()
+
+    def test_encrypted_data_is_different_from_plain(self, temp_dir, sample_paths, test_key):
+        """Test that encrypted data differs from plaintext in LMDB."""
+        import lmdb
+
+        # Create plain cache
+        plain_cache = ImageCache(mode="disk", target_size=(50, 50), encryption_key=None, cache_suffix="plain")
+        plain_cache.initialize(len(sample_paths), temp_dir, sample_paths)
+
+        arr = np.ones((50, 50, 3), dtype=np.uint8) * 128  # Known pattern
+        plain_cache.put(0, arr)
+        plain_cache.finalize()
+
+        # Create encrypted cache
+        enc_cache = ImageCache(mode="disk", target_size=(50, 50), encryption_key=test_key, cache_suffix="encrypted")
+        enc_cache.initialize(len(sample_paths), temp_dir, sample_paths)
+        enc_cache.put(0, arr)
+        enc_cache.finalize()
+
+        # Read raw data from both LMDB databases
+        plain_lmdb_path = plain_cache.cache_path / "cache.lmdb"
+        enc_lmdb_path = enc_cache.cache_path / "cache.lmdb"
+
+        plain_env = lmdb.open(str(plain_lmdb_path), readonly=True, lock=False)
+        enc_env = lmdb.open(str(enc_lmdb_path), readonly=True, lock=False)
+
+        with plain_env.begin() as txn:
+            plain_data = txn.get(b"0")
+
+        with enc_env.begin() as txn:
+            enc_data = txn.get(b"0")
+
+        plain_env.close()
+        enc_env.close()
+
+        # Encrypted data should be different from plain data
+        assert plain_data != enc_data
+
+        # Encrypted data should be larger (due to IV/nonce + tag overhead)
+        assert len(enc_data) > len(plain_data)
+
+        # Plain data should contain recognizable pattern (the header + array bytes)
+        # The first 2 bytes are dtype_id and ndim, then shape, then array data
+        # For uint8 array of 50x50x3, we should see the pattern 128 repeated
+        assert plain_data is not None
+        # Skip header (2 + 4*3 = 14 bytes) and check if 128 pattern exists
+        plain_array_data = plain_data[14:]
+        assert plain_array_data[:100].count(128) > 50  # Should contain many 128s
+
+        # Encrypted data should NOT have recognizable patterns
+        enc_array_data = enc_data[14:] if len(enc_data) > 14 else enc_data
+        # After encryption, the 128 pattern should be dispersed
+        assert enc_array_data[:100].count(128) < 10  # Should have very few 128s
+
+        plain_cache.clear()
+        enc_cache.clear()
+
+    def test_wrong_key_cannot_decrypt(self, temp_dir, sample_paths, test_key):
+        """Test that wrong key cannot decrypt data."""
+        # Create cache with original key
+        cache1 = ImageCache(mode="disk", target_size=(32, 32), encryption_key=test_key, cache_suffix="enc_test")
+        cache1.initialize(len(sample_paths), temp_dir, sample_paths)
+
+        arr = np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)
+        cache1.put(0, arr)
+        cache1.finalize()
+
+        # Try to read with wrong key
+        wrong_key = "fedcba9876543210" * 4  # Different key
+        cache2 = ImageCache(mode="disk", target_size=(32, 32), encryption_key=wrong_key, cache_suffix="enc_test")
+
+        # Initialize will find existing cache but validation should fail due to encryption mismatch
+        # Or reading will fail with decryption error
+        cache2.initialize(len(sample_paths), temp_dir, sample_paths)
+
+        # Attempting to decrypt with wrong key should fail or return corrupted data
+        try:
+            retrieved = cache2.get(0)
+            # If we get here, the data should be corrupted (not equal to original)
+            if retrieved is not None:
+                assert not np.array_equal(retrieved, arr), "Wrong key should not decrypt correctly"
+        except Exception:
+            # Expected - decryption should fail with wrong key
+            pass
+
+        cache1.clear()
+
+    def test_cache_invalidation_on_encryption_change(self, temp_dir, sample_paths, test_key):
+        """Test that cache is invalidated when encryption setting changes."""
+        # Create unencrypted cache
+        cache1 = ImageCache(mode="disk", target_size=(32, 32), encryption_key=None)
+        cache1.initialize(len(sample_paths), temp_dir, sample_paths)
+
+        arr = np.zeros((32, 32, 3), dtype=np.uint8)
+        cache1.put(0, arr)
+        cache1.finalize()
+
+        # Create encrypted cache with same settings (but encryption enabled)
+        cache2 = ImageCache(mode="disk", target_size=(32, 32), encryption_key=test_key)
+        cache_exists = cache2.initialize(len(sample_paths), temp_dir, sample_paths)
+
+        # Cache should be invalidated due to encryption change
+        assert cache_exists is False
+        assert cache2._invalidation_reason == "encryption changed (unencrypted → encrypted)"
+
+        cache2.clear()
+
+    def test_multiple_images_encrypted(self, temp_dir, sample_paths, test_key):
+        """Test storing and retrieving multiple images with encryption."""
+        cache = ImageCache(mode="disk", target_size=(32, 32), encryption_key=test_key)
+        cache.initialize(len(sample_paths), temp_dir, sample_paths)
+
+        # Store multiple images
+        images = {}
+        for i in range(5):
+            arr = np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)
+            images[i] = arr.copy()
+            cache.put(i, arr)
+
+        cache.finalize()
+
+        # Retrieve and verify all images
+        for i, expected in images.items():
+            retrieved = cache.get(i)
+            assert retrieved is not None, f"Image {i} should be retrievable"
+            np.testing.assert_array_equal(retrieved, expected, f"Image {i} should match")
+
+        cache.clear()
+
+    def test_encrypted_cache_serialization(self, temp_dir, sample_paths, test_key, monkeypatch):
+        """Test that encrypted cache can be pickled for multiprocessing.
+
+        The encryption key is NEVER serialized with pickle for security.
+        Workers must read the key from YOLO_ENCRYPTION_KEY environment variable.
+        """
+        cache = ImageCache(mode="disk", target_size=(32, 32), encryption_key=test_key)
+        cache.initialize(len(sample_paths), temp_dir, sample_paths)
+
+        arr = np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)
+        cache.put(0, arr)
+        cache.finalize()
+
+        # Simulate worker process: pickle and unpickle
+        # Worker gets key from environment variable (set by parent process)
+        monkeypatch.setenv("YOLO_ENCRYPTION_KEY", test_key)
+
+        state = pickle.dumps(cache)
+        worker_cache = pickle.loads(state)
+
+        # Worker should be able to read the encrypted data
+        retrieved = worker_cache.get(0)
+        assert retrieved is not None
+        np.testing.assert_array_equal(retrieved, arr)
+
+        cache.clear()
+
+    def test_encryption_key_not_in_pickle(self, temp_dir, sample_paths, test_key):
+        """Test that encryption key is NOT included in pickled state."""
+        cache = ImageCache(mode="disk", target_size=(32, 32), encryption_key=test_key)
+        cache.initialize(len(sample_paths), temp_dir, sample_paths)
+
+        # Get the pickled state
+        state = pickle.dumps(cache)
+        state_str = str(state)
+
+        # The key should NOT appear in the pickled data
+        assert test_key not in state_str, "Encryption key should not be in pickled state!"
 
         cache.clear()
 

@@ -251,7 +251,8 @@ class YOLODataModule(L.LightningDataModule):
         self.val_dataset = None
         self._mosaic_enabled = True
         self._image_loader = image_loader
-        self._encryption_key = encryption_key
+        # Encryption key: prefer parameter, fallback to environment variable
+        self._encryption_key = encryption_key or os.environ.get("YOLO_ENCRYPTION_KEY")
         # Image size is set via CLI link from model.image_size
         self._image_size: Tuple[int, int] = (640, 640)
 
@@ -282,14 +283,14 @@ class YOLODataModule(L.LightningDataModule):
 
             # Determine encryption key for cache (only if cache_encrypt is True)
             cache_encryption_key = None
-            if self.hparams.cache_encrypt and self.hparams.cache_images == "disk":
+            if self.hparams.cache_encrypt:
                 if self._encryption_key is None:
                     raise ValueError(
                         "cache_encrypt=True requires encryption_key to be set. "
                         "Either set data.encryption_key in YAML or YOLO_ENCRYPTION_KEY env var."
                     )
                 cache_encryption_key = self._encryption_key
-                logger.info("🔒 Disk cache encryption enabled")
+                logger.info(f"🔒 {self.hparams.cache_images.upper()} cache encryption enabled")
 
             # Determine target size for caching (None = original size)
             target_size = image_size if self.hparams.cache_resize_images else None
@@ -313,6 +314,7 @@ class YOLODataModule(L.LightningDataModule):
                 target_size=target_size,
                 encryption_key=cache_encryption_key,
                 cache_suffix=cache_suffix,
+                refresh=self.hparams.cache_refresh,
             )
 
         # Get data fraction for sampling
@@ -696,23 +698,24 @@ class CocoDetectionWrapper(CocoDetection):
     def _precache_images(self) -> None:
         """Pre-load all images into cache (RAM or disk, parallelized)."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from yolo.utils.progress import progress_bar, console
+        from yolo.utils.progress import progress_bar, spinner, console
 
         cache_mode = self._image_cache.mode
 
-        # Get all image paths
-        image_paths = []
-        for id in self.ids:
-            path = self.coco.loadImgs(id)[0]["file_name"]
-            image_paths.append(Path(os.path.join(self.root, path)))
+        # Get all image paths (fast - just string lookups)
+        image_paths = [
+            Path(os.path.join(self.root, self.coco.loadImgs(id)[0]["file_name"]))
+            for id in self.ids
+        ]
 
-        # Initialize unified LMDB cache
+        # Initialize unified LMDB cache with spinner
         dataset_root = Path(self.root)
-        cache_exists = self._image_cache.initialize(
-            num_images=len(image_paths),
-            cache_dir=dataset_root,
-            paths=image_paths,
-        )
+        with spinner(f"Validating {cache_mode.upper()} cache ({len(image_paths):,} images)..."):
+            cache_exists = self._image_cache.initialize(
+                num_images=len(image_paths),
+                cache_dir=dataset_root,
+                paths=image_paths,
+            )
         cache_location = self._image_cache.cache_path or "alongside images"
 
         if not self._image_cache._enabled:
@@ -720,8 +723,15 @@ class CocoDetectionWrapper(CocoDetection):
             return
 
         if cache_exists:
-            console.print(f"[green]✓[/green] {cache_mode.upper()} cache: all {len(image_paths)} images already cached ({cache_location})")
+            console.print(f"[green]✓[/green] {cache_mode.upper()} cache found: {len(image_paths):,} images ready ({cache_location})")
             return
+
+        # Show why cache is being rebuilt
+        if getattr(self._image_cache, '_refresh_requested', False):
+            console.print(f"[yellow]🔄[/yellow] Cache refresh requested - rebuilding {cache_mode.upper()} cache")
+        elif getattr(self._image_cache, '_invalidation_reason', None):
+            reason = self._image_cache._invalidation_reason
+            console.print(f"[yellow]⚠[/yellow] Cache invalidated: {reason} - rebuilding")
 
         # All images need to be cached
         work_items = [(idx, path) for idx, path in enumerate(image_paths)]
@@ -742,26 +752,32 @@ class CocoDetectionWrapper(CocoDetection):
 
         # Display cache info
         enc_info = ", encrypted" if self._image_cache._encrypt_cache else ""
-        console.print(f"\n[bold]💾 Pre-caching {len(work_items)} images[/bold] ({size_info}{enc_info}, {num_workers} workers)")
+        console.print(f"\n[bold]💾 Pre-caching {len(work_items):,} images[/bold] ({size_info}{enc_info}, {num_workers} workers)")
         console.print(f"   Cache location: {cache_location}")
 
         # Use ThreadPoolExecutor for parallel I/O
         failed_count = 0
-        with progress_bar(len(work_items), cache_desc) as update:
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = {
-                    executor.submit(self._load_and_cache_image, idx, path, target_size): idx
-                    for idx, path in work_items
-                }
+        executor = ThreadPoolExecutor(max_workers=num_workers)
 
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        failed_count += 1
-                        if failed_count <= 3:
-                            logger.warning(f"Failed to cache image: {e}")
-                    update(1)
+        # Submit all tasks with spinner (can take a moment for large datasets)
+        with spinner(f"Queueing {len(work_items):,} images..."):
+            futures = {
+                executor.submit(self._load_and_cache_image, idx, path, target_size): idx
+                for idx, path in work_items
+            }
+
+        # Process results with progress bar
+        with progress_bar(len(work_items), cache_desc) as update:
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    failed_count += 1
+                    if failed_count <= 3:
+                        logger.warning(f"Failed to cache image: {e}")
+                update(1)
+
+        executor.shutdown(wait=False)
 
         # Finalize cache
         self._image_cache.finalize()
@@ -962,17 +978,18 @@ class YOLOFormatDataset(Dataset):
     def _precache_images(self) -> None:
         """Pre-load all images into cache (RAM or disk, parallelized)."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from yolo.utils.progress import progress_bar, console
+        from yolo.utils.progress import progress_bar, spinner, console
 
         cache_mode = self._image_cache.mode
 
-        # Initialize unified LMDB cache
+        # Initialize unified LMDB cache with spinner
         dataset_root = self.images_dir.parent
-        cache_exists = self._image_cache.initialize(
-            num_images=len(self.image_files),
-            cache_dir=dataset_root,
-            paths=self.image_files,
-        )
+        with spinner(f"Validating {cache_mode.upper()} cache ({len(self.image_files):,} images)..."):
+            cache_exists = self._image_cache.initialize(
+                num_images=len(self.image_files),
+                cache_dir=dataset_root,
+                paths=self.image_files,
+            )
         cache_location = self._image_cache.cache_path or "alongside images"
 
         if not self._image_cache._enabled:
@@ -980,8 +997,15 @@ class YOLOFormatDataset(Dataset):
             return
 
         if cache_exists:
-            console.print(f"[green]✓[/green] {cache_mode.upper()} cache: all {len(self.image_files)} images already cached ({cache_location})")
+            console.print(f"[green]✓[/green] {cache_mode.upper()} cache found: {len(self.image_files):,} images ready ({cache_location})")
             return
+
+        # Show why cache is being rebuilt
+        if getattr(self._image_cache, '_refresh_requested', False):
+            console.print(f"[yellow]🔄[/yellow] Cache refresh requested - rebuilding {cache_mode.upper()} cache")
+        elif getattr(self._image_cache, '_invalidation_reason', None):
+            reason = self._image_cache._invalidation_reason
+            console.print(f"[yellow]⚠[/yellow] Cache invalidated: {reason} - rebuilding")
 
         # All images need to be cached
         work_items = [(idx, path) for idx, path in enumerate(self.image_files)]
@@ -1002,26 +1026,32 @@ class YOLOFormatDataset(Dataset):
 
         # Display cache info
         enc_info = ", encrypted" if self._image_cache._encrypt_cache else ""
-        console.print(f"\n[bold]💾 Pre-caching {len(work_items)} images[/bold] ({size_info}{enc_info}, {num_workers} workers)")
+        console.print(f"\n[bold]💾 Pre-caching {len(work_items):,} images[/bold] ({size_info}{enc_info}, {num_workers} workers)")
         console.print(f"   Cache location: {cache_location}")
 
         # Use ThreadPoolExecutor for parallel I/O
         failed_count = 0
-        with progress_bar(len(work_items), cache_desc) as update:
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = {
-                    executor.submit(self._load_and_cache_image, idx, path, target_size): idx
-                    for idx, path in work_items
-                }
+        executor = ThreadPoolExecutor(max_workers=num_workers)
 
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        failed_count += 1
-                        if failed_count <= 3:
-                            logger.warning(f"Failed to cache image: {e}")
-                    update(1)
+        # Submit all tasks with spinner (can take a moment for large datasets)
+        with spinner(f"Queueing {len(work_items):,} images..."):
+            futures = {
+                executor.submit(self._load_and_cache_image, idx, path, target_size): idx
+                for idx, path in work_items
+            }
+
+        # Process results with progress bar
+        with progress_bar(len(work_items), cache_desc) as update:
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    failed_count += 1
+                    if failed_count <= 3:
+                        logger.warning(f"Failed to cache image: {e}")
+                update(1)
+
+        executor.shutdown(wait=False)
 
         # Finalize cache
         self._image_cache.finalize()
