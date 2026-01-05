@@ -1,0 +1,120 @@
+# lightning.pytorch==2.6.0
+seed_everything: 0
+trainer:
+  accelerator: cpu
+  strategy: auto
+  devices: '1'
+  num_nodes: 1
+  precision: 16-mixed
+  logger: false
+  callbacks: null
+  fast_dev_run: false
+  max_epochs: 1
+  min_epochs: null
+  max_steps: -1
+  min_steps: null
+  max_time: null
+  limit_train_batches: 5
+  limit_val_batches: 2
+  limit_test_batches: null
+  limit_predict_batches: null
+  overfit_batches: 0.0
+  val_check_interval: null
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: null
+  log_every_n_steps: 50
+  enable_checkpointing: null
+  enable_progress_bar: null
+  enable_model_summary: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: 10.0
+  gradient_clip_algorithm: null
+  deterministic: null
+  benchmark: null
+  inference_mode: true
+  use_distributed_sampler: true
+  profiler: null
+  detect_anomaly: false
+  barebones: false
+  plugins: null
+  sync_batchnorm: false
+  reload_dataloaders_every_n_epochs: 0
+  default_root_dir: null
+  enable_autolog_hparams: true
+  model_registry: null
+model:
+  model_config: v9-c
+  num_classes: 80
+  image_size:
+  - 640
+  - 640
+  optimizer: sgd
+  learning_rate: 0.01
+  momentum: 0.937
+  weight_decay: 0.0005
+  adamw_betas:
+  - 0.9
+  - 0.999
+  warmup_epochs: 3
+  warmup_momentum: 0.8
+  warmup_bias_lr: 0.1
+  box_loss_weight: 7.5
+  cls_loss_weight: 0.5
+  dfl_loss_weight: 1.5
+  weight_path: null
+  nms_conf_threshold: 0.25
+  nms_iou_threshold: 0.65
+  nms_max_detections: 300
+  class_names: null
+  save_metrics_plots: true
+  metrics_plots_dir: null
+  lr_scheduler: cosine
+  lr_min_factor: 0.01
+  step_size: 30
+  step_gamma: 0.1
+  one_cycle_pct_start: 0.3
+  one_cycle_div_factor: 25.0
+  one_cycle_final_div_factor: 10000.0
+  freeze_backbone: false
+  freeze_until_epoch: 0
+  freeze_layers: null
+data:
+  format: yolo
+  root: training-experiment/simpsons-yolo
+  train_images: train/images
+  val_images: valid/images
+  train_ann: annotations/instances_train2017.json
+  val_ann: annotations/instances_val2017.json
+  train_labels: train/labels
+  val_labels: valid/labels
+  batch_size: 4
+  num_workers: 2
+  pin_memory: true
+  prefetch_factor: 4
+  image_loader: null
+  mosaic_prob: 1.0
+  mosaic_9_prob: 0.0
+  mixup_prob: 0.15
+  mixup_alpha: 32.0
+  cutmix_prob: 0.0
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  degrees: 0.0
+  translate: 0.1
+  scale: 0.9
+  shear: 0.0
+  perspective: 0.0
+  flip_lr: 0.5
+  flip_ud: 0.0
+  close_mosaic_epochs: 15
+  data_fraction: 1.0
+  cache_labels: true
+  cache_images: none
+  cache_resize_images: true
+  cache_max_memory_gb: 8.0
+  cache_refresh: false
+optimizer: null
+lr_scheduler: null
+ckpt_path: null
+weights_only: null
