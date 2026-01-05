@@ -94,8 +94,17 @@ class YOLOLightningCLI:
 
         class _CLI(LightningCLI):
             def add_arguments_to_parser(self, parser):
-                """No argument linking needed - image_size is propagated in before_fit."""
-                pass
+                """Link model.image_size to data.image_size for automatic propagation.
+
+                This ensures data.image_size is set from model.image_size at instantiation time,
+                BEFORE datamodule.setup() is called. Users should NOT specify data.image_size
+                manually - it will be automatically set from model.image_size.
+                """
+                parser.link_arguments(
+                    "model.image_size",
+                    "data.image_size",
+                    apply_on="instantiate"
+                )
 
             def _add_callback_if_missing(self, callback_cls, *args, **cb_kwargs):
                 """Add callback if not already present."""
@@ -105,30 +114,39 @@ class YOLOLightningCLI:
                 if not has_callback:
                     self.trainer.callbacks.append(callback_cls(*args, **cb_kwargs))
 
+            def _validate_image_size(self):
+                """Validate that model and datamodule image_size match."""
+                if self.model is None or self.datamodule is None:
+                    return
+
+                model_size = tuple(self.model.hparams.image_size)
+                data_size = self.datamodule._image_size
+
+                if model_size != data_size:
+                    raise ValueError(
+                        f"Image size mismatch: model.image_size={model_size} != data.image_size={data_size}. "
+                        f"Do NOT specify data.image_size manually - it is automatically linked from model.image_size."
+                    )
+
             def before_fit(self):
-                """Add callbacks and propagate image_size before training starts."""
+                """Add callbacks before training starts."""
                 from yolo.training.callbacks import (
                     TrainingSummaryCallback,
                     ClassNamesCallback,
                 )
 
-                # Propagate image_size from model to datamodule
-                # This ensures data._image_size matches model.image_size
-                if hasattr(self.model, 'hparams') and hasattr(self.datamodule, '_image_size'):
-                    model_image_size = self.model.hparams.image_size
-                    self.datamodule._image_size = tuple(model_image_size)
+                # Validate image_size consistency
+                self._validate_image_size()
 
                 self._add_callback_if_missing(TrainingSummaryCallback)
                 self._add_callback_if_missing(ClassNamesCallback)
 
             def before_validate(self):
-                """Add callbacks and propagate image_size before validation starts."""
+                """Add callbacks before validation starts."""
                 from yolo.training.callbacks import ClassNamesCallback
 
-                # Propagate image_size from model to datamodule
-                if hasattr(self.model, 'hparams') and hasattr(self.datamodule, '_image_size'):
-                    model_image_size = self.model.hparams.image_size
-                    self.datamodule._image_size = tuple(model_image_size)
+                # Validate image_size consistency
+                self._validate_image_size()
 
                 self._add_callback_if_missing(ClassNamesCallback)
 

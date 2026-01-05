@@ -38,6 +38,8 @@ def main():
     )
 
     # Create datamodule
+    # Note: image_size is automatically linked from model.image_size when using CLI.
+    # When using programmatically, pass it explicitly to match the model.
     datamodule = YOLODataModule(
         root="data/coco",
         train_images="train2017",
@@ -46,9 +48,8 @@ def main():
         val_ann="annotations/instances_val2017.json",
         batch_size=16,
         num_workers=8,
+        image_size=tuple(model.hparams.image_size),
     )
-    # Set image_size to match model (normally done by CLI automatically)
-    datamodule._image_size = tuple(model.hparams.image_size)
 
     # Create trainer
     trainer = Trainer(

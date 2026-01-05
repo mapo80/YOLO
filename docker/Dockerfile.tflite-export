@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir \
     lightning "jsonargparse[signatures]>=4.27.7" \
-    omegaconf einops pycocotools opencv-python-headless
+    omegaconf einops pycocotools opencv-python-headless scipy matplotlib seaborn
 
 # Fix numpy 2.x incompatibility with onnxruntime (must be after lightning which upgrades it)
 RUN pip install --no-cache-dir "numpy<2.0"

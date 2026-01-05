@@ -126,6 +126,10 @@ class YOLODataModule(L.LightningDataModule):
     - 'coco': Uses torchvision.datasets.CocoDetection (JSON annotations)
     - 'yolo': Uses YOLOFormatDataset (.txt label files)
 
+    IMPORTANT: image_size is automatically linked from model.image_size via the CLI.
+    Do NOT specify data.image_size manually - it will be set from model.image_size.
+    If you need to change the image size, modify model.image_size instead.
+
     COCO format directory structure:
         data/coco/
         ├── train2017/
@@ -186,6 +190,7 @@ class YOLODataModule(L.LightningDataModule):
         cache_max_memory_gb: Maximum RAM for image caching in GB (default: 8.0)
         cache_workers: Number of parallel workers for caching (default: None = all CPU threads)
         cache_refresh: Force cache regeneration (default: False)
+        image_size: DO NOT SPECIFY - automatically linked from model.image_size via CLI.
     """
 
     def __init__(
@@ -242,6 +247,9 @@ class YOLODataModule(L.LightningDataModule):
         # Encryption key for encrypted images (.enc) and/or encrypted cache
         # Can also be set via YOLO_ENCRYPTION_KEY environment variable
         encryption_key: Optional[str] = None,
+        # Image size - automatically linked from model.image_size via CLI.
+        # DO NOT specify this manually - it is set automatically from model.image_size.
+        image_size: Tuple[int, int] = (640, 640),
     ):
         super().__init__()
         # Exclude image_loader and encryption_key from hyperparameters (not serializable)
@@ -253,8 +261,8 @@ class YOLODataModule(L.LightningDataModule):
         self._image_loader = image_loader
         # Encryption key: prefer parameter, fallback to environment variable
         self._encryption_key = encryption_key or os.environ.get("YOLO_ENCRYPTION_KEY")
-        # Image size is set via CLI link from model.image_size
-        self._image_size: Tuple[int, int] = (640, 640)
+        # Image size: linked from model.image_size via CLI (apply_on="instantiate")
+        self._image_size: Tuple[int, int] = tuple(image_size)
 
         # Validate format
         if format not in ("coco", "yolo"):
