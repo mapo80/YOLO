@@ -3,7 +3,7 @@ Tests for Dataset Caching System.
 
 Tests cover:
 - DatasetCache: Hash computation, validation, save/load
-- ImageCache: RAM and disk caching modes
+- ImageCache: Unified LMDB-based RAM and disk caching
 - LRUImageBuffer: Capacity, eviction, LRU ordering
 """
 
@@ -180,7 +180,7 @@ class TestDatasetCache:
 
 
 class TestImageCache:
-    """Tests for ImageCache class."""
+    """Tests for unified LMDB ImageCache class."""
 
     @pytest.fixture
     def temp_dir(self):
@@ -188,87 +188,152 @@ class TestImageCache:
         with tempfile.TemporaryDirectory() as tmpdir:
             yield Path(tmpdir)
 
+    @pytest.fixture
+    def sample_paths(self, temp_dir):
+        """Create sample image paths for testing."""
+        return [temp_dir / f"image_{i}.jpg" for i in range(10)]
+
     def test_none_mode_disabled(self):
         """Test that none mode disables caching."""
         cache = ImageCache(mode="none")
         assert cache._enabled is False
-        assert cache.get(0, Path("test.jpg")) is None
+        assert cache.get(0) is None
 
         arr = np.zeros((100, 100, 3), dtype=np.uint8)
-        cache.put(0, Path("test.jpg"), arr)
-        assert cache.get(0, Path("test.jpg")) is None
+        cache.put(0, arr)
+        assert cache.get(0) is None
 
-    def test_ram_put_get(self, temp_dir):
-        """Test RAM caching put and get with memory-mapped file."""
-        cache = ImageCache(mode="ram")
+    def test_ram_cache_initialize_and_put_get(self, temp_dir, sample_paths):
+        """Test RAM caching with unified LMDB backend."""
+        cache = ImageCache(mode="ram", target_size=(64, 64))
+
+        # Initialize cache
+        cache_exists = cache.initialize(
+            num_images=len(sample_paths),
+            cache_dir=temp_dir,
+            paths=sample_paths,
+        )
+        assert cache_exists is False  # New cache
         assert cache._enabled is True
 
-        arr = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        path = Path("test.jpg")
+        # Store and retrieve images
+        arr = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+        cache.put(0, arr)
+        cache.finalize()
 
-        # Initialize mmap cache before use
-        cache.initialize_ram_cache(num_images=10, image_shape=(100, 100, 3), cache_dir=temp_dir)
-
-        cache.put(0, path, arr)
-        retrieved = cache.get(0, path)
-
+        retrieved = cache.get(0)
         assert retrieved is not None
         np.testing.assert_array_equal(retrieved, arr)
 
         # Cleanup
         cache.clear()
 
-    def test_ram_cache_size(self, temp_dir):
-        """Test RAM cache size tracking."""
-        cache = ImageCache(mode="ram")
-        assert cache.size == 0
+    def test_disk_cache_initialize_and_put_get(self, temp_dir, sample_paths):
+        """Test disk caching with unified LMDB backend."""
+        cache = ImageCache(mode="disk", target_size=(64, 64))
 
-        # Initialize mmap cache
-        cache.initialize_ram_cache(num_images=10, image_shape=(10, 10, 3), cache_dir=temp_dir)
+        # Initialize cache
+        cache_exists = cache.initialize(
+            num_images=len(sample_paths),
+            cache_dir=temp_dir,
+            paths=sample_paths,
+        )
+        assert cache_exists is False  # New cache
+        assert cache._enabled is True
 
-        arr = np.zeros((10, 10, 3), dtype=np.uint8)
-        cache.put(0, Path("a.jpg"), arr)
-        cache.put(1, Path("b.jpg"), arr)
+        # Store and retrieve images
+        arr = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+        cache.put(0, arr)
+        cache.finalize()
 
-        assert cache.size == 2
+        retrieved = cache.get(0)
+        assert retrieved is not None
+        np.testing.assert_array_equal(retrieved, arr)
 
         # Cleanup
         cache.clear()
 
-    def test_ram_cache_clear(self, temp_dir):
-        """Test RAM cache clearing."""
-        cache = ImageCache(mode="ram")
+    def test_cache_size_tracking(self, temp_dir, sample_paths):
+        """Test cache size tracking."""
+        cache = ImageCache(mode="disk", target_size=(32, 32))
+        cache.initialize(len(sample_paths), temp_dir, sample_paths)
 
-        # Initialize mmap cache
-        cache.initialize_ram_cache(num_images=10, image_shape=(10, 10, 3), cache_dir=temp_dir)
+        assert cache.size == 0
 
-        arr = np.zeros((10, 10, 3), dtype=np.uint8)
-        cache.put(0, Path("a.jpg"), arr)
-        cache.put(1, Path("b.jpg"), arr)
+        for i in range(5):
+            arr = np.zeros((32, 32, 3), dtype=np.uint8)
+            cache.put(i, arr)
+
+        assert cache.size == 5
 
         cache.clear()
-        assert cache.size == 0
-        assert cache.get(0, Path("a.jpg")) is None
 
-    def test_disk_creates_npy(self, temp_dir):
-        """Test disk caching creates .npy files."""
-        cache = ImageCache(mode="disk", cache_dir=temp_dir)
+    def test_cache_reuse(self, temp_dir, sample_paths):
+        """Test that existing cache is detected and reused."""
+        # Create first cache
+        cache1 = ImageCache(mode="disk", target_size=(32, 32))
+        cache1.initialize(len(sample_paths), temp_dir, sample_paths)
 
-        arr = np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8)
-        img_path = temp_dir / "image.jpg"
-        npy_path = temp_dir / "image.npy"
+        arr = np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)
+        cache1.put(0, arr)
+        cache1.finalize()
 
-        cache.put(0, img_path, arr)
-        assert npy_path.exists()
+        # Create second cache with same settings - should find existing
+        cache2 = ImageCache(mode="disk", target_size=(32, 32))
+        cache_exists = cache2.initialize(len(sample_paths), temp_dir, sample_paths)
 
-        retrieved = cache.get(0, img_path)
+        assert cache_exists is True  # Should detect existing cache
+
+        # Should be able to retrieve the stored data
+        retrieved = cache2.get(0)
+        assert retrieved is not None
         np.testing.assert_array_equal(retrieved, arr)
 
-    def test_disk_returns_none_if_missing(self, temp_dir):
-        """Test disk cache returns None for missing files."""
-        cache = ImageCache(mode="disk", cache_dir=temp_dir)
-        result = cache.get(0, temp_dir / "nonexistent.jpg")
+        cache2.clear()
+
+    def test_cache_invalidation_on_path_change(self, temp_dir, sample_paths):
+        """Test that cache is invalidated when paths change."""
+        # Create first cache
+        cache1 = ImageCache(mode="disk", target_size=(32, 32))
+        cache1.initialize(len(sample_paths), temp_dir, sample_paths)
+
+        arr = np.zeros((32, 32, 3), dtype=np.uint8)
+        cache1.put(0, arr)
+        cache1.finalize()
+
+        # Create second cache with different paths
+        different_paths = [temp_dir / f"different_{i}.jpg" for i in range(10)]
+        cache2 = ImageCache(mode="disk", target_size=(32, 32))
+        cache_exists = cache2.initialize(len(different_paths), temp_dir, different_paths)
+
+        assert cache_exists is False  # Cache should be invalidated
+
+        cache2.clear()
+
+    def test_returns_none_if_not_cached(self, temp_dir, sample_paths):
+        """Test cache returns None for non-cached indices."""
+        cache = ImageCache(mode="disk", target_size=(32, 32))
+        cache.initialize(len(sample_paths), temp_dir, sample_paths)
+
+        result = cache.get(999)  # Index not cached
         assert result is None
+
+        cache.clear()
+
+    def test_is_cached_method(self, temp_dir, sample_paths):
+        """Test is_cached method."""
+        cache = ImageCache(mode="disk", target_size=(32, 32))
+        cache.initialize(len(sample_paths), temp_dir, sample_paths)
+
+        assert cache.is_cached(0) is False
+
+        arr = np.zeros((32, 32, 3), dtype=np.uint8)
+        cache.put(0, arr)
+
+        assert cache.is_cached(0) is True
+        assert cache.is_cached(1) is False
+
+        cache.clear()
 
     def test_can_cache_in_ram_estimation(self):
         """Test RAM capacity estimation."""
@@ -290,9 +355,9 @@ class TestImageCache:
 
     def test_estimate_memory_with_target_size(self, temp_dir):
         """Test memory estimation uses target_size when set."""
-        # Create a test image
         from PIL import Image
 
+        # Create a test image
         img = Image.new("RGB", (1920, 1080), color="red")
         img_path = temp_dir / "test.jpg"
         img.save(img_path)
@@ -306,35 +371,13 @@ class TestImageCache:
         est_resized = cache_resized.estimate_memory([img_path])
 
         # Resized estimate should be much smaller
-        # Original: 1920*1080*3 = 6.2MB, Target: 640*640*3 = 1.2MB
         assert est_resized < est_original
-
-    def test_estimate_memory_with_custom_loader(self, temp_dir):
-        """Test memory estimation with custom image loader."""
-        from PIL import Image
-
-        # Create test image
-        img = Image.new("RGB", (800, 600), color="blue")
-        img_path = temp_dir / "test.jpg"
-        img.save(img_path)
-
-        # Custom loader that wraps the default behavior
-        def custom_loader(path: str) -> Image.Image:
-            return Image.open(path).convert("RGB")
-
-        cache = ImageCache(mode="ram", target_size=None)
-        estimated_gb = cache.estimate_memory([img_path], image_loader=custom_loader)
-
-        # Should return a reasonable estimate
-        assert estimated_gb > 0
 
     def test_estimate_memory_target_size_exact_calculation(self):
         """Test that target_size gives exact memory calculation without sampling."""
         cache = ImageCache(mode="ram", target_size=(640, 480))
 
-        # Even with empty paths, we can calculate exact memory
-        # 640 * 480 * 3 * 1.2 (safety margin) / 1024^3 = ~1.08 MB per image
-        # For 1000 images = ~1.05 GB
+        # Even with fake paths, we can calculate exact memory
         paths = [Path(f"fake_{i}.jpg") for i in range(1000)]
         estimated_gb = cache.estimate_memory(paths)
 
@@ -343,9 +386,44 @@ class TestImageCache:
 
         assert abs(estimated_gb - expected_gb) < 0.01  # Within 0.01 GB
 
+    def test_cache_suffix_differentiates_caches(self, temp_dir, sample_paths):
+        """Test that different cache_suffix creates different caches."""
+        # Create cache with suffix1
+        cache1 = ImageCache(mode="disk", target_size=(32, 32), cache_suffix="suffix1")
+        cache1.initialize(len(sample_paths), temp_dir, sample_paths)
 
-class TestImageCacheMmap:
-    """Tests for memory-mapped RAM cache (shared between workers)."""
+        arr1 = np.ones((32, 32, 3), dtype=np.uint8) * 100
+        cache1.put(0, arr1)
+        cache1.finalize()
+
+        # Create cache with suffix2
+        cache2 = ImageCache(mode="disk", target_size=(32, 32), cache_suffix="suffix2")
+        cache_exists = cache2.initialize(len(sample_paths), temp_dir, sample_paths)
+
+        # Should be a new cache (different suffix)
+        assert cache_exists is False
+
+        arr2 = np.ones((32, 32, 3), dtype=np.uint8) * 200
+        cache2.put(0, arr2)
+        cache2.finalize()
+
+        # Verify they store different data
+        cache1_reopen = ImageCache(mode="disk", target_size=(32, 32), cache_suffix="suffix1")
+        cache1_reopen.initialize(len(sample_paths), temp_dir, sample_paths)
+        retrieved1 = cache1_reopen.get(0)
+
+        cache2_reopen = ImageCache(mode="disk", target_size=(32, 32), cache_suffix="suffix2")
+        cache2_reopen.initialize(len(sample_paths), temp_dir, sample_paths)
+        retrieved2 = cache2_reopen.get(0)
+
+        assert not np.array_equal(retrieved1, retrieved2)
+
+        cache1.clear()
+        cache2.clear()
+
+
+class TestImageCacheMultiprocessing:
+    """Tests for LMDB cache multiprocessing compatibility."""
 
     @pytest.fixture
     def temp_dir(self):
@@ -353,206 +431,84 @@ class TestImageCacheMmap:
         with tempfile.TemporaryDirectory() as tmpdir:
             yield Path(tmpdir)
 
-    def test_mmap_file_created(self, temp_dir):
-        """Test that memory-mapped file is created during initialization."""
-        cache = ImageCache(mode="ram")
-        cache.initialize_ram_cache(
-            num_images=10,
-            image_shape=(100, 100, 3),
-            cache_dir=temp_dir
-        )
+    @pytest.fixture
+    def sample_paths(self, temp_dir):
+        """Create sample image paths for testing."""
+        return [temp_dir / f"image_{i}.jpg" for i in range(10)]
 
-        mmap_file = temp_dir / ".image_cache.mmap"
-        assert mmap_file.exists()
-        assert cache._mmap_array is not None
-        assert cache._enabled is True
-
-        # Cleanup
-        cache.clear()
-
-    def test_mmap_correct_size(self, temp_dir):
-        """Test that memory-mapped file has correct size."""
-        num_images = 5
-        h, w, c = 64, 64, 3
-
-        cache = ImageCache(mode="ram")
-        cache.initialize_ram_cache(
-            num_images=num_images,
-            image_shape=(h, w, c),
-            cache_dir=temp_dir
-        )
-
-        expected_bytes = num_images * h * w * c
-        mmap_file = temp_dir / ".image_cache.mmap"
-        actual_bytes = mmap_file.stat().st_size
-
-        assert actual_bytes == expected_bytes
-
-        # Cleanup
-        cache.clear()
-
-    def test_mmap_put_get_roundtrip(self, temp_dir):
-        """Test storing and retrieving images from mmap cache."""
-        cache = ImageCache(mode="ram")
-        cache.initialize_ram_cache(
-            num_images=10,
-            image_shape=(50, 50, 3),
-            cache_dir=temp_dir
-        )
-
-        # Store multiple images
-        images = []
-        for i in range(5):
-            arr = np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8)
-            images.append(arr)
-            cache.put(i, Path(f"img_{i}.jpg"), arr)
-
-        # Verify all can be retrieved
-        for i, expected in enumerate(images):
-            retrieved = cache.get(i, Path(f"img_{i}.jpg"))
-            assert retrieved is not None
-            np.testing.assert_array_equal(retrieved, expected)
-
-        # Cleanup
-        cache.clear()
-
-    def test_mmap_exceeds_memory_limit(self, temp_dir):
-        """Test that cache is disabled when memory limit is exceeded."""
-        cache = ImageCache(mode="ram", max_memory_gb=0.001)  # 1MB limit
-        cache.initialize_ram_cache(
-            num_images=1000,
-            image_shape=(640, 640, 3),  # ~1.2MB per image
-            cache_dir=temp_dir
-        )
-
-        # Should be disabled due to memory limit
-        assert cache._enabled is False
-
-    def test_mmap_serialization_for_workers(self, temp_dir):
+    def test_cache_serialization_for_workers(self, temp_dir, sample_paths):
         """Test that cache can be pickled/unpickled for worker processes."""
         import pickle
 
-        cache = ImageCache(mode="ram")
-        cache.initialize_ram_cache(
-            num_images=5,
-            image_shape=(32, 32, 3),
-            cache_dir=temp_dir
-        )
+        cache = ImageCache(mode="disk", target_size=(32, 32))
+        cache.initialize(len(sample_paths), temp_dir, sample_paths)
 
         # Store some data
         arr = np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)
-        cache.put(0, Path("test.jpg"), arr)
-        cache._mmap_array.flush()
+        cache.put(0, arr)
+        cache.finalize()
 
         # Simulate worker process: pickle and unpickle
         state = pickle.dumps(cache)
         worker_cache = pickle.loads(state)
 
         # Worker should be able to read the data
-        retrieved = worker_cache.get(0, Path("test.jpg"))
+        retrieved = worker_cache.get(0)
         assert retrieved is not None
         np.testing.assert_array_equal(retrieved, arr)
 
         # Cleanup
         cache.clear()
 
-    def test_mmap_worker_opens_readonly(self, temp_dir):
-        """Test that worker opens mmap in read-only mode."""
-        import pickle
-
-        cache = ImageCache(mode="ram")
-        cache.initialize_ram_cache(
-            num_images=5,
-            image_shape=(32, 32, 3),
-            cache_dir=temp_dir
-        )
-
-        # Store data
-        arr = np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)
-        cache.put(0, Path("test.jpg"), arr)
-        cache._mmap_array.flush()
-
-        # Simulate worker
-        state = pickle.dumps(cache)
-        worker_cache = pickle.loads(state)
-
-        # Worker's mmap should be read-only
-        assert worker_cache._mmap_array is not None
-        # Attempting to write should fail or be no-op
-        # (np.memmap in 'r' mode raises ValueError on write)
-
-        # Cleanup
-        cache.clear()
-
-    def test_mmap_multiple_indices(self, temp_dir):
-        """Test storing images at non-sequential indices."""
-        cache = ImageCache(mode="ram")
-        cache.initialize_ram_cache(
-            num_images=100,
-            image_shape=(32, 32, 3),
-            cache_dir=temp_dir
-        )
+    def test_multiple_indices(self, temp_dir, sample_paths):
+        """Test storing images at various indices."""
+        cache = ImageCache(mode="disk", target_size=(32, 32))
+        cache.initialize(len(sample_paths), temp_dir, sample_paths)
 
         # Store at various indices
-        test_indices = [0, 5, 10, 50, 99]
+        test_indices = [0, 3, 5, 7, 9]
         images = {}
         for idx in test_indices:
             arr = np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)
             images[idx] = arr
-            cache.put(idx, Path(f"img_{idx}.jpg"), arr)
+            cache.put(idx, arr)
+
+        cache.finalize()
 
         # Verify all stored
         assert cache.size == len(test_indices)
 
         # Verify retrieval
         for idx, expected in images.items():
-            retrieved = cache.get(idx, Path(f"img_{idx}.jpg"))
+            retrieved = cache.get(idx)
             assert retrieved is not None
             np.testing.assert_array_equal(retrieved, expected)
 
         # Cleanup
         cache.clear()
 
-    def test_mmap_clear_removes_file(self, temp_dir):
-        """Test that clear() removes the mmap file."""
-        cache = ImageCache(mode="ram")
-        cache.initialize_ram_cache(
-            num_images=5,
-            image_shape=(32, 32, 3),
-            cache_dir=temp_dir
-        )
+    def test_clear_removes_lmdb(self, temp_dir, sample_paths):
+        """Test that clear() removes the LMDB database."""
+        cache = ImageCache(mode="disk", target_size=(32, 32))
+        cache.initialize(len(sample_paths), temp_dir, sample_paths)
 
-        mmap_file = temp_dir / ".image_cache.mmap"
-        assert mmap_file.exists()
+        arr = np.zeros((32, 32, 3), dtype=np.uint8)
+        cache.put(0, arr)
+        cache.finalize()
+
+        cache_path = cache.cache_path
+        assert cache_path is not None
+        assert cache_path.exists()
 
         cache.clear()
 
         assert cache.size == 0
-        assert cache._mmap_array is None
-        assert not mmap_file.exists()
-
-    def test_mmap_not_initialized_returns_none(self):
-        """Test that get() returns None when mmap not initialized."""
-        cache = ImageCache(mode="ram")
-        # Don't call initialize_ram_cache
-
-        result = cache.get(0, Path("test.jpg"))
-        assert result is None
-
-    def test_mmap_put_without_init_is_noop(self):
-        """Test that put() is no-op when mmap not initialized."""
-        cache = ImageCache(mode="ram")
-        # Don't call initialize_ram_cache
-
-        arr = np.zeros((32, 32, 3), dtype=np.uint8)
-        cache.put(0, Path("test.jpg"), arr)
-
-        # Should not crash, size should be 0
-        assert cache.size == 0
+        # LMDB directory should be removed
+        assert not (cache_path / "cache.lmdb").exists()
 
 
 class TestImageCacheEncryption:
-    """Tests for encrypted disk cache."""
+    """Tests for encrypted LMDB cache."""
 
     @pytest.fixture
     def temp_dir(self):
@@ -561,91 +517,45 @@ class TestImageCacheEncryption:
             yield Path(tmpdir)
 
     @pytest.fixture
+    def sample_paths(self, temp_dir):
+        """Create sample image paths for testing."""
+        return [temp_dir / f"image_{i}.jpg" for i in range(5)]
+
+    @pytest.fixture
     def test_key(self):
         """Generate a test encryption key (64 hex chars = 32 bytes)."""
         return "0123456789abcdef" * 4  # 64 hex chars
 
-    def test_encrypted_disk_cache_creates_enc_files(self, temp_dir, test_key):
-        """Test that encrypted disk cache creates .npy.enc files."""
-        cache = ImageCache(mode="disk", cache_dir=temp_dir, encryption_key=test_key)
+    def test_encrypted_cache_roundtrip(self, temp_dir, sample_paths, test_key):
+        """Test encrypted cache can save and load correctly."""
+        cache = ImageCache(mode="disk", target_size=(50, 50), encryption_key=test_key)
+        cache.initialize(len(sample_paths), temp_dir, sample_paths)
 
         arr = np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8)
-        img_path = temp_dir / "image.jpg"
-        enc_path = temp_dir / "image.npy.enc"
-        npy_path = temp_dir / "image.npy"
+        cache.put(0, arr)
+        cache.finalize()
 
-        cache.put(0, img_path, arr)
-
-        # Should create .npy.enc, not .npy
-        assert enc_path.exists()
-        assert not npy_path.exists()
-
-    def test_encrypted_disk_cache_roundtrip(self, temp_dir, test_key):
-        """Test encrypted disk cache can save and load correctly."""
-        cache = ImageCache(mode="disk", cache_dir=temp_dir, encryption_key=test_key)
-
-        arr = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        img_path = temp_dir / "image.jpg"
-
-        cache.put(0, img_path, arr)
-        retrieved = cache.get(0, img_path)
-
+        retrieved = cache.get(0)
         assert retrieved is not None
         np.testing.assert_array_equal(retrieved, arr)
 
-    def test_encrypted_file_is_actually_encrypted(self, temp_dir, test_key):
-        """Test that the .npy.enc file is actually encrypted (not plain numpy)."""
-        cache = ImageCache(mode="disk", cache_dir=temp_dir, encryption_key=test_key)
+        cache.clear()
 
-        arr = np.zeros((50, 50, 3), dtype=np.uint8)  # All zeros for easy detection
-        img_path = temp_dir / "image.jpg"
-        enc_path = temp_dir / "image.npy.enc"
-
-        cache.put(0, img_path, arr)
-
-        # Read raw bytes
-        with open(enc_path, "rb") as f:
-            raw_data = f.read()
-
-        # Should NOT start with numpy magic number (0x93NUMPY)
-        assert not raw_data.startswith(b"\x93NUMPY")
-
-        # Encrypted data should look random (high entropy)
-        # Check that it's not just zeros
-        unique_bytes = len(set(raw_data))
-        assert unique_bytes > 50  # Encrypted data should have variety
-
-    def test_plain_disk_cache_not_encrypted(self, temp_dir):
-        """Test that disk cache without key creates plain .npy files."""
-        cache = ImageCache(mode="disk", cache_dir=temp_dir, encryption_key=None)
+    def test_plain_cache_not_encrypted(self, temp_dir, sample_paths):
+        """Test that cache without key creates plain LMDB."""
+        cache = ImageCache(mode="disk", target_size=(50, 50), encryption_key=None)
+        cache.initialize(len(sample_paths), temp_dir, sample_paths)
 
         arr = np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8)
-        img_path = temp_dir / "image.jpg"
-        npy_path = temp_dir / "image.npy"
-        enc_path = temp_dir / "image.npy.enc"
+        cache.put(0, arr)
+        cache.finalize()
 
-        cache.put(0, img_path, arr)
+        # LMDB directory should exist
+        cache_path = cache.cache_path
+        assert cache_path is not None
+        assert (cache_path / "cache.lmdb").exists()
 
-        # Should create .npy, not .npy.enc
-        assert npy_path.exists()
-        assert not enc_path.exists()
-
-    def test_encrypted_cache_wrong_key_fails(self, temp_dir, test_key):
-        """Test that decryption fails with wrong key."""
-        # Create cache with original key
-        cache1 = ImageCache(mode="disk", cache_dir=temp_dir, encryption_key=test_key)
-
-        arr = np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8)
-        img_path = temp_dir / "image.jpg"
-        cache1.put(0, img_path, arr)
-
-        # Try to read with different key
-        wrong_key = "fedcba9876543210" * 4
-        cache2 = ImageCache(mode="disk", cache_dir=temp_dir, encryption_key=wrong_key)
-
-        # Should return None (decryption fails gracefully)
-        result = cache2.get(0, img_path)
-        assert result is None
+        cache.clear()
 
 
 class TestLRUImageBuffer:

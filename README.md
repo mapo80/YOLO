@@ -1140,8 +1140,14 @@ Labels are parsed from `.txt` files once and saved to a `.cache` file. On subseq
 | Mode | Description |
 |------|-------------|
 | `none` | No image caching (default) |
-| `ram` | Load all images to memory-mapped file (fastest, shared between workers) |
-| `disk` | Save decoded images as `.npy` files (moderate speedup, persistent) |
+| `ram` | Pre-fault all pages into memory for fastest access |
+| `disk` | Uses OS-managed memory-mapping for lazy loading |
+
+Both `ram` and `disk` modes use the same unified **LMDB** (Lightning Memory-Mapped Database) backend, providing:
+- Zero-copy reads via memory-mapping
+- Multi-process safe concurrent reads (DataLoader workers)
+- Efficient B+ tree indexing
+- Automatic page management
 
 **Configuration:**
 
@@ -1149,38 +1155,92 @@ Labels are parsed from `.txt` files once and saved to a `.cache` file. On subseq
 data:
   cache_labels: true           # Enable label caching (default: true)
   cache_images: none           # "none", "ram", or "disk"
+  cache_dir: null              # Directory for cache (null = alongside images)
   cache_resize_images: true    # Resize images to image_size when caching (saves RAM)
-  cache_max_memory_gb: 8.0     # Max RAM for image caching
+  cache_max_memory_gb: 8.0     # Max memory for image caching
+  cache_workers: null          # Parallel workers for caching (null = all CPU threads)
   cache_refresh: false         # Force cache regeneration
-  cache_encrypt: false         # Encrypt disk cache files (requires encryption_key)
+  cache_encrypt: false         # Encrypt cached values (requires encryption_key)
   encryption_key: null         # AES-256 key for encrypted images/cache
 ```
 
-**RAM Cache (Memory-Mapped):**
+#### Cache Architecture
 
-The RAM cache uses a memory-mapped file (`.image_cache.mmap`) that is shared between all DataLoader workers without serialization overhead. This allows using `num_workers > 0` with RAM caching for maximum throughput.
+```
+                         +----------------------------------------------------------+
+                         |                      ImageCache                          |
+                         |                    (Unified LMDB)                        |
+                         +----------------------------------------------------------+
+                                                  |
+                         +------------------------+------------------------+
+                         |                                                 |
+                         v                                                 v
+              +---------------------+                        +---------------------+
+              |     RAM Mode        |                        |     Disk Mode       |
+              |  (cache_images:ram) |                        | (cache_images:disk) |
+              +---------------------+                        +---------------------+
+                         |                                                 |
+                         v                                                 v
+              +---------------------+                        +---------------------+
+              |  Pre-fault pages    |                        |  Lazy OS-managed    |
+              |  into RAM at init   |                        |  memory-mapping     |
+              +---------------------+                        +---------------------+
+                         |                                                 |
+                         +------------------------+------------------------+
+                                                  |
+                                                  v
+                         +----------------------------------------------------------+
+                         |                      LMDB Storage                        |
+                         |  .yolo_cache_{suffix}/cache.lmdb/                        |
+                         |  +-- data.mdb      (memory-mapped data file)             |
+                         |  +-- lock.mdb      (lock file for concurrency)           |
+                         +----------------------------------------------------------+
+                                                  |
+                                                  v
+                         +----------------------------------------------------------+
+                         |                    Data Format                           |
+                         |  Key: image_index (e.g., "0", "1", "2", ...)             |
+                         |  Value: [header][array_bytes]                            |
+                         |         header = dtype_id(1B) + ndim(1B) + shape(4B x N) |
+                         |         (optionally AES-256 encrypted)                   |
+                         +----------------------------------------------------------+
+```
 
-- **Parallel loading**: Images are pre-loaded using all available CPU threads for maximum caching speed
-- All workers access the same memory-mapped file
+**RAM Mode:**
+
+The RAM cache pre-faults all pages into memory during initialization, ensuring fastest possible access. All DataLoader workers share the same memory-mapped LMDB database without serialization overhead.
+
+- **Parallel loading**: Images are pre-loaded using multiple threads
+  - By default, uses all CPU threads (`os.cpu_count()`)
+  - Control with `cache_workers` parameter
+- All workers access the same LMDB database
 - No serialization delays when spawning workers
-- File is automatically cleaned up after training
+- Data persists between training runs
+
+**Disk Mode:**
+
+The disk cache uses OS-managed memory-mapping with lazy loading. Pages are loaded into memory only when accessed, making it suitable for datasets larger than available RAM.
+
+- **Lazy loading**: Only accessed pages are loaded into memory
+- **OS-managed**: The operating system handles page caching
+- **Persistent**: Cache survives restarts and can be reused
 
 **Image Resize During Caching:**
 
 When `cache_resize_images: true` (default), images are resized to `image_size` during caching. This significantly reduces memory usage - a 4K image (4000x3000) takes ~36MB in RAM, but resized to 640x640 only ~1.2MB. The resize uses letterbox padding to preserve aspect ratio.
 
-**Encrypted Disk Cache:**
+**Encrypted Cache:**
 
-When using encrypted images with disk caching, enable `cache_encrypt` to encrypt the cache files:
+When using encrypted images, enable `cache_encrypt` to encrypt the cached values:
 
 ```yaml
 data:
   cache_images: disk
-  cache_encrypt: true          # Encrypt disk cache as .npy.enc files
+  cache_encrypt: true          # Encrypt cached array values
   encryption_key: "your-64-char-hex-key"  # Or use YOLO_ENCRYPTION_KEY env var
 ```
 
-This prevents cached images from being stored in plain format on disk.
+This ensures cached images are encrypted in the LMDB database, maintaining security for sensitive datasets. Note: LMDB metadata (keys, sizes) remains visible; only values are encrypted.
 
 **CLI override:**
 
@@ -1188,14 +1248,23 @@ This prevents cached images from being stored in plain format on disk.
 # Disable label caching
 python -m yolo.cli fit --config config.yaml --data.cache_labels=false
 
-# Enable RAM image caching (memory-mapped, works with num_workers > 0)
+# Enable RAM image caching (LMDB, fastest access)
 python -m yolo.cli fit --config config.yaml --data.cache_images=ram
+
+# Enable disk image caching (LMDB, lazy loading)
+python -m yolo.cli fit --config config.yaml --data.cache_images=disk
 
 # Disable image resize during caching (use original resolution)
 python -m yolo.cli fit --config config.yaml --data.cache_resize_images=false
 
-# Enable encrypted disk cache
+# Enable encrypted cache
 python -m yolo.cli fit --config config.yaml --data.cache_images=disk --data.cache_encrypt=true
+
+# Use custom directory for cache (useful for faster storage)
+python -m yolo.cli fit --config config.yaml --data.cache_images=disk --data.cache_dir=/tmp/yolo_cache
+
+# Control number of parallel workers for caching (null = all CPU threads)
+python -m yolo.cli fit --config config.yaml --data.cache_workers=16
 
 # Force cache regeneration (delete and rebuild)
 python -m yolo.cli fit --config config.yaml --data.cache_refresh=true

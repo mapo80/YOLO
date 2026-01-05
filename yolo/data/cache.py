@@ -166,22 +166,35 @@ class DatasetCache:
 
 class ImageCache:
     """
-    Optional image caching for faster data loading.
+    Unified image caching for faster data loading using LMDB.
 
-    Supports two caching modes:
-    - RAM: Keep decoded images in shared memory (fastest, uses SharedMemoryCache)
-    - Disk: Save decoded images as .npy files (moderate speedup, persistent)
+    Supports two caching modes with the same underlying LMDB storage:
+    - RAM: Pre-faults all pages into memory for fastest access
+    - Disk: Uses OS-managed memory-mapping for lazy loading
 
-    For encrypted images, disk cache can also be encrypted using AES-256.
-
-    RAM cache uses memory-mapped shared memory that can be accessed by all
-    DataLoader workers without serialization overhead.
+    LMDB (Lightning Memory-Mapped Database) provides:
+    - Zero-copy reads via memory-mapping
+    - Multi-process safe concurrent reads
+    - Efficient B+ tree indexing
+    - Automatic page management
 
     Attributes:
         mode: Caching mode ('none', 'ram', or 'disk').
         target_size: Target image size (width, height) for resizing, or None for original.
-        encrypt_disk_cache: Whether to encrypt disk cache files.
     """
+
+    # Cache version for compatibility checking
+    CACHE_VERSION = "3.0.0"
+
+    # Dtype mapping for efficient serialization
+    DTYPE_TO_ID = {
+        np.dtype("uint8"): 0,
+        np.dtype("float32"): 1,
+        np.dtype("float64"): 2,
+        np.dtype("int32"): 3,
+        np.dtype("int64"): 4,
+    }
+    ID_TO_DTYPE = {v: k for k, v in DTYPE_TO_ID.items()}
 
     def __init__(
         self,
@@ -190,118 +203,387 @@ class ImageCache:
         max_memory_gb: float = 8.0,
         target_size: Optional[Tuple[int, int]] = None,
         encryption_key: Optional[str] = None,
+        cache_suffix: Optional[str] = None,
     ):
         """
         Initialize image cache.
 
         Args:
             mode: Caching mode - 'none', 'ram', or 'disk'.
-            cache_dir: Directory for disk cache (only used in disk mode).
-            max_memory_gb: Maximum RAM to use for caching (only used in ram mode).
+            cache_dir: Directory for cache storage.
+            max_memory_gb: Maximum memory to use for caching.
             target_size: Target image size (width, height) for resizing. None = keep original size.
-            encryption_key: Hex-encoded AES-256 key for encrypting disk cache.
-                If provided, disk cache files will be saved as .npy.enc (encrypted).
-                If None, disk cache files will be saved as plain .npy files.
+            encryption_key: Hex-encoded AES-256 key for encrypting cached values.
+            cache_suffix: Optional suffix for cache folder (e.g., "640x640_f0.1").
         """
         self.mode = mode
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.max_memory_gb = max_memory_gb
         self.target_size = target_size
+        self.cache_suffix = cache_suffix
         self._enabled = mode != "none"
 
-        # RAM cache: use memory-mapped file for sharing between workers
-        self._mmap_file: Optional[Path] = None
-        self._mmap_array: Optional[np.ndarray] = None
-        self._mmap_index: Dict[int, int] = {}  # idx -> position in mmap
-        self._cache_count = 0
+        # LMDB environment
+        self._env = None
+        self._db_path: Optional[Path] = None
+        self._cache_dir_path: Optional[Path] = None
+        self._num_images: int = 0
+        self._cached_indices: set = set()
+        self._initialized = False
 
-        # Setup encryption for disk cache
+        # Setup encryption
         self._crypto = None
-        self._encrypt_disk_cache = False
-        if encryption_key is not None and mode == "disk":
+        self._encrypt_cache = False
+        if encryption_key is not None and mode != "none":
             from yolo.data.crypto import CryptoManager
             self._crypto = CryptoManager(key_hex=encryption_key)
-            self._encrypt_disk_cache = True
-            logger.info("🔒 Disk cache encryption enabled")
+            self._encrypt_cache = True
+            logger.info("Disk cache encryption enabled")
 
-    def initialize_ram_cache(self, num_images: int, image_shape: Tuple[int, int, int], cache_dir: Path) -> None:
+    def _build_cache_dir(self, base_dir: Path) -> Path:
+        """Build cache directory path with optional suffix."""
+        cache_folder_name = ".yolo_cache"
+        if self.cache_suffix:
+            cache_folder_name = f".yolo_cache_{self.cache_suffix}"
+
+        if self.cache_dir is not None:
+            return Path(self.cache_dir) / cache_folder_name
+        return base_dir / cache_folder_name
+
+    def initialize(
+        self,
+        num_images: int,
+        cache_dir: Path,
+        paths: List[Path],
+    ) -> bool:
         """
-        Initialize memory-mapped file for RAM cache.
+        Initialize LMDB cache.
 
-        This creates a single large memory-mapped file that all workers can access
-        without serialization overhead.
+        Creates or opens an LMDB database for caching images.
+        Both RAM and Disk modes use the same LMDB format.
 
         Args:
             num_images: Number of images to cache
-            image_shape: Shape of each image (H, W, C)
-            cache_dir: Directory to store the memory-mapped file
+            cache_dir: Directory for cache storage
+            paths: Image paths (for validation)
+
+        Returns:
+            True if cache exists and is valid (reuse), False if needs building
         """
-        if self.mode != "ram":
-            return
+        if self.mode == "none":
+            return False
 
-        # Create cache file path
-        self._mmap_file = cache_dir / ".image_cache.mmap"
+        import lmdb
 
-        # Calculate total size
-        h, w, c = image_shape
-        bytes_per_image = h * w * c
-        total_bytes = num_images * bytes_per_image
+        self._num_images = num_images
+        self._cache_dir_path = self._build_cache_dir(cache_dir)
+        self._cache_dir_path.mkdir(parents=True, exist_ok=True)
+        self._db_path = self._cache_dir_path / "cache.lmdb"
 
-        # Check memory limit
-        total_gb = total_bytes / (1024**3)
-        if total_gb > self.max_memory_gb:
+        # Estimate map size (LMDB requires pre-allocation)
+        map_size = self._estimate_map_size(num_images, paths)
+
+        # Check memory limit for RAM mode
+        map_size_gb = map_size / (1024**3)
+        if self.mode == "ram" and map_size_gb > self.max_memory_gb:
             logger.warning(
-                f"⚠️ RAM cache would use {total_gb:.1f}GB, exceeding limit of {self.max_memory_gb:.1f}GB. "
-                f"Disabling RAM cache."
+                f"Cache would use {map_size_gb:.1f}GB, exceeding limit of {self.max_memory_gb:.1f}GB. "
+                f"Disabling cache."
             )
             self._enabled = False
+            return False
+
+        # Check if valid cache exists
+        if self._validate_existing_cache(paths):
+            self._open_db(readonly=True)
+            self._load_cached_indices()
+            self._initialized = True
+            return True
+
+        # Create new cache - clear old one first
+        if self._db_path.exists():
+            import shutil
+            shutil.rmtree(self._db_path)
+
+        self._open_db(readonly=False, map_size=map_size)
+        self._save_metadata(paths)
+        self._cached_indices.clear()
+        self._initialized = True
+        return False
+
+    def _estimate_map_size(self, num_images: int, paths: List[Path]) -> int:
+        """Estimate LMDB map size based on image count and sizes."""
+        if self.target_size is not None:
+            w, h = self.target_size
+            bytes_per_image = w * h * 3 + 32  # RGB + header overhead
+        else:
+            # Estimate from sample or use default
+            bytes_per_image = 640 * 640 * 3 + 32  # Default estimate
+
+        # Add 50% margin for LMDB overhead and growth
+        total_size = int(num_images * bytes_per_image * 1.5)
+
+        # Minimum 100MB, maximum based on available space
+        return max(100 * 1024 * 1024, total_size)
+
+    def _validate_existing_cache(self, paths: List[Path]) -> bool:
+        """Check if existing cache is valid."""
+        if not self._db_path or not self._db_path.exists():
+            return False
+
+        try:
+            import lmdb
+
+            env = lmdb.open(
+                str(self._db_path),
+                readonly=True,
+                lock=False,
+                readahead=False,
+            )
+
+            with env.begin() as txn:
+                # Check metadata
+                meta_data = txn.get(b"__metadata__")
+                if meta_data is None:
+                    env.close()
+                    return False
+
+                meta = pickle.loads(meta_data)
+
+                # Validate version
+                if meta.get("version") != self.CACHE_VERSION:
+                    logger.debug(f"Cache version mismatch: {meta.get('version')}")
+                    env.close()
+                    return False
+
+                # Validate suffix
+                if meta.get("cache_suffix") != self.cache_suffix:
+                    logger.debug("Cache suffix mismatch")
+                    env.close()
+                    return False
+
+                # Validate number of images
+                if meta.get("num_images") != len(paths):
+                    logger.debug("Cache image count mismatch")
+                    env.close()
+                    return False
+
+                # Validate path hash
+                expected_hash = self._compute_paths_hash(paths)
+                if meta.get("paths_hash") != expected_hash:
+                    logger.debug("Cache paths hash mismatch")
+                    env.close()
+                    return False
+
+            env.close()
+            return True
+
+        except Exception as e:
+            logger.debug(f"Cache validation failed: {e}")
+            return False
+
+    def _compute_paths_hash(self, paths: List[Path]) -> str:
+        """Compute hash of image paths for validation."""
+        hasher = hashlib.md5()
+        for path in sorted(paths):
+            hasher.update(str(path).encode())
+        return hasher.hexdigest()
+
+    def _open_db(self, readonly: bool, map_size: int = 0):
+        """Open LMDB environment."""
+        import lmdb
+
+        self._env = lmdb.open(
+            str(self._db_path),
+            map_size=map_size if not readonly else 0,
+            readonly=readonly,
+            lock=not readonly,
+            readahead=self.mode == "disk",  # Disk mode benefits from readahead
+            meminit=False,  # Don't zero-init for performance
+            max_dbs=0,
+        )
+
+        # RAM mode: pre-fault pages into memory
+        if self.mode == "ram" and not readonly:
+            self._prefault_pages()
+
+    def _prefault_pages(self):
+        """Pre-fault all pages into RAM for faster access."""
+        if self._env is None:
             return
 
-        # Create memory-mapped file
-        logger.debug(f"Creating memory-mapped cache: {self._mmap_file} ({total_gb:.2f}GB)")
+        try:
+            # Read through all data to bring into page cache
+            with self._env.begin() as txn:
+                cursor = txn.cursor()
+                for key, value in cursor:
+                    pass  # Just iterate to fault pages
+            logger.debug("Pre-faulted cache pages into RAM")
+        except Exception as e:
+            logger.debug(f"Failed to pre-fault pages: {e}")
 
-        # Create the file with the right size
-        self._mmap_array = np.memmap(
-            str(self._mmap_file),
-            dtype=np.uint8,
-            mode="w+",
-            shape=(num_images, h, w, c),
-        )
-        self._image_shape = image_shape
+    def _save_metadata(self, paths: List[Path]) -> None:
+        """Save cache metadata."""
+        if self._env is None:
+            return
+
+        meta = {
+            "version": self.CACHE_VERSION,
+            "cache_suffix": self.cache_suffix,
+            "num_images": len(paths),
+            "paths_hash": self._compute_paths_hash(paths),
+            "target_size": self.target_size,
+        }
+
+        with self._env.begin(write=True) as txn:
+            txn.put(b"__metadata__", pickle.dumps(meta))
+
+    def _load_cached_indices(self) -> None:
+        """Load set of cached image indices from LMDB."""
+        if self._env is None:
+            return
+
+        self._cached_indices.clear()
+        with self._env.begin() as txn:
+            cursor = txn.cursor()
+            for key, _ in cursor:
+                if key != b"__metadata__":
+                    try:
+                        idx = int(key.decode())
+                        self._cached_indices.add(idx)
+                    except (ValueError, UnicodeDecodeError):
+                        pass
+
+    def finalize(self) -> None:
+        """Finalize cache after all images have been written."""
+        if self._env is not None:
+            self._env.sync()
+
+            # Re-open as readonly for all modes (safer for concurrent reads)
+            self._env.close()
+            self._open_db(readonly=True)
+            self._load_cached_indices()
+
+            # For RAM mode, prefault pages into memory
+            if self.mode == "ram":
+                self._prefault_pages()
+
+    @property
+    def cache_path(self) -> Optional[Path]:
+        """Get the cache directory path."""
+        return self._cache_dir_path
 
     def __getstate__(self) -> Dict[str, Any]:
-        """
-        Prepare state for pickling (spawn multiprocessing).
-
-        For RAM cache, we pass the mmap file path so workers can open it.
-        """
+        """Prepare state for pickling (spawn multiprocessing)."""
         state = self.__dict__.copy()
-        # Don't serialize the actual mmap array - workers will open it themselves
-        state["_mmap_array"] = None
+        # Don't serialize LMDB env - workers will re-open it
+        state["_env"] = None
+        state["_crypto"] = None  # Will be re-initialized if needed
         return state
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
         """Restore state after unpickling."""
         self.__dict__.update(state)
 
-        # Re-open memory-mapped file in worker
-        if self.mode == "ram" and self._mmap_file is not None and self._mmap_file.exists():
+        # Re-open LMDB in read-only mode for workers
+        if self._initialized and self._db_path is not None and self._db_path.exists():
             try:
-                # Open in read mode for workers
-                shape = (len(self._mmap_index), *self._image_shape)
-                self._mmap_array = np.memmap(
-                    str(self._mmap_file),
-                    dtype=np.uint8,
-                    mode="r",
-                    shape=shape,
-                )
+                self._open_db(readonly=True)
             except Exception as e:
-                logger.warning(f"Failed to open mmap cache in worker: {e}")
-                self._mmap_array = None
+                logger.warning(f"Failed to open cache in worker: {e}")
+                self._env = None
 
         # Re-initialize crypto if needed
-        if hasattr(self, "_encrypt_disk_cache") and self._encrypt_disk_cache:
+        if self._encrypt_cache:
+            # Note: encryption_key needs to be passed separately or stored
             self._crypto = None
+
+    def _serialize(self, arr: np.ndarray) -> bytes:
+        """Serialize numpy array to bytes with compact header."""
+        import struct
+
+        # Header: dtype_id (1 byte) + ndim (1 byte) + shape (4 bytes each dim)
+        # Use < for little-endian to avoid struct padding issues
+        dtype_id = self.DTYPE_TO_ID.get(arr.dtype, 0)
+        header = struct.pack(f"<BB{arr.ndim}I", dtype_id, arr.ndim, *arr.shape)
+        data = header + arr.tobytes()
+
+        if self._encrypt_cache and self._crypto is not None:
+            data = self._crypto.encrypt(data)
+
+        return data
+
+    def _deserialize(self, data: bytes) -> np.ndarray:
+        """Deserialize bytes to numpy array."""
+        import struct
+
+        if self._encrypt_cache and self._crypto is not None:
+            data = self._crypto.decrypt(data)
+
+        # Parse header (little-endian)
+        dtype_id, ndim = struct.unpack("<BB", data[:2])
+        shape = struct.unpack(f"<{ndim}I", data[2:2 + 4 * ndim])
+        dtype = self.ID_TO_DTYPE.get(dtype_id, np.dtype("uint8"))
+
+        # Extract array data
+        arr_data = data[2 + 4 * ndim:]
+        return np.frombuffer(arr_data, dtype=dtype).reshape(shape)
+
+    def get(self, idx: int) -> Optional[np.ndarray]:
+        """
+        Get cached image by index.
+
+        Args:
+            idx: Image index.
+
+        Returns:
+            Cached image array or None if not cached.
+        """
+        if not self._enabled or self._env is None:
+            return None
+
+        if idx not in self._cached_indices:
+            return None
+
+        try:
+            key = str(idx).encode()
+            with self._env.begin(buffers=True) as txn:
+                value = txn.get(key)
+                if value is None:
+                    return None
+                return self._deserialize(bytes(value))
+        except Exception as e:
+            logger.debug(f"Failed to read from cache: {e}")
+            return None
+
+    def put(self, idx: int, arr: np.ndarray) -> None:
+        """
+        Store image in cache.
+
+        Args:
+            idx: Image index.
+            arr: Image array to cache.
+        """
+        if not self._enabled or self._env is None:
+            return
+
+        if idx in self._cached_indices:
+            return  # Already cached
+
+        try:
+            key = str(idx).encode()
+            value = self._serialize(arr)
+
+            with self._env.begin(write=True) as txn:
+                txn.put(key, value)
+
+            self._cached_indices.add(idx)
+        except Exception as e:
+            logger.debug(f"Failed to write to cache: {e}")
+
+    def is_cached(self, idx: int) -> bool:
+        """Check if an image is cached."""
+        return idx in self._cached_indices
 
     def estimate_memory(
         self,
@@ -312,13 +594,10 @@ class ImageCache:
         """
         Estimate memory required to cache all images.
 
-        Samples a subset of images to estimate total memory requirements.
-        If target_size is set, estimates based on resized dimensions.
-
         Args:
             paths: List of image paths.
             sample_size: Number of images to sample for estimation.
-            image_loader: Optional custom image loader (e.g., for encrypted images).
+            image_loader: Optional custom image loader.
 
         Returns:
             Estimated memory in GB.
@@ -334,11 +613,6 @@ class ImageCache:
             w, h = self.target_size
             bytes_per_image = w * h * 3  # RGB
             estimated_gb = (bytes_per_image * len(paths) * 1.2) / (1024**3)
-            logger.debug(
-                f"Memory estimate (resized to {w}x{h}): "
-                f"{bytes_per_image/1024/1024:.1f}MB/img, "
-                f"total {estimated_gb:.1f}GB for {len(paths)} images"
-            )
             return estimated_gb
 
         # Sample from paths to estimate original image sizes
@@ -350,7 +624,6 @@ class ImageCache:
         for path in samples:
             try:
                 path_str = str(path)
-                # Use custom loader if provided (for encrypted images)
                 if image_loader is not None:
                     img = image_loader(path_str)
                     w, h = img.size
@@ -358,146 +631,47 @@ class ImageCache:
                 else:
                     with Image.open(path_str) as img:
                         w, h = img.size
-                # Estimate bytes: width * height * channels (assume 3 for RGB)
                 total_bytes += w * h * 3
                 valid_samples += 1
-            except Exception as e:
-                logger.debug(f"Failed to sample image {path}: {e}")
+            except Exception:
                 continue
 
         if valid_samples == 0:
-            logger.warning("Could not sample any images for memory estimation")
             return 0.0
 
-        # Average bytes per image * total images * safety margin (1.2x)
         avg_bytes = total_bytes / valid_samples
         estimated_gb = (avg_bytes * len(paths) * 1.2) / (1024**3)
-
-        logger.debug(
-            f"Memory estimate: {valid_samples} samples, "
-            f"avg {avg_bytes/1024/1024:.1f}MB/img, "
-            f"total {estimated_gb:.1f}GB for {len(paths)} images"
-        )
-
         return estimated_gb
 
     def can_cache_in_ram(self, estimated_gb: float) -> bool:
-        """
-        Check if there's enough RAM for caching.
-
-        Args:
-            estimated_gb: Estimated memory requirement in GB.
-
-        Returns:
-            True if caching is feasible.
-        """
+        """Check if there's enough RAM for caching."""
         try:
             import psutil
-
             available_gb = psutil.virtual_memory().available / (1024**3)
-            # Use at most 80% of available RAM or max_memory_gb, whichever is smaller
             max_allowed = min(self.max_memory_gb, available_gb * 0.8)
             return estimated_gb < max_allowed
         except ImportError:
-            logger.warning("psutil not available, assuming RAM caching is feasible")
             return estimated_gb < self.max_memory_gb
 
-    def _get_cache_path(self, path: Path) -> Path:
-        """Get cache file path for an image."""
-        if self._encrypt_disk_cache:
-            return path.with_suffix(".npy.enc")
-        return path.with_suffix(".npy")
-
-    def get(self, idx: int, path: Path) -> Optional[np.ndarray]:
-        """
-        Get cached image if available.
-
-        Args:
-            idx: Image index.
-            path: Original image path (used for disk cache lookup).
-
-        Returns:
-            Cached image array or None if not cached.
-        """
-        if not self._enabled:
-            return None
-
-        if self.mode == "ram":
-            # Use memory-mapped array
-            if self._mmap_array is not None and idx in self._mmap_index:
-                pos = self._mmap_index[idx]
-                return np.array(self._mmap_array[pos])  # Copy from mmap
-            return None
-
-        if self.mode == "disk":
-            cache_path = self._get_cache_path(path)
-            if cache_path.exists():
-                try:
-                    if self._encrypt_disk_cache:
-                        # Load and decrypt
-                        with open(cache_path, "rb") as f:
-                            encrypted_data = f.read()
-                        return self._crypto.decrypt_array(encrypted_data)
-                    else:
-                        return np.load(cache_path)
-                except Exception:
-                    return None
-
-        return None
-
-    def put(self, idx: int, path: Path, arr: np.ndarray) -> None:
-        """
-        Store image in cache.
-
-        Args:
-            idx: Image index.
-            path: Original image path (used for disk cache path).
-            arr: Image array to cache.
-        """
-        if not self._enabled:
-            return
-
-        if self.mode == "ram":
-            # Store in memory-mapped array
-            if self._mmap_array is not None and idx not in self._mmap_index:
-                pos = self._cache_count
-                if pos < len(self._mmap_array):
-                    self._mmap_array[pos] = arr
-                    self._mmap_index[idx] = pos
-                    self._cache_count += 1
-
-        elif self.mode == "disk":
-            cache_path = self._get_cache_path(path)
-            try:
-                if self._encrypt_disk_cache:
-                    # Encrypt and save
-                    encrypted_data = self._crypto.encrypt_array(arr)
-                    with open(cache_path, "wb") as f:
-                        f.write(encrypted_data)
-                else:
-                    np.save(cache_path, arr, allow_pickle=False)
-            except Exception as e:
-                logger.debug(f"Failed to cache image to disk: {e}")
-
     def clear(self) -> None:
-        """Clear RAM cache and remove mmap file."""
-        self._mmap_index.clear()
-        self._cache_count = 0
-        if self._mmap_array is not None:
-            del self._mmap_array
-            self._mmap_array = None
-        if self._mmap_file is not None and self._mmap_file.exists():
+        """Clear cache and remove cache files."""
+        self._cached_indices.clear()
+
+        if self._env is not None:
+            self._env.close()
+            self._env = None
+
+        if self._db_path is not None and self._db_path.exists():
+            import shutil
             try:
-                self._mmap_file.unlink()
+                shutil.rmtree(self._db_path)
             except Exception:
                 pass
 
     @property
     def size(self) -> int:
         """Get number of cached items."""
-        if self.mode == "ram":
-            return len(self._mmap_index)
-        return 0
+        return len(self._cached_indices)
 
 
 class LRUImageBuffer:

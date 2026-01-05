@@ -184,6 +184,7 @@ class YOLODataModule(L.LightningDataModule):
         cache_images: Image caching mode - 'none', 'ram', or 'disk' (default: 'none')
         cache_resize_images: Resize images to image_size when caching (default: True, saves RAM)
         cache_max_memory_gb: Maximum RAM for image caching in GB (default: 8.0)
+        cache_workers: Number of parallel workers for caching (default: None = all CPU threads)
         cache_refresh: Force cache regeneration (default: False)
     """
 
@@ -232,8 +233,10 @@ class YOLODataModule(L.LightningDataModule):
         # Caching parameters
         cache_labels: bool = True,
         cache_images: Literal["none", "ram", "disk"] = "none",
+        cache_dir: Optional[str] = None,  # None = same as images directory
         cache_resize_images: bool = True,
         cache_max_memory_gb: float = 8.0,
+        cache_workers: Optional[int] = None,  # None = auto (all CPU threads)
         cache_refresh: bool = False,
         cache_encrypt: bool = False,
         # Encryption key for encrypted images (.enc) and/or encrypted cache
@@ -290,12 +293,26 @@ class YOLODataModule(L.LightningDataModule):
 
             # Determine target size for caching (None = original size)
             target_size = image_size if self.hparams.cache_resize_images else None
+
+            # Determine cache directory (custom or default to dataset root)
+            cache_directory = Path(self.hparams.cache_dir) if self.hparams.cache_dir else root
+
+            # Build cache suffix to differentiate caches with different settings
+            # Format: "{width}x{height}_f{fraction}" e.g., "640x640_f1.0" or "640x640_f0.1"
+            data_fraction = self.hparams.data_fraction
+            if target_size:
+                size_str = f"{target_size[0]}x{target_size[1]}"
+            else:
+                size_str = "orig"
+            cache_suffix = f"{size_str}_f{data_fraction}"
+
             image_cache = ImageCache(
                 mode=self.hparams.cache_images,
-                cache_dir=root,
+                cache_dir=cache_directory,
                 max_memory_gb=self.hparams.cache_max_memory_gb,
                 target_size=target_size,
                 encryption_key=cache_encryption_key,
+                cache_suffix=cache_suffix,
             )
 
         # Get data fraction for sampling
@@ -316,6 +333,7 @@ class YOLODataModule(L.LightningDataModule):
                     cache_refresh=self.hparams.cache_refresh,
                     image_cache=image_cache,
                     data_fraction=data_fraction,
+                    cache_workers=self.hparams.cache_workers,
                 )
             else:
                 base_train_dataset = CocoDetectionWrapper(
@@ -326,6 +344,7 @@ class YOLODataModule(L.LightningDataModule):
                     image_loader=self._image_loader,
                     image_cache=image_cache,
                     data_fraction=data_fraction,
+                    cache_workers=self.hparams.cache_workers,
                 )
 
             # Create post-mosaic transforms (applied after multi-image augmentation)
@@ -551,6 +570,7 @@ class CocoDetectionWrapper(CocoDetection):
         image_cache: Optional ImageCache for caching decoded images in RAM/disk
         data_fraction: Fraction of data to use (default: 1.0). Uses stratified
             sampling by primary class to maintain class distribution.
+        cache_workers: Number of parallel workers for caching (None = all CPU threads)
     """
 
     def __init__(
@@ -562,11 +582,13 @@ class CocoDetectionWrapper(CocoDetection):
         image_loader: Optional[ImageLoader] = None,
         image_cache: Optional[Any] = None,
         data_fraction: float = 1.0,
+        cache_workers: Optional[int] = None,
     ):
         super().__init__(root, annFile)
         self._transforms = transforms
         self.image_size = image_size
         self._image_cache = image_cache
+        self._cache_workers = cache_workers
 
         # Build category_id to 0-indexed class mapping from COCO categories
         # This handles both standard COCO (1-indexed) and custom datasets
@@ -582,8 +604,8 @@ class CocoDetectionWrapper(CocoDetection):
         if data_fraction < 1.0:
             self._apply_stratified_sampling(data_fraction)
 
-        # Pre-cache images if using RAM cache
-        if self._image_cache is not None and self._image_cache.mode == "ram":
+        # Pre-cache images if using RAM or disk cache
+        if self._image_cache is not None and self._image_cache.mode in ("ram", "disk"):
             self._precache_images()
 
     def __getstate__(self) -> Dict[str, Any]:
@@ -672,9 +694,11 @@ class CocoDetectionWrapper(CocoDetection):
         )
 
     def _precache_images(self) -> None:
-        """Pre-load all images into memory-mapped RAM cache (parallelized)."""
+        """Pre-load all images into cache (RAM or disk, parallelized)."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from yolo.utils.progress import progress_bar, console
+
+        cache_mode = self._image_cache.mode
 
         # Get all image paths
         image_paths = []
@@ -682,60 +706,52 @@ class CocoDetectionWrapper(CocoDetection):
             path = self.coco.loadImgs(id)[0]["file_name"]
             image_paths.append(Path(os.path.join(self.root, path)))
 
-        # Determine image shape for mmap
-        target_size = self._image_cache.target_size
-        if target_size:
-            # Fixed size when resizing
-            w, h = target_size
-            image_shape = (h, w, 3)  # HWC format
-            size_info = f"resized to {w}x{h}"
-        else:
-            # Sample first image to get shape
-            first_img = self._image_loader(str(image_paths[0]))
-            w, h = first_img.size
-            image_shape = (h, w, 3)
-            size_info = f"original size {w}x{h}"
-
-        # Calculate memory
-        bytes_per_image = image_shape[0] * image_shape[1] * image_shape[2]
-        estimated_gb = (bytes_per_image * len(self.ids)) / (1024**3)
-
-        if not self._image_cache.can_cache_in_ram(estimated_gb):
-            logger.warning(
-                f"⚠️ Estimated {estimated_gb:.1f}GB needed for image cache, "
-                f"but max allowed is {self._image_cache.max_memory_gb:.1f}GB. "
-                f"Disabling image caching."
-            )
-            self._image_cache = None
-            return
-
-        # Initialize memory-mapped cache
-        cache_dir = Path(self.root)
-        self._image_cache.initialize_ram_cache(len(self.ids), image_shape, cache_dir)
+        # Initialize unified LMDB cache
+        dataset_root = Path(self.root)
+        cache_exists = self._image_cache.initialize(
+            num_images=len(image_paths),
+            cache_dir=dataset_root,
+            paths=image_paths,
+        )
+        cache_location = self._image_cache.cache_path or "alongside images"
 
         if not self._image_cache._enabled:
             self._image_cache = None
             return
 
+        if cache_exists:
+            console.print(f"[green]✓[/green] {cache_mode.upper()} cache: all {len(image_paths)} images already cached ({cache_location})")
+            return
+
+        # All images need to be cached
+        work_items = [(idx, path) for idx, path in enumerate(image_paths)]
+        cache_desc = f"Creating {cache_mode} cache ({len(image_paths)} images)"
+
+        # Determine size info for display
+        target_size = self._image_cache.target_size
+        if target_size:
+            w, h = target_size
+            size_info = f"resized to {w}x{h}"
+        else:
+            first_img = self._image_loader(str(image_paths[0]))
+            w, h = first_img.size
+            size_info = f"original size {w}x{h}"
+
         # Determine number of workers for parallel loading
-        num_workers = os.cpu_count() or 4  # Use all available CPUs for I/O-bound caching
+        num_workers = self._cache_workers if self._cache_workers is not None else (os.cpu_count() or 4)
 
-        console.print(f"\n[bold]📦 Pre-caching {len(self.ids)} images[/bold] ({estimated_gb:.1f}GB, {size_info}, {num_workers} workers)")
-
-        # Prepare work items
-        work_items = [(idx, image_paths[idx], target_size) for idx in range(len(self.ids))]
+        # Display cache info
+        enc_info = ", encrypted" if self._image_cache._encrypt_cache else ""
+        console.print(f"\n[bold]💾 Pre-caching {len(work_items)} images[/bold] ({size_info}{enc_info}, {num_workers} workers)")
+        console.print(f"   Cache location: {cache_location}")
 
         # Use ThreadPoolExecutor for parallel I/O
-        # Threads work well here because:
-        # 1. PIL/OpenCV release GIL during I/O and decoding
-        # 2. We're writing to a memory-mapped file (kernel handles sync)
-        # 3. No pickle overhead like ProcessPoolExecutor
         failed_count = 0
-        with progress_bar(len(work_items), "Caching images") as update:
+        with progress_bar(len(work_items), cache_desc) as update:
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
                 futures = {
                     executor.submit(self._load_and_cache_image, idx, path, target_size): idx
-                    for idx, path, target_size in work_items
+                    for idx, path in work_items
                 }
 
                 for future in as_completed(futures):
@@ -743,16 +759,15 @@ class CocoDetectionWrapper(CocoDetection):
                         future.result()
                     except Exception as e:
                         failed_count += 1
-                        if failed_count <= 3:  # Only log first 3 failures
+                        if failed_count <= 3:
                             logger.warning(f"Failed to cache image: {e}")
                     update(1)
 
-        # Flush mmap to disk
-        if self._image_cache._mmap_array is not None:
-            self._image_cache._mmap_array.flush()
-
+        # Finalize cache
+        self._image_cache.finalize()
         cached_count = self._image_cache.size
-        console.print(f"[green]✓[/green] Cached {cached_count} images to RAM (memory-mapped)")
+        console.print(f"[green]✓[/green] Cached {cached_count} images to {cache_mode.upper()} (LMDB)")
+
         if failed_count > 0:
             console.print(f"[yellow]⚠[/yellow] {failed_count} images failed to cache")
 
@@ -762,7 +777,7 @@ class CocoDetectionWrapper(CocoDetection):
         if target_size is not None:
             img = self._resize_for_cache(img, target_size)
         img_np = np.asarray(img).copy()
-        self._image_cache.put(idx, path, img_np)
+        self._image_cache.put(idx, img_np)
 
     @staticmethod
     def _resize_for_cache(img: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
@@ -793,7 +808,7 @@ class CocoDetectionWrapper(CocoDetection):
 
         # Try cache first
         if self._image_cache is not None:
-            cached = self._image_cache.get(index, full_path)
+            cached = self._image_cache.get(index)
             if cached is not None:
                 return Image.fromarray(cached)
 
@@ -803,7 +818,7 @@ class CocoDetectionWrapper(CocoDetection):
         # Store in cache for next time
         if self._image_cache is not None:
             img_np = np.asarray(img).copy()
-            self._image_cache.put(index, full_path, img_np)
+            self._image_cache.put(index, img_np)
 
         return img
 
@@ -862,6 +877,7 @@ class YOLOFormatDataset(Dataset):
         image_cache: Optional ImageCache for caching decoded images in RAM/disk
         data_fraction: Fraction of data to use (default: 1.0). Uses stratified
             sampling by primary class to maintain class distribution.
+        cache_workers: Number of parallel workers for caching (None = all CPU threads)
     """
 
     def __init__(
@@ -875,6 +891,7 @@ class YOLOFormatDataset(Dataset):
         cache_refresh: bool = False,
         image_cache: Optional[Any] = None,
         data_fraction: float = 1.0,
+        cache_workers: Optional[int] = None,
     ):
         self.images_dir = Path(images_dir)
         self.labels_dir = Path(labels_dir)
@@ -883,6 +900,7 @@ class YOLOFormatDataset(Dataset):
         self._image_loader = image_loader or DefaultImageLoader()
         self._labels_cache: Optional[List[Dict[str, Any]]] = None
         self._image_cache = image_cache
+        self._cache_workers = cache_workers
 
         # Find all images
         self.image_files = []
@@ -903,8 +921,8 @@ class YOLOFormatDataset(Dataset):
         if data_fraction < 1.0:
             self._apply_stratified_sampling(data_fraction)
 
-        # Pre-cache images if using RAM cache
-        if self._image_cache is not None and self._image_cache.mode == "ram":
+        # Pre-cache images if using RAM or disk cache
+        if self._image_cache is not None and self._image_cache.mode in ("ram", "disk"):
             self._precache_images()
 
     def __getstate__(self) -> Dict[str, Any]:
@@ -942,64 +960,58 @@ class YOLOFormatDataset(Dataset):
             self._image_loader = DefaultImageLoader()
 
     def _precache_images(self) -> None:
-        """Pre-load all images into memory-mapped RAM cache (parallelized)."""
+        """Pre-load all images into cache (RAM or disk, parallelized)."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from yolo.utils.progress import progress_bar, console
 
-        # Determine image shape for mmap
-        target_size = self._image_cache.target_size
-        if target_size:
-            # Fixed size when resizing
-            w, h = target_size
-            image_shape = (h, w, 3)  # HWC format
-            size_info = f"resized to {w}x{h}"
-        else:
-            # Sample first image to get shape
-            first_img = self._image_loader(str(self.image_files[0]))
-            w, h = first_img.size
-            image_shape = (h, w, 3)
-            size_info = f"original size {w}x{h}"
+        cache_mode = self._image_cache.mode
 
-        # Calculate memory
-        bytes_per_image = image_shape[0] * image_shape[1] * image_shape[2]
-        estimated_gb = (bytes_per_image * len(self.image_files)) / (1024**3)
-
-        if not self._image_cache.can_cache_in_ram(estimated_gb):
-            logger.warning(
-                f"⚠️ Estimated {estimated_gb:.1f}GB needed for image cache, "
-                f"but max allowed is {self._image_cache.max_memory_gb:.1f}GB. "
-                f"Disabling image caching."
-            )
-            self._image_cache = None
-            return
-
-        # Initialize memory-mapped cache
-        cache_dir = self.images_dir.parent
-        self._image_cache.initialize_ram_cache(len(self.image_files), image_shape, cache_dir)
+        # Initialize unified LMDB cache
+        dataset_root = self.images_dir.parent
+        cache_exists = self._image_cache.initialize(
+            num_images=len(self.image_files),
+            cache_dir=dataset_root,
+            paths=self.image_files,
+        )
+        cache_location = self._image_cache.cache_path or "alongside images"
 
         if not self._image_cache._enabled:
             self._image_cache = None
             return
 
+        if cache_exists:
+            console.print(f"[green]✓[/green] {cache_mode.upper()} cache: all {len(self.image_files)} images already cached ({cache_location})")
+            return
+
+        # All images need to be cached
+        work_items = [(idx, path) for idx, path in enumerate(self.image_files)]
+        cache_desc = f"Creating {cache_mode} cache ({len(self.image_files)} images)"
+
+        # Determine size info for display
+        target_size = self._image_cache.target_size
+        if target_size:
+            w, h = target_size
+            size_info = f"resized to {w}x{h}"
+        else:
+            first_img = self._image_loader(str(self.image_files[0]))
+            w, h = first_img.size
+            size_info = f"original size {w}x{h}"
+
         # Determine number of workers for parallel loading
-        num_workers = os.cpu_count() or 4  # Use all available CPUs for I/O-bound caching
+        num_workers = self._cache_workers if self._cache_workers is not None else (os.cpu_count() or 4)
 
-        console.print(f"\n[bold]📦 Pre-caching {len(self.image_files)} images[/bold] ({estimated_gb:.1f}GB, {size_info}, {num_workers} workers)")
-
-        # Prepare work items
-        work_items = [(idx, self.image_files[idx], target_size) for idx in range(len(self.image_files))]
+        # Display cache info
+        enc_info = ", encrypted" if self._image_cache._encrypt_cache else ""
+        console.print(f"\n[bold]💾 Pre-caching {len(work_items)} images[/bold] ({size_info}{enc_info}, {num_workers} workers)")
+        console.print(f"   Cache location: {cache_location}")
 
         # Use ThreadPoolExecutor for parallel I/O
-        # Threads work well here because:
-        # 1. PIL/OpenCV release GIL during I/O and decoding
-        # 2. We're writing to a memory-mapped file (kernel handles sync)
-        # 3. No pickle overhead like ProcessPoolExecutor
         failed_count = 0
-        with progress_bar(len(work_items), "Caching images") as update:
+        with progress_bar(len(work_items), cache_desc) as update:
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
                 futures = {
                     executor.submit(self._load_and_cache_image, idx, path, target_size): idx
-                    for idx, path, target_size in work_items
+                    for idx, path in work_items
                 }
 
                 for future in as_completed(futures):
@@ -1007,27 +1019,25 @@ class YOLOFormatDataset(Dataset):
                         future.result()
                     except Exception as e:
                         failed_count += 1
-                        if failed_count <= 3:  # Only log first 3 failures
+                        if failed_count <= 3:
                             logger.warning(f"Failed to cache image: {e}")
                     update(1)
 
-        # Flush mmap to disk
-        if self._image_cache._mmap_array is not None:
-            self._image_cache._mmap_array.flush()
-
+        # Finalize cache
+        self._image_cache.finalize()
         cached_count = self._image_cache.size
-        console.print(f"[green]✓[/green] Cached {cached_count} images to RAM (memory-mapped)")
+        console.print(f"[green]✓[/green] Cached {cached_count} images to {cache_mode.upper()} (LMDB)")
+
         if failed_count > 0:
             console.print(f"[yellow]⚠[/yellow] {failed_count} images failed to cache")
 
     def _load_and_cache_image(self, idx: int, path: Path, target_size: Optional[Tuple[int, int]]) -> None:
         """Load a single image and store in cache (called by thread workers)."""
         img = self._image_loader(str(path))
-        # Resize if target_size is set (letterbox to preserve aspect ratio)
         if target_size is not None:
             img = self._resize_for_cache(img, target_size)
         img_np = np.asarray(img).copy()
-        self._image_cache.put(idx, path, img_np)
+        self._image_cache.put(idx, img_np)
 
     @staticmethod
     def _resize_for_cache(img: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
@@ -1128,12 +1138,13 @@ class YOLOFormatDataset(Dataset):
         if refresh:
             cache.delete()
 
+        from yolo.utils.progress import console
+
         if cache.is_valid(label_files):
-            logger.info(f"Loading cached labels from {cache.cache_path}")
             self._labels_cache = cache.load()["labels"]
-            logger.info(f"Loaded {len(self._labels_cache)} cached labels")
+            console.print(f"[green]✓[/green] Labels cache: {len(self._labels_cache)} labels loaded ({cache.cache_path})")
         else:
-            logger.info(f"Parsing {len(self.image_files)} labels (first run or files changed)...")
+            console.print(f"[bold]📝 Parsing {len(self.image_files)} labels[/bold] (first run or files changed)")
             self._labels_cache = []
 
             for image_path in self.image_files:
@@ -1146,6 +1157,7 @@ class YOLOFormatDataset(Dataset):
                 "total_boxes": sum(len(l["boxes_norm"]) for l in self._labels_cache),
             }
             cache.save(self._labels_cache, label_files, stats)
+            console.print(f"[green]✓[/green] Labels cached to {cache.cache_path}")
 
     def _parse_label_file(self, image_path: Path) -> Dict[str, Any]:
         """
@@ -1186,7 +1198,7 @@ class YOLOFormatDataset(Dataset):
 
         # Try cache first
         if self._image_cache is not None:
-            cached = self._image_cache.get(index, image_path)
+            cached = self._image_cache.get(index)
             if cached is not None:
                 return Image.fromarray(cached)
 
@@ -1196,7 +1208,7 @@ class YOLOFormatDataset(Dataset):
         # Store in cache for next time
         if self._image_cache is not None:
             img_np = np.asarray(img).copy()
-            self._image_cache.put(index, image_path, img_np)
+            self._image_cache.put(index, img_np)
 
         return img
 
