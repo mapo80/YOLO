@@ -267,6 +267,16 @@ class YOLODataModule(L.LightningDataModule):
         image_cache = None
         if self.hparams.cache_images != "none":
             from yolo.data.cache import ImageCache
+
+            # Security warning: disk cache with custom loader (e.g., encrypted images)
+            # saves decrypted images as .npy files on disk
+            if self.hparams.cache_images == "disk" and self._image_loader is not None:
+                logger.warning(
+                    "⚠️  SECURITY WARNING: Using disk cache with custom image loader. "
+                    "Decrypted images will be saved as .npy files on disk! "
+                    "Use cache_images='ram' instead for encrypted images."
+                )
+
             # Determine target size for caching (None = original size)
             target_size = image_size if self.hparams.cache_resize_images else None
             image_cache = ImageCache(
