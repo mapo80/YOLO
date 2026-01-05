@@ -161,3 +161,6 @@ training-experiment/*
 # Lightning logs
 lightning_logs/
 validation_results/
+
+# Development plans
+YOLOX_PLAN.md

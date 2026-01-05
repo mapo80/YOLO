@@ -357,8 +357,8 @@ class TestYOLOFormatDataModule:
             val_labels="valid/labels",
             batch_size=4,
             num_workers=0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
 
         assert dm.hparams.batch_size == 4
         assert dm._image_size == (320, 320)
@@ -378,8 +378,8 @@ class TestYOLOFormatDataModule:
             val_labels="valid/labels",
             batch_size=4,
             num_workers=0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
 
         dm.setup(stage="fit")
 
@@ -401,8 +401,8 @@ class TestYOLOFormatDataModule:
             batch_size=2,
             num_workers=0,
             mosaic_prob=0.0,  # Disable mosaic for simpler testing
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
 
         dm.setup(stage="fit")
         train_loader = dm.train_dataloader()
@@ -423,8 +423,8 @@ class TestYOLOFormatDataModule:
             val_labels="valid/labels",
             batch_size=2,
             num_workers=0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
 
         dm.setup(stage="fit")
         val_loader = dm.val_dataloader()
@@ -446,8 +446,8 @@ class TestYOLOFormatDataModule:
             batch_size=4,
             num_workers=0,
             mosaic_prob=0.0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
 
         dm.setup(stage="fit")
         train_loader = dm.train_dataloader()
@@ -485,8 +485,8 @@ class TestYOLOFormatWithMosaic:
             num_workers=0,
             mosaic_prob=1.0,  # Always apply mosaic
             mixup_prob=0.0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
 
         dm.setup(stage="fit")
         train_loader = dm.train_dataloader()
@@ -511,8 +511,8 @@ class TestYOLOFormatWithMosaic:
             mosaic_prob=1.0,
             mixup_prob=0.5,
             mixup_alpha=32.0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
 
         dm.setup(stage="fit")
         train_loader = dm.train_dataloader()
@@ -543,9 +543,9 @@ class TestYOLOFormatWithMosaic:
                 val_labels="valid/labels",
                 batch_size=2,
                 num_workers=0,
+                image_size=(320, 320),
                 **config,
             )
-            dm._image_size = (320, 320)
 
             dm.setup(stage="fit")
             train_loader = dm.train_dataloader()
@@ -569,8 +569,8 @@ class TestYOLOFormatTransforms:
             val_labels="valid/labels",
             batch_size=2,
             num_workers=0,
+            image_size=(416, 416),  # Different size
         )
-        dm._image_size = (416, 416)  # Different size
 
         dm.setup(stage="fit")
         val_loader = dm.val_dataloader()
@@ -595,8 +595,8 @@ class TestYOLOFormatTransforms:
             hsv_s=0.9,
             hsv_v=0.6,
             mosaic_prob=0.0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
 
         dm.setup(stage="fit")
 
@@ -624,8 +624,8 @@ class TestYOLOFormatTransforms:
             flip_lr=0.5,
             flip_ud=0.1,
             mosaic_prob=0.0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
 
         dm.setup(stage="fit")
         train_loader = dm.train_dataloader()
@@ -651,8 +651,8 @@ class TestYOLOFormatCollate:
             batch_size=8,  # Larger batch to get variety
             num_workers=0,
             mosaic_prob=0.0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
 
         dm.setup(stage="fit")
         val_loader = dm.val_dataloader()
@@ -680,8 +680,8 @@ class TestYOLOFormatCollate:
             batch_size=4,
             num_workers=0,
             mosaic_prob=0.0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
 
         dm.setup(stage="fit")
         train_loader = dm.train_dataloader()
@@ -935,8 +935,8 @@ class TestYOLOFormatDataModuleHyperparams:
             num_workers=4,
             mosaic_prob=0.8,
             mixup_prob=0.2,
+            image_size=(640, 640),
         )
-        dm._image_size = (640, 640)
 
         assert dm.hparams.batch_size == 16
         assert dm.hparams.num_workers == 4
@@ -957,8 +957,8 @@ class TestYOLOFormatDataModuleHyperparams:
             batch_size=2,
             num_workers=0,
             close_mosaic_epochs=10,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
 
         assert dm.hparams.close_mosaic_epochs == 10
         assert dm._mosaic_enabled is True
@@ -980,8 +980,8 @@ class TestYOLOFormatDatasetIntegration:
             batch_size=8,
             num_workers=0,
             mosaic_prob=0.0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
 
         dm.setup(stage="fit")
         train_loader = dm.train_dataloader()
@@ -1014,8 +1014,8 @@ class TestYOLOFormatDatasetIntegration:
             batch_size=4,
             num_workers=0,
             mosaic_prob=0.0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
 
         dm.setup(stage="fit")
         train_loader = dm.train_dataloader()
@@ -1129,8 +1129,8 @@ class TestDataFraction:
             batch_size=4,
             num_workers=0,
             data_fraction=1.0,
+            image_size=(320, 320),
         )
-        dm_full._image_size = (320, 320)
         dm_full.setup(stage="fit")
 
         dm_subset = YOLODataModule(
@@ -1143,8 +1143,8 @@ class TestDataFraction:
             batch_size=4,
             num_workers=0,
             data_fraction=0.5,
+            image_size=(320, 320),
         )
-        dm_subset._image_size = (320, 320)
         dm_subset.setup(stage="fit")
 
         # Access underlying datasets
@@ -1194,8 +1194,8 @@ class TestDataLoaderPrewarm:
             batch_size=4,
             num_workers=2,  # Need workers to trigger prewarm
             mosaic_prob=0.0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
         dm.setup(stage="fit")
 
         # After setup with num_workers > 0, _train_dataloader should exist
@@ -1215,8 +1215,8 @@ class TestDataLoaderPrewarm:
             batch_size=4,
             num_workers=0,  # No workers = no prewarm
             mosaic_prob=0.0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
         dm.setup(stage="fit")
 
         # With num_workers=0, _train_dataloader should not be set
@@ -1236,8 +1236,8 @@ class TestDataLoaderPrewarm:
             batch_size=4,
             num_workers=2,
             mosaic_prob=0.0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
         dm.setup(stage="fit")
 
         # Get the pre-warmed loader reference
@@ -1268,8 +1268,8 @@ class TestDataLoaderPrewarm:
             batch_size=4,
             num_workers=2,
             mosaic_prob=0.0,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
         dm.setup(stage="fit")
 
         loader = dm.train_dataloader()
@@ -1303,8 +1303,8 @@ class TestDataLoaderPrewarm:
             cache_images="ram",
             cache_resize_images=True,
             data_fraction=0.1,  # Use small fraction for faster test
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
         dm.setup(stage="fit")
 
         # Should have pre-warmed loader
@@ -1329,8 +1329,8 @@ class TestDataLoaderPrewarm:
             val_labels="valid/labels",
             batch_size=4,
             num_workers=2,
+            image_size=(320, 320),
         )
-        dm._image_size = (320, 320)
         dm.setup(stage="validate")
 
         # For validate stage only, no training dataloader is created
