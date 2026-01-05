@@ -13,6 +13,13 @@ The format can be configured via YAML or CLI:
 
 import os
 from pathlib import Path
+
+try:
+    import resource
+    HAS_RESOURCE = True
+except ImportError:
+    # Windows doesn't have resource module
+    HAS_RESOURCE = False
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import lightning as L
@@ -23,6 +30,65 @@ from torchvision.transforms import v2
 from PIL import Image
 
 from yolo.data.loaders import DefaultImageLoader, ImageLoader
+
+
+def _get_safe_num_workers(requested: int) -> int:
+    """
+    Get a safe number of workers based on system file descriptor limits.
+
+    Each worker uses ~10-15 file descriptors for shared memory, pipes, etc.
+    We reserve some headroom for the main process and other system usage.
+
+    Args:
+        requested: Requested number of workers
+
+    Returns:
+        Safe number of workers that won't exhaust file descriptors
+    """
+    from yolo.utils.logger import logger
+
+    if requested == 0:
+        return 0
+
+    if not HAS_RESOURCE:
+        # Windows: can't check limits, use conservative default if high
+        if requested > 16:
+            logger.warning(
+                f"⚠️ num_workers={requested} is high. "
+                f"Reducing to 16 to avoid potential resource issues."
+            )
+            return 16
+        return requested
+
+    try:
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ValueError, OSError):
+        # Can't get limits, use conservative default
+        if requested > 16:
+            logger.warning(
+                f"⚠️ Cannot determine file descriptor limit. "
+                f"Reducing num_workers from {requested} to 16."
+            )
+            return 16
+        return requested
+
+    # Reserve ~500 FDs for main process, system, dataset files, etc.
+    # Each worker needs ~15 FDs for shared memory, pipes, queues
+    available = soft_limit - 500
+    fd_per_worker = 15
+    max_safe_workers = max(1, available // fd_per_worker)
+
+    if requested > max_safe_workers:
+        logger.warning(
+            f"⚠️ Reducing num_workers: {requested} → {max_safe_workers} "
+            f"(ulimit -n = {soft_limit}). "
+            f"To use {requested} workers, run: ulimit -n {requested * fd_per_worker + 1000}"
+        )
+        return max_safe_workers
+
+    return requested
+
+
 from yolo.data.mosaic import MosaicMixupDataset
 from yolo.data.transforms import (
     LetterBox,
@@ -257,17 +323,26 @@ class YOLODataModule(L.LightningDataModule):
             ann_file=ann_file,
         )
 
+    def _get_dataloader_kwargs(self) -> Dict[str, Any]:
+        """Get common DataLoader kwargs with optimized settings."""
+        num_workers = _get_safe_num_workers(self.hparams.num_workers)
+        kwargs = {
+            "num_workers": num_workers,
+            "collate_fn": self._collate_fn,
+            "pin_memory": self.hparams.pin_memory,
+            "persistent_workers": num_workers > 0,
+            "prefetch_factor": 2 if num_workers > 0 else None,
+        }
+        return kwargs
+
     def train_dataloader(self) -> DataLoader:
         """Create training dataloader."""
         return DataLoader(
             self.train_dataset,
             batch_size=self.hparams.batch_size,
             shuffle=True,
-            num_workers=self.hparams.num_workers,
-            collate_fn=self._collate_fn,
-            pin_memory=self.hparams.pin_memory,
             drop_last=True,
-            persistent_workers=self.hparams.num_workers > 0,
+            **self._get_dataloader_kwargs(),
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -276,10 +351,7 @@ class YOLODataModule(L.LightningDataModule):
             self.val_dataset,
             batch_size=self.hparams.batch_size,
             shuffle=False,
-            num_workers=self.hparams.num_workers,
-            collate_fn=self._collate_fn,
-            pin_memory=self.hparams.pin_memory,
-            persistent_workers=self.hparams.num_workers > 0,
+            **self._get_dataloader_kwargs(),
         )
 
     def on_train_epoch_start(self) -> None:
