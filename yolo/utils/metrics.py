@@ -25,6 +25,21 @@ import seaborn as sns
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
+# Context manager to suppress stdout (used to silence verbose COCO output)
+import contextlib
+import io
+import sys
+
+@contextlib.contextmanager
+def suppress_stdout():
+    """Temporarily suppress stdout output."""
+    old_stdout = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        yield
+    finally:
+        sys.stdout = old_stdout
+
 
 def compute_iou_matrix(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
     """
@@ -183,10 +198,12 @@ class COCOFormatConverter:
 
     def get_coco_dt(self, coco_gt: COCO) -> COCO:
         """Create COCO object for detections."""
-        if not self.dt_annotations:
-            # Return empty results
-            return coco_gt.loadRes([])
-        return coco_gt.loadRes(self.dt_annotations)
+        # Suppress "Loading and preparing results..." message from pycocotools
+        with suppress_stdout():
+            if not self.dt_annotations:
+                # Return empty results
+                return coco_gt.loadRes([])
+            return coco_gt.loadRes(self.dt_annotations)
 
     def reset(self) -> None:
         """Reset all stored data."""
@@ -909,14 +926,8 @@ class DetMetrics:
             logger.debug(f"[Metrics] COCO eval done in {_time.time() - _t0:.2f}s")
 
             # Suppress verbose COCO output - metrics are shown in EvalDashboard
-            import io
-            import sys
-            old_stdout = sys.stdout
-            sys.stdout = io.StringIO()
-            try:
+            with suppress_stdout():
                 coco_eval.summarize()
-            finally:
-                sys.stdout = old_stdout
 
             # Extract all 12 metrics from COCO evaluation
             # stats order: AP, AP50, AP75, APs, APm, APl, AR1, AR10, AR100, ARs, ARm, ARl
