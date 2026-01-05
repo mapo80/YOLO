@@ -9,6 +9,7 @@ These tests verify:
 """
 
 import gc
+import io
 import os
 import resource
 import tempfile
@@ -27,6 +28,7 @@ from yolo.data.loaders import (
     ImageLoader,
     TurboJPEGLoader,
 )
+from yolo.data.encrypted_loader import EncryptedImageLoader
 
 
 # =============================================================================
@@ -698,3 +700,233 @@ class TestImageLoaderABC:
 
         assert isinstance(img, Image.Image)
         assert img.mode == "RGB"
+
+
+# =============================================================================
+# EncryptedImageLoader Tests
+# =============================================================================
+
+
+class TestEncryptedImageLoader:
+    """Tests for EncryptedImageLoader."""
+
+    @pytest.fixture
+    def aes_key(self):
+        """Generate a test AES-256 key."""
+        # 32 bytes = 256 bits for AES-256
+        return os.urandom(32)
+
+    @pytest.fixture
+    def aes_key_hex(self, aes_key):
+        """Return hex-encoded key."""
+        return aes_key.hex()
+
+    @pytest.fixture
+    def encrypted_image(self, temp_image_dir, aes_key) -> Path:
+        """Create an encrypted test image."""
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+        # Create a test image
+        img = Image.new("RGB", (640, 480), color=(255, 128, 0))
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format="JPEG", quality=85)
+        plaintext = img_bytes.getvalue()
+
+        # PKCS7 padding
+        block_size = 16
+        padding_length = block_size - (len(plaintext) % block_size)
+        padded_data = plaintext + bytes([padding_length] * padding_length)
+
+        # Encrypt with AES-256-CBC
+        iv = os.urandom(16)
+        cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+
+        # Write encrypted file
+        enc_path = temp_image_dir / "test_encrypted.enc"
+        enc_path.write_bytes(iv + ciphertext)
+
+        return enc_path
+
+    @pytest.fixture
+    def set_env_key(self, aes_key_hex, monkeypatch):
+        """Set the encryption key environment variable."""
+        monkeypatch.setenv("YOLO_IMAGE_ENCRYPTION_KEY", aes_key_hex)
+
+    def test_loads_encrypted_image(self, encrypted_image, set_env_key):
+        """Test loading an encrypted image."""
+        loader = EncryptedImageLoader()
+        img = loader(encrypted_image)
+
+        assert isinstance(img, Image.Image)
+        assert img.mode == "RGB"
+        assert img.size == (640, 480)
+
+    def test_loads_regular_image(self, sample_jpg_image, set_env_key):
+        """Test loading regular (non-encrypted) images."""
+        loader = EncryptedImageLoader()
+        img = loader(sample_jpg_image)
+
+        assert isinstance(img, Image.Image)
+        assert img.mode == "RGB"
+
+    def test_missing_env_key_raises_error(self, encrypted_image, monkeypatch):
+        """Test that missing key raises ValueError."""
+        monkeypatch.delenv("YOLO_IMAGE_ENCRYPTION_KEY", raising=False)
+
+        loader = EncryptedImageLoader()
+
+        with pytest.raises(ValueError, match="YOLO_IMAGE_ENCRYPTION_KEY"):
+            loader(encrypted_image)
+
+    def test_invalid_key_length_raises_error(self, encrypted_image, monkeypatch):
+        """Test that invalid key length raises ValueError."""
+        # Set a key that's too short (only 16 bytes instead of 32)
+        monkeypatch.setenv("YOLO_IMAGE_ENCRYPTION_KEY", "a" * 32)  # 16 bytes
+
+        loader = EncryptedImageLoader()
+
+        with pytest.raises(ValueError, match="32 bytes"):
+            loader(encrypted_image)
+
+    def test_key_caching(self, aes_key_hex, monkeypatch):
+        """Test that key is cached after first retrieval."""
+        monkeypatch.setenv("YOLO_IMAGE_ENCRYPTION_KEY", aes_key_hex)
+
+        loader = EncryptedImageLoader()
+
+        # First call should cache the key
+        key1 = loader._get_key()
+
+        # Modify env (should not affect cached key)
+        monkeypatch.setenv("YOLO_IMAGE_ENCRYPTION_KEY", "b" * 64)
+
+        key2 = loader._get_key()
+
+        assert key1 == key2
+
+    def test_lazy_crypto_initialization(self):
+        """Test that crypto modules are initialized lazily."""
+        loader = EncryptedImageLoader()
+
+        assert loader._cipher_module is None
+        assert loader._algorithms is None
+        assert loader._modes is None
+
+    def test_file_handle_closed(self, encrypted_image, set_env_key):
+        """Test file handles are closed after loading encrypted images."""
+        loader = EncryptedImageLoader()
+
+        gc.collect()
+        initial_count = get_open_file_count()
+
+        for _ in range(50):
+            img = loader(encrypted_image)
+            del img
+
+        gc.collect()
+        final_count = get_open_file_count()
+
+        assert final_count <= initial_count + 5
+
+    def test_opencv_fallback(self, encrypted_image, set_env_key):
+        """Test that loader works when OpenCV is not available."""
+        loader = EncryptedImageLoader(use_opencv=False)
+        img = loader(encrypted_image)
+
+        assert isinstance(img, Image.Image)
+        assert img.mode == "RGB"
+
+    def test_stress_encrypted_images(self, temp_image_dir, aes_key, set_env_key):
+        """Stress test with many encrypted images."""
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+        # Create 100 encrypted images
+        paths = []
+        for i in range(100):
+            # Create image
+            color = ((i * 17) % 256, (i * 31) % 256, (i * 47) % 256)
+            img = Image.new("RGB", (320, 240), color=color)
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format="JPEG", quality=75)
+            plaintext = img_bytes.getvalue()
+
+            # Pad and encrypt
+            block_size = 16
+            padding_length = block_size - (len(plaintext) % block_size)
+            padded_data = plaintext + bytes([padding_length] * padding_length)
+
+            iv = os.urandom(16)
+            cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+            encryptor = cipher.encryptor()
+            ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+
+            enc_path = temp_image_dir / f"stress_{i:04d}.enc"
+            enc_path.write_bytes(iv + ciphertext)
+            paths.append(enc_path)
+
+        # Load all images
+        loader = EncryptedImageLoader()
+
+        gc.collect()
+        initial_count = get_open_file_count()
+
+        for path in paths:
+            img = loader(path)
+            assert img.mode == "RGB"
+            del img
+
+        gc.collect()
+        final_count = get_open_file_count()
+
+        leak = final_count - initial_count
+        assert leak <= 10, f"File descriptor leak: +{leak}"
+
+    def test_throughput_encrypted(self, temp_image_dir, aes_key, set_env_key):
+        """Measure throughput for encrypted images."""
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+        # Create 30 encrypted images
+        paths = []
+        for i in range(30):
+            np_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+            img = Image.fromarray(np_img)
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format="JPEG", quality=85)
+            plaintext = img_bytes.getvalue()
+
+            block_size = 16
+            padding_length = block_size - (len(plaintext) % block_size)
+            padded_data = plaintext + bytes([padding_length] * padding_length)
+
+            iv = os.urandom(16)
+            cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+            encryptor = cipher.encryptor()
+            ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+
+            enc_path = temp_image_dir / f"perf_{i:04d}.enc"
+            enc_path.write_bytes(iv + ciphertext)
+            paths.append(enc_path)
+
+        loader = EncryptedImageLoader()
+
+        # Warmup
+        for path in paths[:3]:
+            _ = loader(path)
+
+        # Measure
+        start = time.time()
+        for path in paths:
+            img = loader(path)
+            del img
+        elapsed = time.time() - start
+
+        throughput = len(paths) / elapsed
+        print(f"\nEncryptedImageLoader: {throughput:.1f} images/sec")
+
+        # Should load at least 5 images per second (decryption overhead)
+        assert throughput > 5, f"Too slow: {throughput:.1f} img/s"
