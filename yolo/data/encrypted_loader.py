@@ -72,6 +72,25 @@ class EncryptedImageLoader(ImageLoader):
         self._modes = None
         self._backend = None
 
+    def __getstate__(self):
+        """Prepare state for pickling (required for spawn multiprocessing)."""
+        # Only save serializable config, not lazy-loaded modules
+        return {
+            "_key": self._key,
+            "_use_opencv": self._use_opencv,
+        }
+
+    def __setstate__(self, state):
+        """Restore state after unpickling."""
+        self._key = state.get("_key")
+        self._use_opencv = state.get("_use_opencv", True)
+        # Reset lazy-loaded modules (will be re-initialized on first use)
+        self._cv2 = None
+        self._cipher_module = None
+        self._algorithms = None
+        self._modes = None
+        self._backend = None
+
     def _init_crypto(self):
         """Lazy initialize cryptography modules."""
         if self._cipher_module is None:

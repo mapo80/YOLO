@@ -892,6 +892,31 @@ class TestYOLOFormatCustomLoader:
         img, target = restored_dataset[0]
         assert img is not None
 
+    def test_dataset_pickle_with_encrypted_loader(self):
+        """Test dataset with EncryptedImageLoader can be pickled (spawn multiprocessing)."""
+        import pickle
+        from yolo.data.datamodule import YOLOFormatDataset
+        from yolo.data.encrypted_loader import EncryptedImageLoader
+
+        # Create loader with specific config
+        loader = EncryptedImageLoader(use_opencv=False)
+
+        dataset = YOLOFormatDataset(
+            images_dir=str(YOLO_DATASET_PATH / "train" / "images"),
+            labels_dir=str(YOLO_DATASET_PATH / "train" / "labels"),
+            image_loader=loader,
+        )
+
+        # Should be able to pickle and unpickle
+        pickled = pickle.dumps(dataset)
+        restored_dataset = pickle.loads(pickled)
+
+        # Verify restored dataset works
+        assert len(restored_dataset) == len(dataset)
+        assert isinstance(restored_dataset._image_loader, EncryptedImageLoader)
+        # Verify config was preserved
+        assert restored_dataset._image_loader._use_opencv == False
+
 
 class TestYOLOFormatDataModuleHyperparams:
     """Tests for datamodule hyperparameter saving."""

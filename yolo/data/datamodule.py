@@ -498,13 +498,6 @@ class CocoDetectionWrapper(CocoDetection):
         self.target_transform = YOLOTargetTransform(self._category_id_to_idx)
         # Use provided loader or default PIL loader
         self._image_loader = image_loader or DefaultImageLoader()
-        # Store loader class info for pickling (spawn multiprocessing)
-        self._image_loader_class = type(self._image_loader)
-        self._image_loader_state = (
-            self._image_loader.__dict__.copy()
-            if hasattr(self._image_loader, "__dict__")
-            else {}
-        )
 
         # Apply stratified sampling if data_fraction < 1.0
         if data_fraction < 1.0:
@@ -517,19 +510,32 @@ class CocoDetectionWrapper(CocoDetection):
     def __getstate__(self) -> Dict[str, Any]:
         """Prepare state for pickling (spawn multiprocessing compatibility)."""
         state = self.__dict__.copy()
-        # Remove the loader instance - will be recreated from class info
-        state.pop("_image_loader", None)
+        # Store loader class and its pickle-safe state
+        loader = state.pop("_image_loader", None)
+        if loader is not None:
+            state["_image_loader_class"] = type(loader)
+            # Use loader's __getstate__ if available, otherwise use __dict__
+            if hasattr(loader, "__getstate__"):
+                state["_image_loader_state"] = loader.__getstate__()
+            else:
+                state["_image_loader_state"] = loader.__dict__.copy() if hasattr(loader, "__dict__") else {}
         return state
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
         """Restore state after unpickling."""
+        # Extract loader info before updating __dict__
+        loader_class = state.pop("_image_loader_class", DefaultImageLoader)
+        loader_state = state.pop("_image_loader_state", {})
+
         self.__dict__.update(state)
-        # Recreate the image loader from stored class info
-        loader_class = state.get("_image_loader_class", DefaultImageLoader)
-        loader_state = state.get("_image_loader_state", {})
+
+        # Recreate the image loader
         try:
             self._image_loader = loader_class.__new__(loader_class)
-            if loader_state:
+            # Use loader's __setstate__ if available
+            if hasattr(self._image_loader, "__setstate__"):
+                self._image_loader.__setstate__(loader_state)
+            elif loader_state:
                 self._image_loader.__dict__.update(loader_state)
         except Exception:
             # Fallback to default loader
@@ -751,13 +757,6 @@ class YOLOFormatDataset(Dataset):
         self._transforms = transforms
         self.image_size = image_size
         self._image_loader = image_loader or DefaultImageLoader()
-        # Store loader class info for pickling (spawn multiprocessing)
-        self._image_loader_class = type(self._image_loader)
-        self._image_loader_state = (
-            self._image_loader.__dict__.copy()
-            if hasattr(self._image_loader, "__dict__")
-            else {}
-        )
         self._labels_cache: Optional[List[Dict[str, Any]]] = None
         self._image_cache = image_cache
 
@@ -787,19 +786,32 @@ class YOLOFormatDataset(Dataset):
     def __getstate__(self) -> Dict[str, Any]:
         """Prepare state for pickling (spawn multiprocessing compatibility)."""
         state = self.__dict__.copy()
-        # Remove the loader instance - will be recreated from class info
-        state.pop("_image_loader", None)
+        # Store loader class and its pickle-safe state
+        loader = state.pop("_image_loader", None)
+        if loader is not None:
+            state["_image_loader_class"] = type(loader)
+            # Use loader's __getstate__ if available, otherwise use __dict__
+            if hasattr(loader, "__getstate__"):
+                state["_image_loader_state"] = loader.__getstate__()
+            else:
+                state["_image_loader_state"] = loader.__dict__.copy() if hasattr(loader, "__dict__") else {}
         return state
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
         """Restore state after unpickling."""
+        # Extract loader info before updating __dict__
+        loader_class = state.pop("_image_loader_class", DefaultImageLoader)
+        loader_state = state.pop("_image_loader_state", {})
+
         self.__dict__.update(state)
-        # Recreate the image loader from stored class info
-        loader_class = state.get("_image_loader_class", DefaultImageLoader)
-        loader_state = state.get("_image_loader_state", {})
+
+        # Recreate the image loader
         try:
             self._image_loader = loader_class.__new__(loader_class)
-            if loader_state:
+            # Use loader's __setstate__ if available
+            if hasattr(self._image_loader, "__setstate__"):
+                self._image_loader.__setstate__(loader_state)
+            elif loader_state:
                 self._image_loader.__dict__.update(loader_state)
         except Exception:
             # Fallback to default loader
