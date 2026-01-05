@@ -3,7 +3,7 @@
 ![GitHub License](https://img.shields.io/github/license/WongKinYiu/YOLO)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch Lightning](https://img.shields.io/badge/PyTorch-Lightning-792ee5.svg)](https://lightning.ai/)
-[![Tests](https://img.shields.io/badge/tests-373%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-379%20passed-brightgreen.svg)](tests/)
 
 > **Fork Notice**: This is a fork of [WongKinYiu/YOLO](https://github.com/WongKinYiu/YOLO) with extensive additions for production training.
 
@@ -1527,11 +1527,11 @@ python -m pytest tests/ -v --run-integration
 | **Bounding Box Utils** | 13 tests | IoU, transforms, NMS, anchor generation |
 | **Export** | 12 tests | Letterbox, ONNX/TFLite signatures, CLI options |
 | **Training Experiment** | 16 tests | Dataset loading, metrics, schedulers, freezing, export |
-| **YOLO Format Dataloader** | 30 tests | Dataset loading, transforms, collate, edge cases |
+| **YOLO Format Dataloader** | 36 tests | Dataset loading, transforms, collate, prewarm, edge cases |
 | **Cache** | 50 tests | Label caching, image caching (RAM/disk), mmap, encryption, LRU buffer |
 | **Integration** | 10 tests | Full pipeline tests (run with `--run-integration`) |
 
-**Total: 373 tests** covering image loaders, data augmentation, training callbacks, metrics, eval dashboard, schedulers, layer freezing, model components, export, validate, caching, and utilities.
+**Total: 379 tests** covering image loaders, data augmentation, training callbacks, metrics, eval dashboard, schedulers, layer freezing, model components, export, validate, caching, and utilities.
 
 ### Training Experiment Tests
 
