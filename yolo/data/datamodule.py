@@ -393,31 +393,13 @@ class YOLODataModule(L.LightningDataModule):
         With 'spawn' multiprocessing, worker creation is slow. By fetching one batch
         here, we force worker initialization during setup() instead of during training.
         """
-        import sys
-        import threading
-        import time
+        from yolo.utils.progress import spinner, console
 
         num_workers = _get_safe_num_workers(self.hparams.num_workers)
         if num_workers == 0:
             return
 
-        # Spinner animation
-        spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-        stop_spinner = threading.Event()
-
-        def spin():
-            idx = 0
-            while not stop_spinner.is_set():
-                char = spinner_chars[idx % len(spinner_chars)]
-                print(f"\r{char} Initializing {num_workers} DataLoader workers (spawn)...", end="", flush=True)
-                idx += 1
-                time.sleep(0.1)
-
-        # Start spinner in background
-        spinner_thread = threading.Thread(target=spin, daemon=True)
-        spinner_thread.start()
-
-        try:
+        with spinner(f"Initializing {num_workers} DataLoader workers (spawn)..."):
             # Create a temporary DataLoader and fetch one batch to force worker init
             temp_loader = DataLoader(
                 self.train_dataset,
@@ -433,12 +415,7 @@ class YOLODataModule(L.LightningDataModule):
             # Store the loader for reuse (workers are persistent)
             self._train_dataloader = temp_loader
 
-        finally:
-            # Stop spinner and clear line
-            stop_spinner.set()
-            spinner_thread.join(timeout=0.5)
-            print(f"\r✅ DataLoader workers initialized ({num_workers} workers)     ")
-            sys.stdout.flush()
+        console.print(f"[green]✓[/green] DataLoader workers initialized ({num_workers} workers)")
 
     def _extract_class_names(self, is_yolo_format: bool) -> None:
         """Extract class names from dataset for metrics display."""
@@ -680,9 +657,8 @@ class CocoDetectionWrapper(CocoDetection):
 
     def _precache_images(self) -> None:
         """Pre-load all images into memory-mapped RAM cache (parallelized)."""
-        import sys
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from tqdm import tqdm
+        from yolo.utils.progress import progress_bar, console
 
         # Get all image paths
         image_paths = []
@@ -728,9 +704,7 @@ class CocoDetectionWrapper(CocoDetection):
         # Determine number of workers for parallel loading
         num_workers = min(os.cpu_count() or 4, 8)  # Cap at 8 workers
 
-        # Print directly to ensure visibility before Lightning takes over
-        print(f"\n📦 Pre-caching {len(self.ids)} images to RAM ({estimated_gb:.1f}GB, {size_info}, {num_workers} workers)...")
-        sys.stdout.flush()
+        console.print(f"\n[bold]📦 Pre-caching {len(self.ids)} images[/bold] ({estimated_gb:.1f}GB, {size_info}, {num_workers} workers)")
 
         # Prepare work items
         work_items = [(idx, image_paths[idx], target_size) for idx in range(len(self.ids))]
@@ -741,13 +715,13 @@ class CocoDetectionWrapper(CocoDetection):
         # 2. We're writing to a memory-mapped file (kernel handles sync)
         # 3. No pickle overhead like ProcessPoolExecutor
         failed_count = 0
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = {
-                executor.submit(self._load_and_cache_image, idx, path, target_size): idx
-                for idx, path, target_size in work_items
-            }
+        with progress_bar(len(work_items), "Caching images") as update:
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {
+                    executor.submit(self._load_and_cache_image, idx, path, target_size): idx
+                    for idx, path, target_size in work_items
+                }
 
-            with tqdm(total=len(futures), desc="Caching images", file=sys.stdout) as pbar:
                 for future in as_completed(futures):
                     try:
                         future.result()
@@ -755,17 +729,16 @@ class CocoDetectionWrapper(CocoDetection):
                         failed_count += 1
                         if failed_count <= 3:  # Only log first 3 failures
                             logger.warning(f"Failed to cache image: {e}")
-                    pbar.update(1)
+                    update(1)
 
         # Flush mmap to disk
         if self._image_cache._mmap_array is not None:
             self._image_cache._mmap_array.flush()
 
         cached_count = self._image_cache.size
-        print(f"✅ Cached {cached_count} images to RAM (memory-mapped)\n")
+        console.print(f"[green]✓[/green] Cached {cached_count} images to RAM (memory-mapped)")
         if failed_count > 0:
-            print(f"⚠️ {failed_count} images failed to cache\n")
-        sys.stdout.flush()
+            console.print(f"[yellow]⚠[/yellow] {failed_count} images failed to cache")
 
     def _load_and_cache_image(self, idx: int, path: Path, target_size: Optional[Tuple[int, int]]) -> None:
         """Load a single image and store in cache (called by thread workers)."""
@@ -954,9 +927,8 @@ class YOLOFormatDataset(Dataset):
 
     def _precache_images(self) -> None:
         """Pre-load all images into memory-mapped RAM cache (parallelized)."""
-        import sys
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from tqdm import tqdm
+        from yolo.utils.progress import progress_bar, console
 
         # Determine image shape for mmap
         target_size = self._image_cache.target_size
@@ -996,9 +968,7 @@ class YOLOFormatDataset(Dataset):
         # Determine number of workers for parallel loading
         num_workers = min(os.cpu_count() or 4, 8)  # Cap at 8 workers
 
-        # Print directly to ensure visibility before Lightning takes over
-        print(f"\n📦 Pre-caching {len(self.image_files)} images to RAM ({estimated_gb:.1f}GB, {size_info}, {num_workers} workers)...")
-        sys.stdout.flush()
+        console.print(f"\n[bold]📦 Pre-caching {len(self.image_files)} images[/bold] ({estimated_gb:.1f}GB, {size_info}, {num_workers} workers)")
 
         # Prepare work items
         work_items = [(idx, self.image_files[idx], target_size) for idx in range(len(self.image_files))]
@@ -1009,13 +979,13 @@ class YOLOFormatDataset(Dataset):
         # 2. We're writing to a memory-mapped file (kernel handles sync)
         # 3. No pickle overhead like ProcessPoolExecutor
         failed_count = 0
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = {
-                executor.submit(self._load_and_cache_image, idx, path, target_size): idx
-                for idx, path, target_size in work_items
-            }
+        with progress_bar(len(work_items), "Caching images") as update:
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {
+                    executor.submit(self._load_and_cache_image, idx, path, target_size): idx
+                    for idx, path, target_size in work_items
+                }
 
-            with tqdm(total=len(futures), desc="Caching images", file=sys.stdout) as pbar:
                 for future in as_completed(futures):
                     try:
                         future.result()
@@ -1023,17 +993,16 @@ class YOLOFormatDataset(Dataset):
                         failed_count += 1
                         if failed_count <= 3:  # Only log first 3 failures
                             logger.warning(f"Failed to cache image: {e}")
-                    pbar.update(1)
+                    update(1)
 
         # Flush mmap to disk
         if self._image_cache._mmap_array is not None:
             self._image_cache._mmap_array.flush()
 
         cached_count = self._image_cache.size
-        print(f"✅ Cached {cached_count} images to RAM (memory-mapped)\n")
+        console.print(f"[green]✓[/green] Cached {cached_count} images to RAM (memory-mapped)")
         if failed_count > 0:
-            print(f"⚠️ {failed_count} images failed to cache\n")
-        sys.stdout.flush()
+            console.print(f"[yellow]⚠[/yellow] {failed_count} images failed to cache")
 
     def _load_and_cache_image(self, idx: int, path: Path, target_size: Optional[Tuple[int, int]]) -> None:
         """Load a single image and store in cache (called by thread workers)."""
