@@ -50,7 +50,7 @@ class TestImageSizeValidation:
         datamodule._image_size = (320, 320)
 
         # Simulate the CLI validation method
-        model_size = tuple(model.hparams.image_size)
+        model_size = tuple(model.image_size)
         data_size = datamodule._image_size
 
         # This should detect the mismatch
@@ -91,7 +91,7 @@ class TestImageSizeValidation:
             image_size=(640, 640),  # Same as model
         )
 
-        model_size = tuple(model.hparams.image_size)
+        model_size = tuple(model.image_size)
         data_size = datamodule._image_size
 
         # Sizes should match - no error
@@ -113,7 +113,7 @@ class TestImageSizeValidation:
                 if self.model is None or self.datamodule is None:
                     return
 
-                model_size = tuple(self.model.hparams.image_size)
+                model_size = tuple(self.model.image_size)
                 data_size = self.datamodule._image_size
 
                 if model_size != data_size:

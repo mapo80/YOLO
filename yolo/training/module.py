@@ -137,6 +137,9 @@ class YOLOModule(L.LightningModule):
         # Track if we're resuming from a checkpoint
         self._resumed_from_checkpoint = False
 
+        # Expose image_size as attribute for link_arguments compatibility
+        self.image_size = list(image_size)
+
         # Layer freezing state
         self._frozen_layers: List[str] = []
 
