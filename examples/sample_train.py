@@ -46,8 +46,9 @@ def main():
         val_ann="annotations/instances_val2017.json",
         batch_size=16,
         num_workers=8,
-        image_size=[640, 640],
     )
+    # Set image_size to match model (normally done by CLI automatically)
+    datamodule._image_size = tuple(model.hparams.image_size)
 
     # Create trainer
     trainer = Trainer(

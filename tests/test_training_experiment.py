@@ -73,8 +73,8 @@ class TestDatasetLoading:
             val_ann="annotations/instances_val.json",
             batch_size=2,
             num_workers=0,
-            image_size=[320, 320],
         )
+        dm._image_size = (320, 320)
         dm.setup(stage="fit")
 
         assert dm.train_dataset is not None
@@ -93,9 +93,9 @@ class TestDatasetLoading:
             val_ann="annotations/instances_val.json",
             batch_size=2,
             num_workers=0,
-            image_size=[320, 320],
             mosaic_prob=0.0,  # Disable mosaic for simpler testing
         )
+        dm._image_size = (320, 320)
         dm.setup(stage="fit")
 
         # Get a batch
