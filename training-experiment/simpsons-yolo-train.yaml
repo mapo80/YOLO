@@ -141,7 +141,7 @@ data:
   # DataLoader
   batch_size: 8
   num_workers: 4
-  image_size: [640, 640]
+  # image_size: inherited from model.image_size via CLI link
   pin_memory: true
 
   # Multi-Image Augmentation
