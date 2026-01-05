@@ -815,15 +815,17 @@ Best practices for optimizing data loading performance during training.
 
 ```yaml
 data:
-  num_workers: 8      # Increase for faster loading (default: 8)
-  pin_memory: true    # Faster GPU transfer (default: true)
-  batch_size: 16      # Adjust based on GPU memory
+  num_workers: 8        # Parallel data loading workers (default: 8)
+  pin_memory: true      # Faster GPU transfer (default: true)
+  batch_size: 16        # Adjust based on GPU memory
+  prefetch_factor: 4    # Batches to prefetch per worker (default: 4)
 ```
 
 **Guidelines:**
 - `num_workers`: Set to number of CPU cores, or 2x for I/O-bound workloads
 - `pin_memory`: Keep `true` for GPU training
 - `batch_size`: Larger batches improve throughput but require more VRAM
+- `prefetch_factor`: Number of batches each worker loads in advance. Higher values use more RAM but reduce GPU stalls. With `num_workers=8` and `prefetch_factor=4`, there are 32 batches ready in queue.
 
 ### File Descriptor Limits (num_workers)
 
