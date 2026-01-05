@@ -264,6 +264,69 @@ class TestImageCache:
         # Large dataset should not fit
         assert cache.can_cache_in_ram(100.0) is False
 
+    def test_target_size_stored(self):
+        """Test that target_size is stored correctly."""
+        cache = ImageCache(mode="ram", target_size=(640, 640))
+        assert cache.target_size == (640, 640)
+
+        cache2 = ImageCache(mode="ram", target_size=None)
+        assert cache2.target_size is None
+
+    def test_estimate_memory_with_target_size(self, temp_dir):
+        """Test memory estimation uses target_size when set."""
+        # Create a test image
+        from PIL import Image
+
+        img = Image.new("RGB", (1920, 1080), color="red")
+        img_path = temp_dir / "test.jpg"
+        img.save(img_path)
+
+        # Without target_size - estimates based on original size
+        cache_no_resize = ImageCache(mode="ram", target_size=None)
+        est_original = cache_no_resize.estimate_memory([img_path])
+
+        # With target_size - estimates based on resized dimensions
+        cache_resized = ImageCache(mode="ram", target_size=(640, 640))
+        est_resized = cache_resized.estimate_memory([img_path])
+
+        # Resized estimate should be much smaller
+        # Original: 1920*1080*3 = 6.2MB, Target: 640*640*3 = 1.2MB
+        assert est_resized < est_original
+
+    def test_estimate_memory_with_custom_loader(self, temp_dir):
+        """Test memory estimation with custom image loader."""
+        from PIL import Image
+
+        # Create test image
+        img = Image.new("RGB", (800, 600), color="blue")
+        img_path = temp_dir / "test.jpg"
+        img.save(img_path)
+
+        # Custom loader that wraps the default behavior
+        def custom_loader(path: str) -> Image.Image:
+            return Image.open(path).convert("RGB")
+
+        cache = ImageCache(mode="ram", target_size=None)
+        estimated_gb = cache.estimate_memory([img_path], image_loader=custom_loader)
+
+        # Should return a reasonable estimate
+        assert estimated_gb > 0
+
+    def test_estimate_memory_target_size_exact_calculation(self):
+        """Test that target_size gives exact memory calculation without sampling."""
+        cache = ImageCache(mode="ram", target_size=(640, 480))
+
+        # Even with empty paths, we can calculate exact memory
+        # 640 * 480 * 3 * 1.2 (safety margin) / 1024^3 = ~1.08 MB per image
+        # For 1000 images = ~1.05 GB
+        paths = [Path(f"fake_{i}.jpg") for i in range(1000)]
+        estimated_gb = cache.estimate_memory(paths)
+
+        expected_bytes_per_img = 640 * 480 * 3
+        expected_gb = (expected_bytes_per_img * 1000 * 1.2) / (1024**3)
+
+        assert abs(estimated_gb - expected_gb) < 0.01  # Within 0.01 GB
+
 
 class TestLRUImageBuffer:
     """Tests for LRUImageBuffer class."""
