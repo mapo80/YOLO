@@ -464,6 +464,12 @@ Examples:
         default=100,
         help="Number of calibration images for INT8 (default: 100)",
     )
+    parser.add_argument(
+        "--xnnpack-optimize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply XNNPACK graph rewrites (SiLU→HardSwish, DFL Conv3D→Conv2D) (default: True)",
+    )
 
     try:
         args = parser.parse_args(sys.argv[2:] if argv is None else argv)  # skip subcommand
@@ -499,6 +505,7 @@ Examples:
             calibration_images=args.calibration_images,
             num_calibration_images=args.num_calibration,
             device=args.device,
+            xnnpack_optimize=args.xnnpack_optimize,
         )
         print(f"\nExport complete: {output_path}")
 

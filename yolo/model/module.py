@@ -67,7 +67,8 @@ class Detection(nn.Module):
 
         first_neck, in_channels = in_channels
         anchor_neck = max(round_up(first_neck // 4, groups), anchor_channels, reg_max)
-        class_neck = max(first_neck, min(num_classes * 2, 128))
+        # Use num_classes as intermediate channels to match official pretrained weights
+        class_neck = num_classes
 
         self.anchor_conv = nn.Sequential(
             Conv(in_channels, anchor_neck, 3),
