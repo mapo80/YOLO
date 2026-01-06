@@ -525,6 +525,16 @@ class EMACallback(Callback):
         if not self.enabled:
             return
 
+        # Skip if EMA was already restored from checkpoint
+        if self._ema is not None:
+            # Move EMA weights to the same device as the model
+            device = pl_module.device
+            self._ema.ema.to(device)
+            logger.info(
+                f"EMA restored from checkpoint (updates={self._ema.updates}), moved to {device}"
+            )
+            return
+
         # Initialize EMA with current model weights
         self._ema = ModelEMA(
             model=pl_module,
@@ -611,11 +621,16 @@ class EMACallback(Callback):
 
         # Initialize EMA if not yet created
         if self._ema is None:
+            # Extract updates from checkpoint BEFORE initializing
+            saved_updates = 0
+            if "ema_state" in ema_data:
+                saved_updates = ema_data["ema_state"].get("updates", 0)
+
             self._ema = ModelEMA(
                 model=pl_module,
                 decay=ema_data.get("decay", self.decay),
                 tau=ema_data.get("tau", self.tau),
-                updates=0,
+                updates=saved_updates,
             )
 
         # Load saved EMA state

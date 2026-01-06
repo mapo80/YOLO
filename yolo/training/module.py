@@ -154,6 +154,11 @@ class YOLOModule(L.LightningModule):
         global_step = checkpoint.get("global_step", 0)
         logger.info(f"🔄 Resuming from checkpoint (epoch {epoch + 1}, step {global_step})")
 
+        # Log scheduler state for debugging
+        if "lr_schedulers" in checkpoint and checkpoint["lr_schedulers"]:
+            sched_state = checkpoint["lr_schedulers"][0]
+            logger.info(f"📊 Scheduler state: last_epoch={sched_state.get('last_epoch')}, last_lr={sched_state.get('_last_lr')}")
+
     def setup(self, stage: str) -> None:
         """Setup loss function, converter, and metrics after model is on device."""
         if stage == "fit" or stage == "validate":
