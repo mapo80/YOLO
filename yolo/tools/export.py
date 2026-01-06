@@ -318,6 +318,400 @@ def _letterbox_image(
     return new_image
 
 
+def _replace_silu_with_hardswish(onnx_path: str, verbose: bool = True) -> int:
+    """
+    Replace SiLU activations with HardSwish in ONNX model for XNNPACK compatibility.
+
+    SiLU (Sigmoid Linear Unit): y = x * sigmoid(x)
+    HardSwish approximation: y = x * clip(x + 3, 0, 6) / 6
+
+    HardSwish is fully supported by XNNPACK delegate, while LOGISTIC (sigmoid) is not.
+    This transformation allows full GPU/XNNPACK delegation without retraining.
+
+    Args:
+        onnx_path: Path to the ONNX model (modified in-place)
+        verbose: Whether to print progress messages
+
+    Returns:
+        Number of SiLU patterns replaced
+    """
+    try:
+        import onnx
+        from onnx import helper, TensorProto
+    except ImportError:
+        if verbose:
+            print("   ⚠️  ONNX not available, skipping SiLU→HardSwish replacement")
+        return 0
+
+    if verbose:
+        print("   🔄 Replacing SiLU with HardSwish for XNNPACK compatibility...")
+
+    model = onnx.load(onnx_path)
+    graph = model.graph
+
+    # Build a map of node outputs to nodes
+    output_to_node = {}
+    for node in graph.node:
+        for out in node.output:
+            output_to_node[out] = node
+
+    # Build a map of node index for proper insertion
+    node_index = {node.name: i for i, node in enumerate(graph.node)}
+
+    # Find all Sigmoid nodes that are part of SiLU pattern
+    sigmoid_nodes = {node.name: node for node in graph.node if node.op_type == 'Sigmoid'}
+
+    if verbose:
+        print(f"      Found {len(sigmoid_nodes)} Sigmoid operations")
+
+    # Track replacements: (sigmoid_node, mul_node, x_input, output_name)
+    replacements_info = []
+
+    for node in list(graph.node):
+        if node.op_type == 'Mul':
+            # Check if this is x * sigmoid(x) pattern
+            inputs = list(node.input)
+            if len(inputs) != 2:
+                continue
+
+            sig_input = None
+            x_input = None
+
+            for inp in inputs:
+                # Check if input comes from a Sigmoid
+                if inp in output_to_node:
+                    sig_node = output_to_node[inp]
+                    if sig_node.op_type == 'Sigmoid':
+                        # The other input should be the same as sigmoid's input
+                        other_inp = [i for i in inputs if i != inp][0]
+                        if other_inp == sig_node.input[0]:
+                            sig_input = sig_node
+                            x_input = other_inp
+                            break
+
+            if sig_input and x_input:
+                replacements_info.append((sig_input, node, x_input, node.output[0]))
+
+    if verbose:
+        print(f"      Found {len(replacements_info)} SiLU patterns to replace")
+
+    if not replacements_info:
+        if verbose:
+            print("      ℹ️  No SiLU patterns found")
+        return 0
+
+    # Create new graph nodes list
+    new_nodes = []
+    nodes_to_skip = set()
+    initializers_to_add = []
+
+    for sig_node, mul_node, _, _ in replacements_info:
+        nodes_to_skip.add(sig_node.name)
+        nodes_to_skip.add(mul_node.name)
+
+    replacement_idx = 0
+    for node in graph.node:
+        if node.name in nodes_to_skip:
+            # Check if this is a sigmoid node that starts a SiLU pattern
+            for sig_node, mul_node, x_input, output_name in replacements_info:
+                if node.name == sig_node.name:
+                    # Insert HardSwish nodes here (after we see the sigmoid)
+                    replacement_idx += 1
+                    prefix = f"hardswish_{replacement_idx}"
+
+                    # Constants (add as initializers)
+                    const_3 = helper.make_tensor(f"{prefix}_const_3", TensorProto.FLOAT, [], [3.0])
+                    const_6 = helper.make_tensor(f"{prefix}_const_6", TensorProto.FLOAT, [], [6.0])
+                    const_0 = helper.make_tensor(f"{prefix}_const_0", TensorProto.FLOAT, [], [0.0])
+                    initializers_to_add.extend([const_3, const_6, const_0])
+
+                    # Create HardSwish: y = x * clip(x + 3, 0, 6) / 6
+
+                    # x + 3
+                    add_node = helper.make_node(
+                        'Add',
+                        inputs=[x_input, f"{prefix}_const_3"],
+                        outputs=[f"{prefix}_add"],
+                        name=f"{prefix}_add_node"
+                    )
+
+                    # clip(x + 3, 0, 6)
+                    clip_node = helper.make_node(
+                        'Clip',
+                        inputs=[f"{prefix}_add", f"{prefix}_const_0", f"{prefix}_const_6"],
+                        outputs=[f"{prefix}_clip"],
+                        name=f"{prefix}_clip_node"
+                    )
+
+                    # x * clip(...)
+                    mul_node_new = helper.make_node(
+                        'Mul',
+                        inputs=[x_input, f"{prefix}_clip"],
+                        outputs=[f"{prefix}_mul"],
+                        name=f"{prefix}_mul_node"
+                    )
+
+                    # / 6 -> output same as original SiLU output
+                    div_node = helper.make_node(
+                        'Div',
+                        inputs=[f"{prefix}_mul", f"{prefix}_const_6"],
+                        outputs=[output_name],
+                        name=f"{prefix}_div_node"
+                    )
+
+                    new_nodes.extend([add_node, clip_node, mul_node_new, div_node])
+                    break
+        else:
+            new_nodes.append(node)
+
+    # Replace graph nodes
+    del graph.node[:]
+    graph.node.extend(new_nodes)
+
+    # Add initializers for constants
+    graph.initializer.extend(initializers_to_add)
+
+    # Validate and clean up the model
+    try:
+        import onnxsim
+        model_simp, check = onnxsim.simplify(model)
+        if check:
+            model = model_simp
+            if verbose:
+                print("      ✅ Model simplified after HardSwish replacement")
+    except Exception:
+        pass  # Continue without simplification if onnxsim fails
+
+    # Save modified model
+    onnx.save(model, onnx_path)
+
+    if verbose:
+        print(f"      ✅ Replaced {len(replacements_info)} SiLU patterns with HardSwish")
+
+    return len(replacements_info)
+
+
+def _replace_dfl_conv3d_gather_with_conv2d(onnx_path: str, verbose: bool = True) -> int:
+    """
+    Replace DFL anc2vec Conv3D + Gather with Conv2D + Reshape for full XNNPACK delegation.
+
+    In YOLOv9 DFL (Distribution Focal Loss) decoding, the expected value is computed via a 3D Conv:
+      x: [N, C, D, H, W]  (C = reg_max+1, D = 4 coords)
+      y = Conv3D(x, w:[1,C,1,1,1]) -> [N, 1, D, H, W]
+      z = Gather(y, idx=0, axis=1) -> [N, D, H, W]
+
+    TFLite conversion maps this to CONV_3D + GATHER, which XNNPACK cannot delegate.
+    We rewrite it to an equivalent Conv2D by folding D into H:
+      x1 = Reshape(x) -> [N, C, D*H, W]
+      y1 = Conv2D(x1, w2d:[1,C,1,1]) -> [N, 1, D*H, W]
+      z  = Reshape(y1) -> [N, D, H, W]
+
+    This is mathematically identical (1x1 kernel) and removes CONV_3D/GATHER without retraining.
+
+    Args:
+        onnx_path: Path to the ONNX model (modified in-place)
+        verbose: Whether to print progress messages
+
+    Returns:
+        Number of DFL patterns replaced
+    """
+    try:
+        import numpy as np
+        import onnx
+        from onnx import TensorProto, helper, numpy_helper, shape_inference
+    except ImportError:
+        if verbose:
+            print("   ⚠️  ONNX/numpy not available, skipping DFL Conv3D→Conv2D replacement")
+        return 0
+
+    if verbose:
+        print("   🔄 Replacing DFL Conv3D+Gather with Conv2D+Reshape for XNNPACK...")
+
+    model = onnx.load(onnx_path)
+
+    # Shapes are needed to compute D*H; export_onnx(simplify=True) should make them static.
+    try:
+        model = shape_inference.infer_shapes(model)
+    except Exception:
+        pass
+
+    graph = model.graph
+
+    # Build shape map
+    shape_by_name = {}
+    for vi in list(graph.value_info) + list(graph.input) + list(graph.output):
+        t = vi.type.tensor_type
+        if not t.HasField("shape"):
+            continue
+        dims = []
+        for d in t.shape.dim:
+            if d.HasField("dim_value"):
+                dims.append(int(d.dim_value))
+            else:
+                dims.append(None)
+        shape_by_name[vi.name] = dims
+
+    init_by_name = {i.name: i for i in graph.initializer}
+
+    # Producer map: tensor_name -> node
+    producer = {}
+    for node in graph.node:
+        for out in node.output:
+            producer[out] = node
+
+    def _const_array(name: str, max_hops: int = 8):  # noqa: ANN001
+        """Resolve constant tensor value from initializer/Identity/Constant nodes."""
+        cur = name
+        for _ in range(max_hops):
+            if cur in init_by_name:
+                return numpy_helper.to_array(init_by_name[cur])
+            node = producer.get(cur)
+            if node is None:
+                return None
+            if node.op_type == "Identity" and node.input:
+                cur = node.input[0]
+                continue
+            if node.op_type == "Constant":
+                for attr in node.attribute:
+                    if attr.name == "value":
+                        tp = helper.get_attribute_value(attr)
+                        return numpy_helper.to_array(tp)
+                return None
+            return None
+        return None
+
+    weight2d_name = "xnnpack_anc2vec_weight_2d"
+    has_weight2d = weight2d_name in init_by_name
+
+    nodes_to_remove = set()
+    new_nodes = []
+    replacements = 0
+
+    for gather_node in graph.node:
+        if gather_node.op_type != "Gather":
+            continue
+        if "/anc2vec/Gather" not in (gather_node.name or ""):
+            continue
+
+        axis = 0
+        for attr in gather_node.attribute:
+            if attr.name == "axis":
+                axis = int(helper.get_attribute_value(attr))
+                break
+        if axis != 1:
+            continue
+        if len(gather_node.input) < 2:
+            continue
+
+        conv_out = gather_node.input[0]
+        conv_node = producer.get(conv_out)
+        if conv_node is None or conv_node.op_type != "Conv":
+            continue
+        if "/anc2vec/anc2vec/Conv" not in (conv_node.name or ""):
+            continue
+
+        x_name = conv_node.input[0]
+        x_shape = shape_by_name.get(x_name)
+        if not x_shape or len(x_shape) != 5:
+            continue
+        n, c, d, h, w = x_shape
+        if any(v is None for v in (n, c, d, h, w)):
+            continue
+
+        idx_arr = _const_array(gather_node.input[1])
+        if idx_arr is None or getattr(idx_arr, "shape", None) != ():
+            continue
+        if int(idx_arr) != 0:
+            continue
+
+        if not has_weight2d:
+            w_arr = _const_array(conv_node.input[1])
+            if w_arr is None or getattr(w_arr, "ndim", None) != 5:
+                continue
+            # (1, C, 1, 1, 1) -> (1, C, 1, 1)
+            w2d_arr = np.squeeze(w_arr, axis=2).astype(np.float32, copy=False)
+            graph.initializer.append(numpy_helper.from_array(w2d_arr, name=weight2d_name))
+            init_by_name[weight2d_name] = graph.initializer[-1]
+            has_weight2d = True
+
+        replacements += 1
+        prefix = f"xnnpack_dfl_{replacements}"
+
+        reshape_in_shape_name = f"{prefix}_reshape_in_shape"
+        reshape_out_shape_name = f"{prefix}_reshape_out_shape"
+        graph.initializer.append(
+            helper.make_tensor(
+                reshape_in_shape_name,
+                TensorProto.INT64,
+                [4],
+                [int(n), int(c), int(d) * int(h), int(w)],
+            )
+        )
+        graph.initializer.append(
+            helper.make_tensor(
+                reshape_out_shape_name,
+                TensorProto.INT64,
+                [4],
+                [int(n), int(d), int(h), int(w)],
+            )
+        )
+
+        reshape_in_out = f"{prefix}_reshape_in"
+        conv2d_out = f"{prefix}_conv2d_out"
+
+        reshape_in_node = helper.make_node(
+            "Reshape",
+            inputs=[x_name, reshape_in_shape_name],
+            outputs=[reshape_in_out],
+            name=f"{prefix}_reshape_in_node",
+        )
+        conv2d_node = helper.make_node(
+            "Conv",
+            inputs=[reshape_in_out, weight2d_name],
+            outputs=[conv2d_out],
+            name=f"{prefix}_conv2d_node",
+            dilations=[1, 1],
+            group=1,
+            kernel_shape=[1, 1],
+            pads=[0, 0, 0, 0],
+            strides=[1, 1],
+        )
+        reshape_out_node = helper.make_node(
+            "Reshape",
+            inputs=[conv2d_out, reshape_out_shape_name],
+            outputs=[gather_node.output[0]],
+            name=f"{prefix}_reshape_out_node",
+        )
+
+        new_nodes.extend([reshape_in_node, conv2d_node, reshape_out_node])
+        nodes_to_remove.add(gather_node.name)
+        nodes_to_remove.add(conv_node.name)
+
+    if replacements == 0:
+        if verbose:
+            print("      ℹ️  No DFL Conv3D+Gather patterns found")
+        return 0
+
+    # Replace graph nodes (append new nodes at the end; outputs are not consumed internally).
+    kept_nodes = [n for n in graph.node if n.name not in nodes_to_remove]
+    del graph.node[:]
+    graph.node.extend(kept_nodes)
+    graph.node.extend(new_nodes)
+
+    try:
+        onnx.checker.check_model(model)
+    except Exception as e:
+        if verbose:
+            print(f"      ⚠️  ONNX validation warning after DFL rewrite: {str(e)[:200]}")
+
+    onnx.save(model, onnx_path)
+
+    if verbose:
+        print(f"      ✅ Replaced {replacements} DFL Conv3D+Gather patterns")
+
+    return replacements
+
+
 def _add_tflite_metadata(
     tflite_path: str,
     metadata: Dict[str, Any],
@@ -366,6 +760,7 @@ def _convert_onnx_to_tflite_via_cli(
         True if successful, False otherwise
     """
     # Configure onnx2tf CLI with optimized parameters for YOLO models
+    # Full XNNPACK delegation optimization
     cmd = [
         sys.executable, "-m", "onnx2tf",
         "-i", onnx_path,
@@ -375,6 +770,8 @@ def _convert_onnx_to_tflite_via_cli(
         "-nuo",  # not_use_onnxsim - avoid shape inference issues
         "-b", "1",  # Set static batch size to help resolve dynamic shape issues
         "-ois", f"images:1,3,{image_size[0]},{image_size[1]}",  # Explicit input shape
+        "-ofgd",  # optimization_for_gpu_delegate - improves XNNPACK/GPU compatibility
+        "-dgc",  # disable_group_convolution - convert to standard conv for better compatibility
     ]
 
     # Add batchmatmul_unfold for non-INT8 exports (improves GPU delegate detection)
@@ -383,7 +780,8 @@ def _convert_onnx_to_tflite_via_cli(
 
     if quantization == "int8" and calibration_path:
         cmd.extend(["-oiqt", "-qt", "per-channel"])
-        cmd.extend(["-cind", "images", calibration_path, "[[[0,0,0]]]", "[[[255,255,255]]]"])
+        # IMPORTANT: Use [0,1] range since calibration images are normalized to [0,1]
+        cmd.extend(["-cind", "images", calibration_path, "[[[0,0,0]]]", "[[[1,1,1]]]"])
 
     try:
         print(f"   Running: {' '.join(cmd[:6])}...")
@@ -413,6 +811,7 @@ def export_tflite(
     device: Optional[str] = None,
     add_metadata: bool = True,
     nms: bool = False,
+    xnnpack_optimize: bool = True,
 ) -> str:
     """
     Export a YOLO model from Lightning checkpoint to TFLite format.
@@ -429,6 +828,7 @@ def export_tflite(
         device: Device to use for initial ONNX export (auto-detected if None)
         add_metadata: Whether to embed metadata in the TFLite file
         nms: Whether to include NMS in the model (experimental)
+        xnnpack_optimize: Whether to apply XNNPACK graph rewrites (SiLU→HardSwish, DFL Conv3D→Conv2D) (default: True)
 
     Returns:
         Path to the exported TFLite file
@@ -530,6 +930,11 @@ def export_tflite(
             verbose=False,
         )
 
+        # Apply XNNPACK optimizations (SiLU → HardSwish, DFL Conv3D/Gather → Conv2D/Reshape)
+        if xnnpack_optimize:
+            _replace_silu_with_hardswish(str(onnx_path), verbose=True)
+            _replace_dfl_conv3d_gather_with_conv2d(str(onnx_path), verbose=True)
+
         # Step 2: Convert ONNX to TFLite
         print("\n" + "-" * 40)
         print("🔄 Step 2/3: Converting ONNX to TFLite...")
@@ -563,6 +968,7 @@ def export_tflite(
                 import onnx2tf
 
                 # Configure onnx2tf with optimized parameters for YOLO models
+                # Full XNNPACK delegation optimization
                 h, w = image_size
                 convert_kwargs = {
                     "input_onnx_file_path": str(onnx_path),
@@ -572,6 +978,8 @@ def export_tflite(
                     "output_signaturedefs": True,  # Fix Attention block group convolution issues
                     "copy_onnx_input_output_names_to_tflite": True,
                     "enable_batchmatmul_unfold": quantization != "int8",  # Fix detected objects on GPU delegate
+                    "optimization_for_gpu_delegate": True,  # Improves XNNPACK/GPU compatibility
+                    "disable_group_convolution": True,  # Convert group conv to standard conv for better compatibility
                     # Overwrite input shape to help resolve dynamic dimension issues
                     "batch_size": 1,  # Static batch size
                     "overwrite_input_shape": [f"images:1,3,{h},{w}"],  # Explicit input shape
@@ -580,11 +988,12 @@ def export_tflite(
                 if quantization == "int8" and calib_path:
                     convert_kwargs["output_integer_quantized_tflite"] = True
                     convert_kwargs["quant_type"] = "per-channel"
+                    # IMPORTANT: Use [0,1] range since calibration images are normalized to [0,1]
                     convert_kwargs["custom_input_op_name_np_data_path"] = [[
                         "images",
                         str(calib_path),
                         [[[[0, 0, 0]]]],  # min values
-                        [[[[255, 255, 255]]]],  # max values
+                        [[[[1, 1, 1]]]],  # max values (normalized range, NOT 255!)
                     ]]
 
                 print("   Running onnx2tf conversion (Python API)...")

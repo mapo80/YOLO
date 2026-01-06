@@ -122,8 +122,17 @@ runs
 *.pth
 *.pt
 *.trt
-*.onnx
 *.npy
+*.tflite
+
+# ONNX files (ignored globally, but allowed in exports/)
+*.onnx
+!exports/*.onnx
+
+# Exports folder (large model files)
+exports/*.ckpt
+exports/*.tflite
+exports/*.npy
 
 # Image files
 *.png
