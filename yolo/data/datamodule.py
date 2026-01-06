@@ -798,10 +798,11 @@ class CocoDetectionWrapper(CocoDetection):
     def _load_and_cache_image(self, idx: int, path: Path, target_size: Optional[Tuple[int, int]]) -> None:
         """Load a single image and store in cache (called by thread workers)."""
         img = self._image_loader(str(path))
+        orig_size = img.size if target_size is not None else None  # Save original size only if resizing
         if target_size is not None:
             img = self._resize_for_cache(img, target_size)
         img_np = np.asarray(img).copy()
-        self._image_cache.put(idx, img_np)
+        self._image_cache.put(idx, img_np, orig_size=orig_size)
 
     @staticmethod
     def _resize_for_cache(img: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
@@ -825,8 +826,14 @@ class CocoDetectionWrapper(CocoDetection):
 
         return padded
 
-    def _load_image(self, id: int, index: int):
-        """Load image, using cache if available."""
+    def _load_image(self, id: int, index: int) -> Tuple[Image.Image, Optional[Tuple[int, int]]]:
+        """
+        Load image, using cache if available.
+
+        Returns:
+            Tuple of (image, orig_size) where orig_size is the original image size
+            before cache resize (width, height), or None if not resized.
+        """
         path = self.coco.loadImgs(id)[0]["file_name"]
         full_path = Path(os.path.join(self.root, path))
 
@@ -834,17 +841,18 @@ class CocoDetectionWrapper(CocoDetection):
         if self._image_cache is not None:
             cached = self._image_cache.get(index)
             if cached is not None:
-                return Image.fromarray(cached)
+                img_arr, orig_size = cached
+                return Image.fromarray(img_arr), orig_size
 
         # Load from disk
         img = self._image_loader(str(full_path))
 
-        # Store in cache for next time
+        # Store in cache for next time (no resize when loading from disk directly)
         if self._image_cache is not None:
             img_np = np.asarray(img).copy()
-            self._image_cache.put(index, img_np)
+            self._image_cache.put(index, img_np, orig_size=None)
 
-        return img
+        return img, None  # No resize info when loaded from disk
 
     def __getitem__(self, index: int):
         """Get image and target at index."""
@@ -852,19 +860,64 @@ class CocoDetectionWrapper(CocoDetection):
         id = self.ids[index]
 
         # Load image using custom loader (with cache)
-        image = self._load_image(id, index)
+        image, orig_size = self._load_image(id, index)
 
         # Get annotations
         target = self._load_target(id)
 
         # Convert COCO annotations to YOLO format
-        target = self.target_transform(target, image.size)
+        # Use orig_size for bbox transform if image was resized in cache
+        bbox_reference_size = orig_size if orig_size is not None else image.size
+        target = self.target_transform(target, bbox_reference_size)
+
+        # If image was resized in cache, transform bboxes to match the resized image
+        if orig_size is not None:
+            target = self._transform_bboxes_for_letterbox(target, orig_size, image.size)
 
         # Apply transforms
         if self._transforms is not None:
             image, target = self._transforms(image, target)
 
         return image, target
+
+    def _transform_bboxes_for_letterbox(
+        self, target: Dict[str, Any], orig_size: Tuple[int, int], target_size: Tuple[int, int]
+    ) -> Dict[str, Any]:
+        """
+        Transform bboxes from original image coordinates to letterboxed image coordinates.
+
+        Args:
+            target: Target dict with 'boxes' in xyxy pixel format (from YOLOTargetTransform)
+            orig_size: Original image size (width, height)
+            target_size: Letterboxed image size (width, height)
+
+        Returns:
+            Target dict with transformed bboxes
+        """
+        if "boxes" not in target or len(target["boxes"]) == 0:
+            return target
+
+        orig_w, orig_h = orig_size
+        target_w, target_h = target_size
+
+        # Calculate letterbox parameters (same as _resize_for_cache)
+        scale = min(target_w / orig_w, target_h / orig_h)
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        pad_x = (target_w - new_w) // 2
+        pad_y = (target_h - new_h) // 2
+
+        # Transform bboxes: xyxy pixel coords in original -> xyxy pixel coords in letterboxed
+        boxes = target["boxes"].clone()
+
+        # Scale all coordinates
+        boxes[:, 0] = boxes[:, 0] * scale + pad_x  # x1
+        boxes[:, 1] = boxes[:, 1] * scale + pad_y  # y1
+        boxes[:, 2] = boxes[:, 2] * scale + pad_x  # x2
+        boxes[:, 3] = boxes[:, 3] * scale + pad_y  # y2
+
+        target["boxes"] = boxes
+        return target
 
     def disable_mosaic(self):
         """Disable mosaic augmentation (called near end of training)."""
@@ -1072,10 +1125,11 @@ class YOLOFormatDataset(Dataset):
     def _load_and_cache_image(self, idx: int, path: Path, target_size: Optional[Tuple[int, int]]) -> None:
         """Load a single image and store in cache (called by thread workers)."""
         img = self._image_loader(str(path))
+        orig_size = img.size if target_size is not None else None  # Save original size only if resizing
         if target_size is not None:
             img = self._resize_for_cache(img, target_size)
         img_np = np.asarray(img).copy()
-        self._image_cache.put(idx, img_np)
+        self._image_cache.put(idx, img_np, orig_size=orig_size)
 
     @staticmethod
     def _resize_for_cache(img: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
@@ -1230,31 +1284,43 @@ class YOLOFormatDataset(Dataset):
 
         return {"boxes_norm": boxes_norm, "labels": labels}
 
-    def _load_image(self, index: int) -> Image.Image:
-        """Load image, using cache if available."""
+    def _load_image(self, index: int) -> Tuple[Image.Image, Optional[Tuple[int, int]]]:
+        """
+        Load image, using cache if available.
+
+        Returns:
+            Tuple of (image, orig_size) where orig_size is the original image size
+            before cache resize (width, height), or None if not resized.
+        """
         image_path = self.image_files[index]
 
         # Try cache first
         if self._image_cache is not None:
             cached = self._image_cache.get(index)
             if cached is not None:
-                return Image.fromarray(cached)
+                img_arr, orig_size = cached
+                return Image.fromarray(img_arr), orig_size
 
         # Load from disk
         img = self._image_loader(str(image_path))
 
-        # Store in cache for next time
+        # Store in cache for next time (no resize when loading from disk directly)
         if self._image_cache is not None:
             img_np = np.asarray(img).copy()
-            self._image_cache.put(index, img_np)
+            self._image_cache.put(index, img_np, orig_size=None)
 
-        return img
+        return img, None  # No resize info when loaded from disk
 
     def __getitem__(self, index: int):
         """Get image and target at index."""
         # Load image (with cache if enabled)
-        image = self._load_image(index)
-        img_w, img_h = image.size
+        image, orig_size = self._load_image(index)
+
+        # Use original size for bbox calculation if image was resized in cache
+        if orig_size is not None:
+            img_w, img_h = orig_size
+        else:
+            img_w, img_h = image.size
 
         # Get labels (from cache or parse on-the-fly)
         if self._labels_cache is not None:
@@ -1263,6 +1329,7 @@ class YOLOFormatDataset(Dataset):
             label_ids = cached["labels"]
         else:
             # Parse on-the-fly (no caching)
+            image_path = self.image_files[index]
             parsed = self._parse_label_file(image_path)
             boxes_norm = parsed["boxes_norm"]
             label_ids = parsed["labels"]
@@ -1301,8 +1368,51 @@ class YOLOFormatDataset(Dataset):
                 "labels": torch.zeros((0,), dtype=torch.long),
             }
 
+        # If image was resized in cache, transform bboxes to match letterboxed image
+        if orig_size is not None:
+            target = self._transform_bboxes_for_letterbox(target, orig_size, image.size)
+
         # Apply transforms
         if self._transforms is not None:
             image, target = self._transforms(image, target)
 
         return image, target
+
+    def _transform_bboxes_for_letterbox(
+        self, target: Dict[str, Any], orig_size: Tuple[int, int], target_size: Tuple[int, int]
+    ) -> Dict[str, Any]:
+        """
+        Transform bboxes from original image coordinates to letterboxed image coordinates.
+
+        Args:
+            target: Target dict with 'boxes' in xyxy pixel format
+            orig_size: Original image size (width, height)
+            target_size: Letterboxed image size (width, height)
+
+        Returns:
+            Target dict with transformed bboxes
+        """
+        if "boxes" not in target or len(target["boxes"]) == 0:
+            return target
+
+        orig_w, orig_h = orig_size
+        target_w, target_h = target_size
+
+        # Calculate letterbox parameters (same as _resize_for_cache)
+        scale = min(target_w / orig_w, target_h / orig_h)
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        pad_x = (target_w - new_w) // 2
+        pad_y = (target_h - new_h) // 2
+
+        # Transform bboxes: pixel coords in original -> pixel coords in letterboxed
+        boxes = target["boxes"].clone()
+
+        # Scale coordinates
+        boxes[:, 0] = boxes[:, 0] * scale + pad_x  # x1
+        boxes[:, 1] = boxes[:, 1] * scale + pad_y  # y1
+        boxes[:, 2] = boxes[:, 2] * scale + pad_x  # x2
+        boxes[:, 3] = boxes[:, 3] * scale + pad_y  # y2
+
+        target["boxes"] = boxes
+        return target

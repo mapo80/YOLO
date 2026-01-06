@@ -186,7 +186,8 @@ class ImageCache:
     # Cache version for compatibility checking
     # v3.0.0: Initial LMDB implementation
     # v3.1.0: Fast hash computation (sampled paths instead of all)
-    CACHE_VERSION = "3.1.0"
+    # v3.2.0: Store original image size for correct bbox transformation with resized cache
+    CACHE_VERSION = "3.2.0"
 
     # Dtype mapping for efficient serialization
     DTYPE_TO_ID = {
@@ -558,14 +559,32 @@ class ImageCache:
                     "Cache reads will fail."
                 )
 
-    def _serialize(self, arr: np.ndarray) -> bytes:
-        """Serialize numpy array to bytes with compact header."""
+    def _serialize(self, arr: np.ndarray, orig_size: Optional[Tuple[int, int]] = None) -> bytes:
+        """
+        Serialize numpy array to bytes with compact header.
+
+        Args:
+            arr: Image array to serialize
+            orig_size: Original image size (width, height) before resize, or None if not resized
+
+        Returns:
+            Serialized bytes with header containing dtype, shape, and orig_size
+        """
         import struct
 
-        # Header: dtype_id (1 byte) + ndim (1 byte) + shape (4 bytes each dim)
-        # Use < for little-endian to avoid struct padding issues
+        # Header format (little-endian):
+        # - dtype_id: 1 byte
+        # - ndim: 1 byte
+        # - has_orig_size: 1 byte (0 or 1)
+        # - shape: 4 bytes * ndim
+        # - orig_size (if has_orig_size): 4 bytes * 2 (orig_w, orig_h)
         dtype_id = self.DTYPE_TO_ID.get(arr.dtype, 0)
-        header = struct.pack(f"<BB{arr.ndim}I", dtype_id, arr.ndim, *arr.shape)
+        has_orig_size = 1 if orig_size is not None else 0
+
+        header = struct.pack(f"<BBB{arr.ndim}I", dtype_id, arr.ndim, has_orig_size, *arr.shape)
+        if orig_size is not None:
+            header += struct.pack("<II", orig_size[0], orig_size[1])
+
         data = header + arr.tobytes()
 
         if self._encrypt_cache and self._crypto is not None:
@@ -573,23 +592,38 @@ class ImageCache:
 
         return data
 
-    def _deserialize(self, data: bytes) -> np.ndarray:
-        """Deserialize bytes to numpy array."""
+    def _deserialize(self, data: bytes) -> Tuple[np.ndarray, Optional[Tuple[int, int]]]:
+        """
+        Deserialize bytes to numpy array and original size.
+
+        Returns:
+            Tuple of (image array, original size or None)
+        """
         import struct
 
         if self._encrypt_cache and self._crypto is not None:
             data = self._crypto.decrypt(data)
 
         # Parse header (little-endian)
-        dtype_id, ndim = struct.unpack("<BB", data[:2])
-        shape = struct.unpack(f"<{ndim}I", data[2:2 + 4 * ndim])
+        dtype_id, ndim, has_orig_size = struct.unpack("<BBB", data[:3])
+        shape = struct.unpack(f"<{ndim}I", data[3:3 + 4 * ndim])
         dtype = self.ID_TO_DTYPE.get(dtype_id, np.dtype("uint8"))
 
-        # Extract array data
-        arr_data = data[2 + 4 * ndim:]
-        return np.frombuffer(arr_data, dtype=dtype).reshape(shape)
+        # Parse orig_size if present
+        header_end = 3 + 4 * ndim
+        orig_size = None
+        if has_orig_size:
+            orig_w, orig_h = struct.unpack("<II", data[header_end:header_end + 8])
+            orig_size = (orig_w, orig_h)
+            header_end += 8
 
-    def get(self, idx: int) -> Optional[np.ndarray]:
+        # Extract array data
+        arr_data = data[header_end:]
+        arr = np.frombuffer(arr_data, dtype=dtype).reshape(shape)
+
+        return arr, orig_size
+
+    def get(self, idx: int) -> Optional[Tuple[np.ndarray, Optional[Tuple[int, int]]]]:
         """
         Get cached image by index.
 
@@ -597,7 +631,8 @@ class ImageCache:
             idx: Image index.
 
         Returns:
-            Cached image array or None if not cached.
+            Tuple of (image array, original size) or None if not cached.
+            Original size is (width, height) before resize, or None if not resized.
         """
         if not self._enabled or self._env is None:
             return None
@@ -616,13 +651,14 @@ class ImageCache:
             logger.debug(f"Failed to read from cache: {e}")
             return None
 
-    def put(self, idx: int, arr: np.ndarray) -> None:
+    def put(self, idx: int, arr: np.ndarray, orig_size: Optional[Tuple[int, int]] = None) -> None:
         """
         Store image in cache.
 
         Args:
             idx: Image index.
             arr: Image array to cache.
+            orig_size: Original image size (width, height) before resize, or None if not resized.
         """
         if not self._enabled or self._env is None:
             return
@@ -632,7 +668,7 @@ class ImageCache:
 
         try:
             key = str(idx).encode()
-            value = self._serialize(arr)
+            value = self._serialize(arr, orig_size)
 
             with self._env.begin(write=True) as txn:
                 txn.put(key, value)
