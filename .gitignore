@@ -125,14 +125,11 @@ runs
 *.npy
 *.tflite
 
-# ONNX files (ignored globally, but allowed in exports/)
+# ONNX files
 *.onnx
-!exports/*.onnx
 
-# Exports folder (large model files)
-exports/*.ckpt
-exports/*.tflite
-exports/*.npy
+# Exports folder (generated model files - not tracked)
+exports/
 
 # Image files
 *.png

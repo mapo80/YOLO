@@ -23,6 +23,7 @@ This repository extends the official YOLOv7[^1], YOLOv9[^2], and YOLO-RD[^3] imp
   - [Validation](#validation)
   - [Inference](#inference)
   - [Export](#export)
+  - [Quantization-Aware Training (QAT)](#quantization-aware-training-qat)
 - [Image Loaders](#image-loaders)
 - [Data Loading Performance](#data-loading-performance)
 - [Advanced Training Techniques](#advanced-training-techniques)
@@ -461,6 +462,23 @@ exports/
 
 ONNX export is the fastest and simplest option, with no additional dependencies beyond the base installation.
 
+**Output Format (YOLOv9 Compatible):**
+
+The exported ONNX model uses the same output format as the [original YOLOv9 repository](https://github.com/WongKinYiu/yolov9):
+
+| Property | Value |
+|----------|-------|
+| Input name | `images` |
+| Input shape | `[batch, 3, height, width]` |
+| Output name | `output0` |
+| Output shape | `[batch, num_detections, 4+num_classes]` |
+
+For a 640x640 image with 80 COCO classes: `[1, 8400, 84]`
+- First 4 values: `x1, y1, x2, y2` (xyxy bounding box in absolute pixels)
+- Remaining 80 values: class probabilities (post-sigmoid)
+
+This format ensures compatibility with existing YOLOv9 inference code and deployment pipelines.
+
 ```shell
 # Basic ONNX export
 python -m yolo.cli export --checkpoint runs/best.ckpt --format onnx
@@ -745,6 +763,117 @@ The export uses **per-channel quantization** by default, which provides better a
 **Issue: Calibration takes too long**
 - Reduce `--num-calibration` (100 is usually sufficient)
 - Use smaller input size `--size 416`
+
+#### Quantization-Aware Training (QAT)
+
+If post-training INT8 quantization results in unacceptable accuracy loss, **Quantization-Aware Training (QAT)** can recover most of the accuracy by simulating INT8 quantization during training.
+
+##### Why QAT?
+
+YOLOv9's **Distribution Focal Loss (DFL)** decoder uses softmax over 16 values for precise coordinate prediction. This layer is particularly sensitive to INT8 quantization. Post-training quantization (PTQ) can cause significant accuracy degradation (~20-40% mAP loss). QAT fine-tunes the model with fake quantization operators, allowing it to learn to be robust to quantization errors.
+
+**Expected results:**
+- **PTQ INT8**: ~56% of original mAP (significant loss)
+- **QAT INT8**: ~95-98% of original mAP (minimal loss)
+
+##### QAT Fine-tuning Command
+
+```shell
+# Basic QAT fine-tuning (20 epochs recommended)
+python -m yolo.cli qat-finetune \
+    --checkpoint runs/best.ckpt \
+    --config config.yaml \
+    --epochs 20 \
+    --lr 0.0001
+
+# QAT with custom settings
+python -m yolo.cli qat-finetune \
+    --checkpoint runs/best.ckpt \
+    --config config.yaml \
+    --epochs 30 \
+    --lr 0.00005 \
+    --backend qnnpack \
+    --freeze-bn-after 10 \
+    --output runs/qat
+
+# QAT with automatic TFLite export
+python -m yolo.cli qat-finetune \
+    --checkpoint runs/best.ckpt \
+    --config config.yaml \
+    --epochs 20 \
+    --export-tflite \
+    --calibration-images data/train/images/
+```
+
+##### QAT CLI Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--checkpoint, -c` | required | Path to pre-trained model checkpoint |
+| `--config` | required | Path to config YAML (for data configuration) |
+| `--epochs` | 20 | Number of QAT fine-tuning epochs |
+| `--lr` | 0.0001 | Learning rate (lower than training) |
+| `--batch-size` | 16 | Batch size for training |
+| `--backend` | qnnpack | Quantization backend: `qnnpack` (mobile), `x86`, `fbgemm` |
+| `--freeze-bn-after` | 5 | Freeze batch norm statistics after N epochs |
+| `--val-every` | 1 | Validation frequency (epochs) |
+| `--output, -o` | runs/qat | Output directory |
+| `--export-tflite` | false | Export to INT8 TFLite after training |
+| `--calibration-images` | - | Directory for TFLite INT8 calibration |
+
+##### QAT Best Practices
+
+1. **Start from a well-trained model**: QAT fine-tunes an existing checkpoint, not from scratch
+2. **Use low learning rate**: 0.0001 or lower (10-100x smaller than original training)
+3. **Short training**: 10-20 epochs is usually sufficient
+4. **Freeze batch norm early**: After ~5 epochs, freeze BN statistics for stability
+5. **Backend selection**:
+   - `qnnpack`: Best for ARM/mobile deployment (Android, iOS, Raspberry Pi)
+   - `x86`: Best for x86 CPU deployment (Intel, AMD servers)
+   - `fbgemm`: Facebook's optimized backend for x86
+
+##### QAT Workflow Example
+
+```shell
+# Step 1: Train your model normally
+python -m yolo.cli fit --config yolo/config/experiment/default.yaml
+
+# Step 2: Fine-tune with QAT (10-20 epochs)
+python -m yolo.cli qat-finetune \
+    --checkpoint runs/yolo/version_0/checkpoints/best.ckpt \
+    --config config.yaml \
+    --epochs 20 \
+    --output runs/qat
+
+# Step 3: Export the QAT model to INT8 TFLite
+python -m yolo.cli export \
+    --checkpoint runs/qat/qat_finetune/last.ckpt \
+    --format tflite \
+    --quantization int8 \
+    --calibration-images data/train/images/
+
+# Step 4: Validate accuracy
+python -m yolo.cli validate \
+    --checkpoint runs/qat/model_int8.tflite \
+    --config config.yaml
+```
+
+##### QAT vs PTQ Comparison
+
+| Method | Training Time | Accuracy Recovery | Complexity |
+|--------|--------------|-------------------|------------|
+| **PTQ (Post-Training)** | None | ~56-80% of FP32 | Low |
+| **QAT (Quantization-Aware)** | 10-20 epochs | ~95-98% of FP32 | Medium |
+
+**When to use QAT:**
+- INT8 accuracy from PTQ is unacceptable
+- Deploying to edge devices where INT8 is required
+- Model has precision-sensitive layers (DFL, attention, etc.)
+
+**When PTQ is sufficient:**
+- Small accuracy loss is acceptable
+- Quick deployment without retraining
+- Model architecture is quantization-friendly
 
 #### TFLite Technical Notes
 
