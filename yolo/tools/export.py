@@ -17,8 +17,69 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 import numpy as np
 import torch
 from PIL import Image
+from torch import nn
 
 from yolo.training.module import YOLOModule
+from yolo.utils.bounding_box_utils import generate_anchors
+
+
+class YOLOExportWrapper(nn.Module):
+    """Wrapper for ONNX export compatible with original YOLOv9 format.
+
+    This wrapper processes the model output to produce a single tensor
+    with shape [B, num_detections, 4+num_classes] containing:
+    - First 4 values: xyxy bounding box coordinates (absolute pixels)
+    - Remaining values: class probabilities (post-sigmoid)
+    """
+
+    def __init__(self, model: nn.Module, image_size: Tuple[int, int], strides: List[int]):
+        super().__init__()
+        self.model = model
+        self.image_size = image_size
+        self.strides = strides
+
+        # Pre-compute anchor grid and scaler for box decoding
+        # image_size is (H, W), generate_anchors expects (W, H)
+        anchor_grid, scaler = generate_anchors((image_size[1], image_size[0]), strides)
+        self.register_buffer("anchor_grid", anchor_grid)
+        self.register_buffer("scaler", scaler)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Forward pass through base model
+        outputs = self.model(x)
+
+        # Get only Main head output (ignore AUX)
+        main_outputs = outputs["Main"]
+
+        # Process each scale
+        all_boxes = []
+        all_cls = []
+
+        for layer_output in main_outputs:
+            pred_cls, pred_anc, pred_box = layer_output
+            B, C, H, W = pred_cls.shape
+
+            # Reshape: B C H W -> B (H*W) C
+            pred_cls = pred_cls.permute(0, 2, 3, 1).reshape(B, -1, C)
+            pred_box = pred_box.permute(0, 2, 3, 1).reshape(B, -1, 4)
+
+            all_cls.append(pred_cls)
+            all_boxes.append(pred_box)
+
+        # Concatenate all scales
+        preds_cls = torch.cat(all_cls, dim=1)  # [B, N, num_classes]
+        preds_box = torch.cat(all_boxes, dim=1)  # [B, N, 4]
+
+        # Convert boxes from relative LTRB to absolute xyxy
+        pred_LTRB = preds_box * self.scaler.view(1, -1, 1)
+        lt, rb = pred_LTRB.chunk(2, dim=-1)
+        boxes_xyxy = torch.cat([self.anchor_grid - lt, self.anchor_grid + rb], dim=-1)
+
+        # Apply sigmoid to class scores
+        cls_scores = preds_cls.sigmoid()
+
+        # Final output: [B, N, 4+num_classes]
+        return torch.cat([boxes_xyxy, cls_scores], dim=-1)
 
 
 def _check_dependencies(verbose: bool = True) -> Dict[str, Any]:
@@ -151,27 +212,41 @@ def export_onnx(
     dtype = torch.float16 if half else torch.float32
     dummy_input = torch.randn(1, 3, image_size[0], image_size[1], dtype=dtype, device=device)
 
-    # Define input/output names
+    # Determine strides automatically from model output
+    print("🔍 Detecting model strides...")
+    with torch.no_grad():
+        outputs = model(dummy_input)
+        strides = []
+        for pred in outputs["Main"]:
+            _, _, h, w = pred[2].shape  # vector_x shape is (B, 4, H, W)
+            strides.append(image_size[1] // w)
+    print(f"   Detected strides: {strides}")
+
+    # Create export wrapper for YOLOv9-compatible output format
+    export_model = YOLOExportWrapper(model, image_size, strides)
+    export_model.to(device)
+    export_model.eval()
+
+    if half:
+        export_model = export_model.half()
+
+    # Define input/output names (YOLOv9 compatible)
     input_names = ["images"]
-    output_names = ["output"]
+    output_names = ["output0"]
 
     # Dynamic axes for batch size
     dynamic_axes = None
     if dynamic_batch:
         dynamic_axes = {
-            "images": {0: "batch_size"},
-            "output": {0: "batch_size"},
+            "images": {0: "batch_size", 2: "height", 3: "width"},
+            "output0": {0: "batch_size", 1: "num_detections"},
         }
 
     # Export to ONNX
     print(f"🔄 Exporting to ONNX (opset {opset_version})...")
 
-    # Run a forward pass first to capture all tensor shapes (helps with dynamic dims)
-    with torch.no_grad():
-        _ = model(dummy_input)
-
     torch.onnx.export(
-        model,
+        export_model,
         dummy_input,
         str(output_path),
         export_params=True,
@@ -216,8 +291,12 @@ def export_onnx(
         print("✅ ONNX model validation passed")
 
         # Print model info
-        print(f"\n📊 Model Info:")
-        print(f"   Input shape: {[d.dim_value for d in onnx_model.graph.input[0].type.tensor_type.shape.dim]}")
+        print(f"\n📊 Model Info (YOLOv9 compatible format):")
+        input_shape = [d.dim_value or d.dim_param for d in onnx_model.graph.input[0].type.tensor_type.shape.dim]
+        output_shape = [d.dim_value or d.dim_param for d in onnx_model.graph.output[0].type.tensor_type.shape.dim]
+        print(f"   Input:  {onnx_model.graph.input[0].name} {input_shape}")
+        print(f"   Output: {onnx_model.graph.output[0].name} {output_shape}")
+        print(f"   Format: [batch, num_detections, 4+num_classes]")
         print(f"   Opset version: {onnx_model.opset_import[0].version}")
 
     except ImportError:
@@ -1083,6 +1162,140 @@ def export_tflite(
     print(f"   📁 Output: {output_path}")
     print(f"   📊 Size: {file_size:.2f} MB")
     print(f"   🔢 Quantization: {quantization.upper()}")
+    print("=" * 60 + "\n")
+
+    return str(output_path)
+
+
+def export_qat_tflite(
+    qat_checkpoint_path: str,
+    output_path: Optional[str] = None,
+    image_size: Tuple[int, int] = (640, 640),
+    calibration_images: Optional[str] = None,
+    num_calibration_images: int = 100,
+    device: Optional[str] = None,
+) -> str:
+    """
+    Export a QAT-trained model to INT8 TFLite format.
+
+    This function handles models trained with Quantization-Aware Training (QAT),
+    which should produce higher accuracy INT8 models than post-training quantization.
+
+    Pipeline: QAT Checkpoint -> Convert to Quantized -> ONNX -> TFLite INT8
+
+    Args:
+        qat_checkpoint_path: Path to QAT-trained checkpoint (.ckpt file)
+        output_path: Path for output .tflite file
+        image_size: Input image size (height, width)
+        calibration_images: Directory with calibration images
+        num_calibration_images: Number of calibration images
+        device: Device to use for export
+
+    Returns:
+        Path to the exported TFLite file
+    """
+    from yolo.training.qat_module import QATModule
+
+    print("\n" + "=" * 60)
+    print("🔧 QAT TFLite Export")
+    print("=" * 60)
+    print(f"   Checkpoint: {qat_checkpoint_path}")
+    print(f"   Image size: {image_size}")
+    print("=" * 60 + "\n")
+
+    # Determine output path
+    checkpoint_path = Path(qat_checkpoint_path)
+    if output_path is None:
+        output_path = checkpoint_path.with_suffix("").with_suffix(".qat_int8.tflite")
+    else:
+        output_path = Path(output_path)
+
+    # Load QAT module
+    print("📂 Loading QAT checkpoint...")
+    qat_module = QATModule.load_from_checkpoint(
+        qat_checkpoint_path,
+        map_location="cpu" if device is None else device,
+    )
+
+    # Convert to quantized model
+    print("🔄 Converting QAT model to quantized format...")
+    qat_module.convert_to_quantized()
+
+    # Create temporary directory for intermediate files
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir = Path(tmp_dir)
+
+        # Export quantized model to ONNX
+        print("📦 Exporting quantized model to ONNX...")
+        onnx_path = tmp_dir / "qat_model.onnx"
+
+        # Create example input
+        example_input = torch.randn(1, 3, image_size[0], image_size[1])
+
+        # Export to ONNX
+        qat_module.model.eval()
+        torch.onnx.export(
+            qat_module.model,
+            example_input,
+            str(onnx_path),
+            export_params=True,
+            opset_version=13,
+            do_constant_folding=True,
+            input_names=["images"],
+            output_names=["output"],
+        )
+
+        # Convert ONNX to TFLite
+        print("🔄 Converting to TFLite INT8...")
+        saved_model_dir = tmp_dir / "saved_model"
+
+        # Prepare calibration data if provided
+        calib_path = None
+        if calibration_images:
+            print(f"   Preparing INT8 calibration from: {calibration_images}")
+            calib_data = list(_get_calibration_images(
+                calibration_images,
+                image_size,
+                num_calibration_images,
+            ))
+
+            if len(calib_data) > 0:
+                calib_array = np.concatenate(calib_data, axis=0)
+                calib_path = tmp_dir / "calibration_data.npy"
+                np.save(str(calib_path), calib_array)
+
+        # Convert using onnx2tf
+        conversion_success = _convert_onnx_to_tflite_via_cli(
+            str(onnx_path),
+            str(saved_model_dir),
+            image_size=image_size,
+            quantization="int8" if calib_path else "fp32",
+            calibration_path=str(calib_path) if calib_path else None,
+        )
+
+        if not conversion_success:
+            raise RuntimeError("TFLite conversion failed")
+
+        # Find and copy TFLite file
+        tflite_candidates = list(saved_model_dir.glob("*.tflite"))
+        if not tflite_candidates:
+            raise RuntimeError("No TFLite file generated")
+
+        # Select INT8 file if available
+        int8_files = [f for f in tflite_candidates if "integer_quant" in f.name or "int8" in f.name.lower()]
+        src_tflite = int8_files[0] if int8_files else tflite_candidates[0]
+
+        # Copy to final destination
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src_tflite), str(output_path))
+
+    # Verify and report
+    file_size = output_path.stat().st_size / (1024 * 1024)
+    print("\n" + "=" * 60)
+    print("✅ QAT TFLite Export Complete!")
+    print("=" * 60)
+    print(f"   📁 Output: {output_path}")
+    print(f"   📊 Size: {file_size:.2f} MB")
     print("=" * 60 + "\n")
 
     return str(output_path)
