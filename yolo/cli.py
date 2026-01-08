@@ -65,6 +65,9 @@ Examples:
 
   # Export checkpoint
   yolo export --checkpoint runs/best.ckpt --format onnx --simplify
+
+  # QAT fine-tuning for INT8 quantization
+  yolo qat-finetune --checkpoint best.ckpt --config config.yaml --epochs 20
         """,
     )
     subparsers = parser.add_subparsers(title="commands", metavar="<command>")
@@ -74,6 +77,7 @@ Examples:
     subparsers.add_parser("predict", help="Run inference on images.")
     subparsers.add_parser("export", help="Export a checkpoint to ONNX/TFLite/SavedModel.")
     subparsers.add_parser("validate", help="Standalone validation with detection metrics and optional benchmark.")
+    subparsers.add_parser("qat-finetune", help="Quantization-Aware Training fine-tuning for INT8 deployment.")
 
     return parser
 
@@ -389,6 +393,9 @@ Examples:
 
   # Export to TensorFlow SavedModel
   python -m yolo.cli export --checkpoint best.ckpt --format saved_model
+
+  # Export to raw YOLOv9 format [B, 4+C, anchors] without post-processing
+  python -m yolo.cli export --checkpoint best.ckpt --format onnx --raw
         """,
     )
     parser.add_argument(
@@ -470,6 +477,11 @@ Examples:
         default=True,
         help="Apply XNNPACK graph rewrites (SiLU→HardSwish, DFL Conv3D→Conv2D) (default: True)",
     )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Export in raw YOLOv9 format [B, 4+C, anchors] without post-processing (ONNX only)",
+    )
 
     try:
         args = parser.parse_args(sys.argv[2:] if argv is None else argv)  # skip subcommand
@@ -491,6 +503,7 @@ Examples:
             dynamic_batch=args.dynamic_batch,
             half=args.half,
             device=args.device,
+            raw=args.raw,
         )
         print(f"\nExport complete: {output_path}")
 
@@ -523,6 +536,316 @@ Examples:
     else:
         print(f"Error: Unsupported format: {args.format}", file=sys.stderr)
         return 1
+    return 0
+
+
+def qat_finetune_main(argv: Optional[List[str]] = None) -> int:
+    """Run QAT (Quantization-Aware Training) fine-tuning on a pre-trained model."""
+    parser = argparse.ArgumentParser(
+        description="YOLO QAT Fine-tuning - Quantization-Aware Training for INT8 deployment",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic QAT fine-tuning
+  python -m yolo.cli qat-finetune --checkpoint best.ckpt --config config.yaml
+
+  # QAT with custom epochs and learning rate
+  python -m yolo.cli qat-finetune --checkpoint best.ckpt --config config.yaml \\
+      --epochs 20 --lr 0.0001
+
+  # QAT with specific backend
+  python -m yolo.cli qat-finetune --checkpoint best.ckpt --config config.yaml \\
+      --backend qnnpack
+
+  # QAT with validation every 5 epochs
+  python -m yolo.cli qat-finetune --checkpoint best.ckpt --config config.yaml \\
+      --val-every 5
+
+  # Export QAT model to INT8 TFLite after training
+  python -m yolo.cli qat-finetune --checkpoint best.ckpt --config config.yaml \\
+      --export-tflite --calibration-images /path/to/images/
+        """,
+    )
+    # Required arguments
+    parser.add_argument(
+        "--checkpoint", "-c",
+        type=str,
+        required=True,
+        help="Path to pre-trained model checkpoint (.ckpt file)",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="Path to config YAML file (for data configuration)",
+    )
+
+    # Training arguments
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=20,
+        help="Number of QAT fine-tuning epochs (default: 20)",
+    )
+    parser.add_argument(
+        "--lr", "--learning-rate",
+        type=float,
+        default=0.0001,
+        dest="learning_rate",
+        help="Learning rate for QAT fine-tuning (default: 0.0001)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        help="Batch size for training (default: 16)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of data loading workers (default: 4)",
+    )
+
+    # QAT-specific arguments
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="qnnpack",
+        choices=["qnnpack", "x86", "fbgemm"],
+        help="Quantization backend: qnnpack (mobile), x86, fbgemm (default: qnnpack)",
+    )
+    parser.add_argument(
+        "--freeze-bn-after",
+        type=int,
+        default=5,
+        help="Freeze batch norm statistics after this epoch (default: 5)",
+    )
+
+    # Validation arguments
+    parser.add_argument(
+        "--val-every",
+        type=int,
+        default=1,
+        help="Run validation every N epochs (default: 1)",
+    )
+
+    # Output arguments
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default="runs/qat",
+        help="Output directory for checkpoints and logs (default: runs/qat)",
+    )
+    parser.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="Experiment name (default: auto-generated)",
+    )
+
+    # Export arguments
+    parser.add_argument(
+        "--export-tflite",
+        action="store_true",
+        help="Export to INT8 TFLite after training",
+    )
+    parser.add_argument(
+        "--calibration-images",
+        type=str,
+        default=None,
+        help="Directory with calibration images for TFLite INT8 export",
+    )
+    parser.add_argument(
+        "--num-calibration",
+        type=int,
+        default=100,
+        help="Number of calibration images for TFLite export (default: 100)",
+    )
+
+    # Device arguments
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device to use (cuda/mps/cpu, default: auto)",
+    )
+    parser.add_argument(
+        "--gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs to use (default: 1)",
+    )
+
+    try:
+        args = parser.parse_args(sys.argv[2:] if argv is None else argv)
+    except SystemExit as exc:
+        return _coerce_system_exit_code(exc)
+
+    # Import dependencies
+    import lightning as L
+    from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+    from lightning.pytorch.loggers import TensorBoardLogger
+    from omegaconf import OmegaConf
+
+    from yolo.data.datamodule import YOLODataModule
+    from yolo.training.qat_module import QATModule
+
+    # Load config
+    print(f"\n{'=' * 60}")
+    print("🔧 YOLO QAT Fine-tuning")
+    print("=" * 60)
+    print(f"   Checkpoint: {args.checkpoint}")
+    print(f"   Config: {args.config}")
+    print(f"   Backend: {args.backend}")
+    print(f"   Epochs: {args.epochs}")
+    print(f"   Learning rate: {args.learning_rate}")
+    print("=" * 60 + "\n")
+
+    config = OmegaConf.load(args.config)
+
+    # Extract data configuration
+    if not hasattr(config, "data"):
+        print("Error: Config file must have 'data' section", file=sys.stderr)
+        return 1
+
+    data_cfg = config.data
+
+    # Get image size from checkpoint
+    from yolo.training.module import YOLOModule
+    base_module = YOLOModule.load_from_checkpoint(args.checkpoint, map_location="cpu")
+    image_size = tuple(base_module.hparams.image_size)
+    del base_module
+
+    # Create datamodule with all parameters from config
+    # CLI args override config values if specified
+    batch_size = getattr(data_cfg, "batch_size", args.batch_size)
+    num_workers = getattr(data_cfg, "num_workers", args.workers)
+
+    datamodule = YOLODataModule(
+        root=data_cfg.root,
+        format=getattr(data_cfg, "format", "coco"),
+        train_images=getattr(data_cfg, "train_images", None),
+        val_images=getattr(data_cfg, "val_images", None),
+        train_labels=getattr(data_cfg, "train_labels", None),
+        val_labels=getattr(data_cfg, "val_labels", None),
+        train_ann=getattr(data_cfg, "train_ann", None),
+        val_ann=getattr(data_cfg, "val_ann", None),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        image_size=image_size,
+        # Augmentation parameters from config (defaults to disabled for QAT)
+        mosaic_prob=getattr(data_cfg, "mosaic_prob", 0.0),
+        mosaic_9_prob=getattr(data_cfg, "mosaic_9_prob", 0.0),
+        mixup_prob=getattr(data_cfg, "mixup_prob", 0.0),
+        flip_lr=getattr(data_cfg, "flip_lr", 0.0),
+        flip_ud=getattr(data_cfg, "flip_ud", 0.0),
+        degrees=getattr(data_cfg, "degrees", 0.0),
+        translate=getattr(data_cfg, "translate", 0.0),
+        scale=getattr(data_cfg, "scale", 0.0),
+        shear=getattr(data_cfg, "shear", 0.0),
+        perspective=getattr(data_cfg, "perspective", 0.0),
+        hsv_h=getattr(data_cfg, "hsv_h", 0.0),
+        hsv_s=getattr(data_cfg, "hsv_s", 0.0),
+        hsv_v=getattr(data_cfg, "hsv_v", 0.0),
+    )
+
+    # Create QAT module
+    qat_module = QATModule(
+        checkpoint_path=args.checkpoint,
+        backend=args.backend,
+        learning_rate=args.learning_rate,
+        freeze_bn_after_epoch=args.freeze_bn_after,
+    )
+
+    # Setup callbacks
+    callbacks = [
+        ModelCheckpoint(
+            dirpath=Path(args.output) / (args.name or "qat_finetune"),
+            filename="qat-{epoch:02d}-{val_mAP:.4f}",
+            monitor="val/mAP",
+            mode="max",
+            save_top_k=3,
+            save_last=True,
+        ),
+        LearningRateMonitor(logging_interval="epoch"),
+    ]
+
+    # Setup logger
+    logger = TensorBoardLogger(
+        save_dir=args.output,
+        name=args.name or "qat_finetune",
+    )
+
+    # Determine accelerator
+    if args.device:
+        accelerator = args.device
+        devices = 1
+    else:
+        import torch
+        if torch.cuda.is_available():
+            accelerator = "cuda"
+            devices = args.gpus
+        elif torch.backends.mps.is_available():
+            accelerator = "mps"
+            devices = 1
+        else:
+            accelerator = "cpu"
+            devices = 1
+
+    # Create trainer
+    trainer = L.Trainer(
+        max_epochs=args.epochs,
+        accelerator=accelerator,
+        devices=devices,
+        callbacks=callbacks,
+        logger=logger,
+        check_val_every_n_epoch=args.val_every,
+        log_every_n_steps=10,
+        enable_progress_bar=True,
+    )
+
+    # Train
+    print("\n🚀 Starting QAT fine-tuning...\n")
+    trainer.fit(qat_module, datamodule)
+
+    # Get best checkpoint path
+    best_ckpt = callbacks[0].best_model_path
+    print(f"\n✅ QAT training complete!")
+    print(f"   Best checkpoint: {best_ckpt}")
+    print(f"   Best mAP: {callbacks[0].best_model_score:.4f}")
+
+    # Export to TFLite if requested
+    if args.export_tflite:
+        print("\n📦 Exporting to INT8 TFLite...")
+
+        if args.calibration_images is None:
+            print("Error: --calibration-images required for TFLite export", file=sys.stderr)
+            return 1
+
+        from yolo.tools.export import export_tflite
+
+        # Load best checkpoint
+        best_module = QATModule.load_from_checkpoint(best_ckpt)
+        best_module.convert_to_quantized()
+
+        # Save quantized PyTorch model first
+        pt_output = Path(args.output) / (args.name or "qat_finetune") / "quantized_model.pt"
+        best_module.export_quantized(str(pt_output), image_size)
+
+        # Export to TFLite
+        tflite_output = Path(args.output) / (args.name or "qat_finetune") / "model_int8.tflite"
+        export_tflite(
+            checkpoint_path=best_ckpt,
+            output_path=str(tflite_output),
+            image_size=image_size,
+            quantization="int8",
+            calibration_images=args.calibration_images,
+            num_calibration_images=args.num_calibration,
+        )
+
+        print(f"   TFLite model: {tflite_output}")
+
     return 0
 
 
@@ -791,13 +1114,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         return export_main(args[1:])
     if cmd == "validate":
         return validate_main(args[1:])
+    if cmd == "qat-finetune":
+        return qat_finetune_main(args[1:])
 
     # Fall back to training CLI (supports global options before the subcommand).
     if cmd.startswith("-"):
         return train_main(args)
 
     # If it's not a known command, provide a clearer error than LightningCLI.
-    known = {"fit", "test", "predict", "export", "validate"}
+    known = {"fit", "test", "predict", "export", "validate", "qat-finetune"}
     if cmd not in known:
         print(f"Error: Unknown command: {cmd}\n", file=sys.stderr)
         _root_parser().print_help()

@@ -147,6 +147,56 @@ def _check_dependencies(verbose: bool = True) -> Dict[str, Any]:
     return status
 
 
+class YOLORawExportWrapper(nn.Module):
+    """Wrapper for ONNX export in raw YOLOv9 format (without post-processing).
+
+    This wrapper produces output in the original YOLOv9 format with 2 outputs:
+    - output0: [B, 4+num_classes, num_anchors] - Main head (boxes + class logits concatenated)
+    - output1: [B, 4+num_classes, num_anchors] - AUX head (boxes + class logits concatenated)
+
+    This matches the original YOLOv9 export format where each output has shape [B, 17, 8400]
+    for 13 classes (4 box coords + 13 class scores).
+    """
+
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Forward pass through base model
+        outputs = self.model(x)
+
+        results = []
+        # Process both Main and AUX heads
+        for head_name in ["Main", "AUX"]:
+            if head_name not in outputs:
+                continue
+
+            head_outputs = outputs[head_name]
+            all_preds = []
+
+            for layer_output in head_outputs:
+                pred_cls, pred_anc, pred_box = layer_output
+                B, C, H, W = pred_cls.shape
+
+                # Reshape: B C H W -> B C (H*W)
+                pred_cls = pred_cls.reshape(B, C, -1)
+                pred_box = pred_box.reshape(B, 4, -1)
+
+                # Concatenate box + class: [B, 4+num_classes, H*W]
+                pred = torch.cat([pred_box, pred_cls], dim=1)
+                all_preds.append(pred)
+
+            # Concatenate all scales: [B, 4+num_classes, total_anchors]
+            results.append(torch.cat(all_preds, dim=2))
+
+        # Return Main and AUX outputs (or just Main if no AUX)
+        if len(results) == 2:
+            return results[0], results[1]
+        else:
+            return results[0], results[0]  # Duplicate Main if no AUX
+
+
 def export_onnx(
     checkpoint_path: str,
     output_path: Optional[str] = None,
@@ -157,6 +207,7 @@ def export_onnx(
     half: bool = False,
     device: Optional[str] = None,
     verbose: bool = True,
+    raw: bool = False,
 ) -> str:
     """
     Export a YOLO model from Lightning checkpoint to ONNX format.
@@ -171,6 +222,7 @@ def export_onnx(
         half: Whether to export in FP16 (half precision)
         device: Device to use for export (auto-detected if None)
         verbose: Whether to print progress messages
+        raw: Whether to export in raw YOLOv9 format [B, C+4, anchors] without post-processing
 
     Returns:
         Path to the exported ONNX file
@@ -212,18 +264,24 @@ def export_onnx(
     dtype = torch.float16 if half else torch.float32
     dummy_input = torch.randn(1, 3, image_size[0], image_size[1], dtype=dtype, device=device)
 
-    # Determine strides automatically from model output
-    print("🔍 Detecting model strides...")
-    with torch.no_grad():
-        outputs = model(dummy_input)
-        strides = []
-        for pred in outputs["Main"]:
-            _, _, h, w = pred[2].shape  # vector_x shape is (B, 4, H, W)
-            strides.append(image_size[1] // w)
-    print(f"   Detected strides: {strides}")
+    # Create export wrapper based on mode
+    if raw:
+        print("🔧 Using RAW export format (original YOLOv9 style)")
+        export_model = YOLORawExportWrapper(model)
+    else:
+        # Determine strides automatically from model output
+        print("🔍 Detecting model strides...")
+        with torch.no_grad():
+            outputs = model(dummy_input)
+            strides = []
+            for pred in outputs["Main"]:
+                _, _, h, w = pred[2].shape  # vector_x shape is (B, 4, H, W)
+                strides.append(image_size[1] // w)
+        print(f"   Detected strides: {strides}")
 
-    # Create export wrapper for YOLOv9-compatible output format
-    export_model = YOLOExportWrapper(model, image_size, strides)
+        # Create export wrapper for YOLOv9-compatible output format
+        export_model = YOLOExportWrapper(model, image_size, strides)
+
     export_model.to(device)
     export_model.eval()
 
@@ -232,15 +290,25 @@ def export_onnx(
 
     # Define input/output names (YOLOv9 compatible)
     input_names = ["images"]
-    output_names = ["output0"]
+    if raw:
+        output_names = ["output0", "output1"]  # boxes, scores
+    else:
+        output_names = ["output0"]
 
     # Dynamic axes for batch size
     dynamic_axes = None
     if dynamic_batch:
-        dynamic_axes = {
-            "images": {0: "batch_size", 2: "height", 3: "width"},
-            "output0": {0: "batch_size", 1: "num_detections"},
-        }
+        if raw:
+            dynamic_axes = {
+                "images": {0: "batch_size", 2: "height", 3: "width"},
+                "output0": {0: "batch_size", 2: "num_anchors"},
+                "output1": {0: "batch_size", 2: "num_anchors"},
+            }
+        else:
+            dynamic_axes = {
+                "images": {0: "batch_size", 2: "height", 3: "width"},
+                "output0": {0: "batch_size", 1: "num_detections"},
+            }
 
     # Export to ONNX
     print(f"🔄 Exporting to ONNX (opset {opset_version})...")
@@ -291,12 +359,21 @@ def export_onnx(
         print("✅ ONNX model validation passed")
 
         # Print model info
-        print(f"\n📊 Model Info (YOLOv9 compatible format):")
+        format_name = "RAW YOLOv9" if raw else "YOLOv9 compatible"
+        print(f"\n📊 Model Info ({format_name} format):")
         input_shape = [d.dim_value or d.dim_param for d in onnx_model.graph.input[0].type.tensor_type.shape.dim]
-        output_shape = [d.dim_value or d.dim_param for d in onnx_model.graph.output[0].type.tensor_type.shape.dim]
         print(f"   Input:  {onnx_model.graph.input[0].name} {input_shape}")
-        print(f"   Output: {onnx_model.graph.output[0].name} {output_shape}")
-        print(f"   Format: [batch, num_detections, 4+num_classes]")
+
+        if raw:
+            # Two outputs for raw format (Main and AUX heads)
+            for i, output in enumerate(onnx_model.graph.output):
+                output_shape = [d.dim_value or d.dim_param for d in output.type.tensor_type.shape.dim]
+                print(f"   Output {i}: {output.name} {output_shape}")
+            print(f"   Format: [batch, 4+num_classes, anchors] (boxes + class logits concatenated)")
+        else:
+            output_shape = [d.dim_value or d.dim_param for d in onnx_model.graph.output[0].type.tensor_type.shape.dim]
+            print(f"   Output: {onnx_model.graph.output[0].name} {output_shape}")
+            print(f"   Format: [batch, num_detections, 4+num_classes]")
         print(f"   Opset version: {onnx_model.opset_import[0].version}")
 
     except ImportError:

@@ -503,6 +503,36 @@ python -m yolo.cli export --checkpoint runs/best.ckpt \
     --opset 17
 ```
 
+**Raw Export Format (--raw):**
+
+By default, the export includes post-processing (box decoding to xyxy, sigmoid on class scores). Use `--raw` to export without post-processing, matching the original YOLOv9 output format:
+
+| Format | Outputs | Description |
+|--------|---------|-------------|
+| Default | 1 output: `[B, anchors, 4+C]` | Post-processed: xyxy boxes (pixels) + sigmoid class scores |
+| Raw (`--raw`) | 2 outputs: `[B, 4+C, anchors]` each | Raw: Main + AUX heads, boxes and class logits concatenated |
+
+**Raw output tensor layout:**
+
+Each output tensor has shape `[batch, 4+num_classes, num_anchors]`:
+- **First 4 channels** (`[0:4]`): Bounding box coordinates (LTRB offsets, requires DFL decoding)
+- **Remaining channels** (`[4:]`): Class logits (raw scores, no sigmoid applied)
+
+For 640x640 with 13 classes (17 = 4 boxes + 13 classes):
+- Default: `output0=[1, 8400, 17]` - ready for NMS
+- Raw:
+  - `output0=[1, 17, 8400]` - **Main head** (used for inference)
+  - `output1=[1, 17, 8400]` - **AUX head** (used during training, can be ignored for inference)
+
+```shell
+# Export in raw format (original YOLOv9 style with 2 outputs)
+python -m yolo.cli export --checkpoint runs/best.ckpt --format onnx --raw
+
+# Raw format with Docker
+docker run --platform linux/amd64 -v $(pwd):/workspace yolo-tflite-export \
+    --checkpoint /workspace/best.ckpt --format onnx --raw
+```
+
 #### Export to TFLite
 
 TFLite export enables deployment on mobile devices (Android, iOS), microcontrollers, and Edge TPU devices like Google Coral.
@@ -630,6 +660,7 @@ docker run --platform linux/amd64 -v $(pwd):/workspace yolo-tflite-export \
 | `--simplify` | false | Simplify ONNX model using onnxsim |
 | `--dynamic-batch` | false | Enable dynamic batch size dimension |
 | `--half` | false | Export in FP16 precision (CUDA only) |
+| `--raw` | false | Export in raw YOLOv9 format with 2 outputs: `[B, 4+C, anchors]` (Main + AUX heads) |
 
 **TFLite-specific options:**
 
