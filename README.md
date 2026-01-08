@@ -503,34 +503,46 @@ python -m yolo.cli export --checkpoint runs/best.ckpt \
     --opset 17
 ```
 
-**Raw Export Format (--raw):**
+**Output Format (YOLOv9 Compatible):**
 
-By default, the export includes post-processing (box decoding to xyxy, sigmoid on class scores). Use `--raw` to export without post-processing, matching the original YOLOv9 output format:
+The ONNX export produces output identical to the original [WongKinYiu/yolov9](https://github.com/WongKinYiu/yolov9) format, ensuring compatibility with existing inference pipelines (including .NET):
 
-| Format | Outputs | Description |
-|--------|---------|-------------|
-| Default | 1 output: `[B, anchors, 4+C]` | Post-processed: xyxy boxes (pixels) + sigmoid class scores |
-| Raw (`--raw`) | 2 outputs: `[B, 4+C, anchors]` each | Raw: Main + AUX heads, boxes and class logits concatenated |
+| Aspect | Format |
+|--------|--------|
+| **Output shape** | `[B, 4+num_classes, num_anchors]` |
+| **Example (13 classes)** | `[1, 17, 8400]` |
+| **Box format** | XYWH (center_x, center_y, width, height) in pixels |
+| **Class scores** | Post-sigmoid (0-1 range) |
 
-**Raw output tensor layout:**
+**Output tensor layout:**
 
-Each output tensor has shape `[batch, 4+num_classes, num_anchors]`:
-- **First 4 channels** (`[0:4]`): Bounding box coordinates (LTRB offsets, requires DFL decoding)
-- **Remaining channels** (`[4:]`): Class logits (raw scores, no sigmoid applied)
+The output tensor has shape `[batch, 4+num_classes, num_anchors]`:
+- **First 4 channels** (`[:4, :]`): Bounding box coordinates in XYWH format (absolute pixel values)
+- **Remaining channels** (`[4:, :]`): Class probabilities (post-sigmoid, ready for thresholding)
 
-For 640x640 with 13 classes (17 = 4 boxes + 13 classes):
-- Default: `output0=[1, 8400, 17]` - ready for NMS
-- Raw:
-  - `output0=[1, 17, 8400]` - **Main head** (used for inference)
-  - `output1=[1, 17, 8400]` - **AUX head** (used during training, can be ignored for inference)
+For 640x640 with 80 classes (COCO):
+- `output0=[1, 84, 8400]` where 84 = 4 (box) + 80 (classes)
+
+For 640x640 with 13 classes:
+- `output0=[1, 17, 8400]` where 17 = 4 (box) + 13 (classes)
+
+**Inference Script:**
+
+A standalone Python inference script is provided for testing ONNX models:
 
 ```shell
-# Export in raw format (original YOLOv9 style with 2 outputs)
-python -m yolo.cli export --checkpoint runs/best.ckpt --format onnx --raw
+# Run inference on an image
+python tools/onnx_inference.py \
+    --model exports/model.onnx \
+    --image test.jpg \
+    --conf-thresh 0.25 \
+    --output result.jpg
 
-# Raw format with Docker
-docker run --platform linux/amd64 -v $(pwd):/workspace yolo-tflite-export \
-    --checkpoint /workspace/best.ckpt --format onnx --raw
+# With specific number of classes
+python tools/onnx_inference.py \
+    --model exports/model.onnx \
+    --image test.jpg \
+    --num-classes 13
 ```
 
 #### Export to TFLite
@@ -660,7 +672,6 @@ docker run --platform linux/amd64 -v $(pwd):/workspace yolo-tflite-export \
 | `--simplify` | false | Simplify ONNX model using onnxsim |
 | `--dynamic-batch` | false | Enable dynamic batch size dimension |
 | `--half` | false | Export in FP16 precision (CUDA only) |
-| `--raw` | false | Export in raw YOLOv9 format with 2 outputs: `[B, 4+C, anchors]` (Main + AUX heads) |
 
 **TFLite-specific options:**
 
