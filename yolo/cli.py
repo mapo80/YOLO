@@ -393,9 +393,6 @@ Examples:
 
   # Export to TensorFlow SavedModel
   python -m yolo.cli export --checkpoint best.ckpt --format saved_model
-
-  # Export to raw YOLOv9 format [B, 4+C, anchors] without post-processing
-  python -m yolo.cli export --checkpoint best.ckpt --format onnx --raw
         """,
     )
     parser.add_argument(
@@ -477,12 +474,6 @@ Examples:
         default=True,
         help="Apply XNNPACK graph rewrites (SiLU→HardSwish, DFL Conv3D→Conv2D) (default: True)",
     )
-    parser.add_argument(
-        "--raw",
-        action="store_true",
-        help="Export in raw YOLOv9 format [B, 4+C, anchors] without post-processing (ONNX only)",
-    )
-
     try:
         args = parser.parse_args(sys.argv[2:] if argv is None else argv)  # skip subcommand
     except SystemExit as exc:
@@ -503,7 +494,6 @@ Examples:
             dynamic_batch=args.dynamic_batch,
             half=args.half,
             device=args.device,
-            raw=args.raw,
         )
         print(f"\nExport complete: {output_path}")
 
