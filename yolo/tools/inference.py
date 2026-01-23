@@ -124,6 +124,53 @@ def run_inference(
     return predictions
 
 
+def scale_boxes_to_original(
+    boxes: Tensor,
+    original_size: Tuple[int, int],
+    letterbox_size: Tuple[int, int],
+) -> Tensor:
+    """
+    Scale bounding boxes from letterboxed image space to original image space.
+
+    Args:
+        boxes: Tensor of shape [N, 6] with [class_id, x1, y1, x2, y2, conf]
+        original_size: Original image size (width, height)
+        letterbox_size: Letterboxed image size (width, height)
+
+    Returns:
+        Scaled boxes tensor
+    """
+    if len(boxes) == 0:
+        return boxes
+
+    orig_w, orig_h = original_size
+    lb_w, lb_h = letterbox_size
+
+    # Calculate scale and padding used in letterbox
+    scale = min(lb_w / orig_w, lb_h / orig_h)
+    new_w = int(orig_w * scale)
+    new_h = int(orig_h * scale)
+    pad_x = (lb_w - new_w) // 2
+    pad_y = (lb_h - new_h) // 2
+
+    # Clone boxes to avoid modifying original
+    scaled_boxes = boxes.clone()
+
+    # Remove padding offset and scale back to original size
+    scaled_boxes[:, 1] = (boxes[:, 1] - pad_x) / scale  # x1
+    scaled_boxes[:, 2] = (boxes[:, 2] - pad_y) / scale  # y1
+    scaled_boxes[:, 3] = (boxes[:, 3] - pad_x) / scale  # x2
+    scaled_boxes[:, 4] = (boxes[:, 4] - pad_y) / scale  # y2
+
+    # Clamp to image boundaries
+    scaled_boxes[:, 1] = scaled_boxes[:, 1].clamp(0, orig_w)
+    scaled_boxes[:, 2] = scaled_boxes[:, 2].clamp(0, orig_h)
+    scaled_boxes[:, 3] = scaled_boxes[:, 3].clamp(0, orig_w)
+    scaled_boxes[:, 4] = scaled_boxes[:, 4].clamp(0, orig_h)
+
+    return scaled_boxes
+
+
 def predict_image(
     checkpoint_path: str,
     image_path: str,
@@ -180,7 +227,14 @@ def predict_image(
     }
 
     if len(pred) > 0:
-        for det in pred:
+        # Scale boxes from letterbox space to original image space
+        scaled_pred = scale_boxes_to_original(
+            pred,
+            original_size=original_image.size,  # (width, height)
+            letterbox_size=image_size,  # (width, height)
+        )
+
+        for det in scaled_pred:
             class_id = int(det[0].item())
             results["detections"].append({
                 "class_id": class_id,
@@ -191,7 +245,7 @@ def predict_image(
 
         # Draw and save if requested
         if draw_boxes and output_path:
-            result_image = draw_bboxes(original_image, pred, idx2label=class_names)
+            result_image = draw_bboxes(original_image, scaled_pred, idx2label=class_names)
             result_image.save(output_path)
             results["output_path"] = str(output_path)
 
@@ -268,7 +322,14 @@ def predict_directory(
         }
 
         if len(pred) > 0:
-            for det in pred:
+            # Scale boxes from letterbox space to original image space
+            scaled_pred = scale_boxes_to_original(
+                pred,
+                original_size=original_image.size,  # (width, height)
+                letterbox_size=image_size,  # (width, height)
+            )
+
+            for det in scaled_pred:
                 class_id = int(det[0].item())
                 result["detections"].append({
                     "class_id": class_id,
@@ -280,7 +341,7 @@ def predict_directory(
             # Draw and save
             if draw_boxes:
                 out_file = output_path / img_file.name
-                result_image = draw_bboxes(original_image, pred, idx2label=class_names)
+                result_image = draw_bboxes(original_image, scaled_pred, idx2label=class_names)
                 result_image.save(out_file)
                 result["output_path"] = str(out_file)
 

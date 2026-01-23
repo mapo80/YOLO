@@ -486,6 +486,29 @@ python -m yolo.cli export --checkpoint runs/best.ckpt \
     --opset 17
 ```
 
+##### Export and Verification Workflow
+
+After exporting, verify that the ONNX model produces the same results as the original checkpoint:
+
+```bash
+# Step 1: Export to ONNX
+python -m yolo export --checkpoint runs/best.ckpt --output model.onnx --size 320
+
+# Step 2: Run inference with checkpoint (reference)
+python -m yolo predict --checkpoint runs/best.ckpt --source test.jpg --output result_ckpt.jpg --size 320
+
+# Step 3: Run inference with ONNX (verification)
+python tools/onnx_inference.py --model model.onnx --image test.jpg --output result_onnx.jpg
+
+# Step 4: Compare results
+# Both should show the same classes, similar confidences, and matching bounding boxes
+```
+
+**Expected behavior:**
+- Same classes detected
+- Confidence scores within ~2% (minor differences due to floating point precision)
+- Bounding box coordinates should match (after accounting for coordinate scaling)
+
 ##### ONNX Model Format Specification
 
 The exported ONNX model uses the [WongKinYiu/yolov9](https://github.com/WongKinYiu/yolov9) output format, ensuring compatibility with existing inference pipelines (including .NET, C++, and mobile).
@@ -835,6 +858,105 @@ The model uses 3 detection scales with strides 8, 16, and 32:
 | 640×640 | 80×80=6400 | 40×40=1600 | 20×20=400 | **8400** |
 
 Anchors are ordered by scale (stride 8 first, then 16, then 32), and within each scale by row-major order (left-to-right, top-to-bottom).
+
+##### ONNX Inference Script
+
+A standalone inference script is provided at `tools/onnx_inference.py` that performs complete inference on ONNX models without any SDK dependencies (only requires `onnxruntime`, `numpy`, and `opencv-python`).
+
+###### Features
+
+- **Standalone**: No YOLO SDK required, just standard ML libraries
+- **Complete pipeline**: Letterbox preprocessing, inference, NMS, coordinate scaling
+- **Auto-detection**: Automatically reads input size and number of classes from ONNX model
+- **Visualization**: Draws bounding boxes and saves annotated images
+- **Flexible output**: Console output with detection details, optional image saving
+
+###### Usage
+
+```bash
+# Basic inference
+python tools/onnx_inference.py --model model.onnx --image test.jpg
+
+# Save annotated output
+python tools/onnx_inference.py --model model.onnx --image test.jpg --output result.jpg
+
+# Adjust thresholds
+python tools/onnx_inference.py --model model.onnx --image test.jpg \
+    --conf-thresh 0.5 --iou-thresh 0.45
+
+# With class names file
+python tools/onnx_inference.py --model model.onnx --image test.jpg \
+    --class-names classes.txt --output result.jpg
+```
+
+###### Command Line Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--model` | (required) | Path to ONNX model file |
+| `--image` | (required) | Path to input image |
+| `--output` | None | Path to save annotated image (displays if not set) |
+| `--conf-thresh` | 0.25 | Confidence threshold for detections |
+| `--iou-thresh` | 0.45 | IoU threshold for NMS |
+| `--num-classes` | auto | Number of classes (auto-detected from model) |
+| `--input-size` | auto | Input size as "H W" (auto-detected from model) |
+| `--class-names` | None | Path to class names file (one name per line) |
+
+###### Output Format
+
+The script prints detection results to console:
+
+```
+Loading model: model.onnx
+Input: images [1, 3, 320, 320]
+Output: output0 [1, 17, 2100]
+Using model input size: (320, 320)
+Processing image: test.jpg
+Running inference...
+Output shape: (1, 17, 2100)
+Auto-detected 13 classes
+Found 2 detections
+  [0] Class 7: 0.986 [370.5, 301.7, 1119.5, 742.1]
+  [1] Class 9: 0.989 [374.3, 1181.0, 1136.1, 1679.5]
+Saved result to: result.jpg
+```
+
+Each detection shows:
+- **Class ID**: Integer class index
+- **Confidence**: Detection confidence (0-1)
+- **Bounding box**: `[x1, y1, x2, y2]` in original image coordinates (pixels)
+
+###### Coordinate System
+
+The script automatically handles the coordinate transformation pipeline:
+
+```
+Original Image (e.g., 2448x3264)
+        │
+        ▼ letterbox resize
+Letterboxed Image (320x320)
+        │
+        ▼ model inference
+Model Output (XYWH in 320x320 space)
+        │
+        ▼ decode & scale_boxes
+Final Detections (XYXY in original image coordinates)
+```
+
+The output bounding boxes are in the **original image coordinate system**, so they can be drawn directly on the original image without any additional transformation.
+
+###### Class Names File Format
+
+Create a plain text file with one class name per line:
+
+```
+class_0_name
+class_1_name
+class_2_name
+...
+```
+
+The line number (0-indexed) corresponds to the class ID.
 
 #### Export to TFLite
 
