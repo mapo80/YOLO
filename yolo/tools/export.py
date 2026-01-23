@@ -215,8 +215,13 @@ def export_onnx(
         half = False
 
     # Load model from checkpoint
+    # Skip pretrained weight loading since checkpoint already has trained weights
     print(f"📂 Loading checkpoint: {checkpoint_path}")
-    module = YOLOModule.load_from_checkpoint(checkpoint_path, map_location=device)
+    module = YOLOModule.load_from_checkpoint(
+        checkpoint_path,
+        map_location=device,
+        weight_path=None,  # Don't load pretrained weights, use checkpoint state_dict
+    )
     module.eval()
     module.to(device)
 

@@ -71,10 +71,12 @@ class QATModule(L.LightningModule):
         self.save_hyperparameters()
 
         # Load base module from checkpoint
+        # Skip pretrained weight loading since checkpoint already has trained weights
         logger.info(f"📂 Loading base model from: {checkpoint_path}")
         self._base_module = YOLOModule.load_from_checkpoint(
             checkpoint_path,
             map_location="cpu",
+            weight_path=None,  # Don't load pretrained weights, use checkpoint state_dict
         )
 
         # Extract configuration from base module

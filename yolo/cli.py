@@ -706,8 +706,13 @@ Examples:
     data_cfg = config.data
 
     # Get image size from checkpoint
+    # Skip pretrained weight loading since checkpoint already has trained weights
     from yolo.training.module import YOLOModule
-    base_module = YOLOModule.load_from_checkpoint(args.checkpoint, map_location="cpu")
+    base_module = YOLOModule.load_from_checkpoint(
+        args.checkpoint,
+        map_location="cpu",
+        weight_path=None,  # Don't load pretrained weights, use checkpoint state_dict
+    )
     image_size = tuple(base_module.hparams.image_size)
     del base_module
 

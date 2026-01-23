@@ -333,7 +333,12 @@ def validate(
         console.print(f"[bold blue]Device:[/] {device}")
 
     # Load model
-    model = YOLOModule.load_from_checkpoint(checkpoint_path, map_location=device)
+    # Skip pretrained weight loading since checkpoint already has trained weights
+    model = YOLOModule.load_from_checkpoint(
+        checkpoint_path,
+        map_location=device,
+        weight_path=None,  # Don't load pretrained weights, use checkpoint state_dict
+    )
     model.eval()
     model.to(device)
 
