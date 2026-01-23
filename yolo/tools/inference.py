@@ -44,7 +44,12 @@ def load_model_from_checkpoint(
             device = "cpu"
 
     # Load the Lightning module from checkpoint
-    module = YOLOModule.load_from_checkpoint(checkpoint_path, map_location=device)
+    # Skip pretrained weight loading since checkpoint already has trained weights
+    module = YOLOModule.load_from_checkpoint(
+        checkpoint_path,
+        map_location=device,
+        weight_path=None,  # Don't load pretrained weights, use checkpoint state_dict
+    )
     module.eval()
     module.to(device)
 

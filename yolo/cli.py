@@ -296,6 +296,10 @@ Examples:
             output = source.parent / f"{source.stem}_prediction{source.suffix}"
         else:
             output = Path(args.output)
+            # If output looks like a directory (no extension or ends with /), create filename inside it
+            if output.is_dir() or not output.suffix or str(args.output).endswith('/'):
+                output.mkdir(parents=True, exist_ok=True)
+                output = output / f"{source.stem}_prediction{source.suffix}"
 
         print(f"Running inference on: {source}")
         results = predict_image(
