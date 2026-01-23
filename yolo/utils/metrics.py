@@ -18,6 +18,8 @@ import torch
 from scipy.ndimage import gaussian_filter1d
 
 # Plotting imports
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
