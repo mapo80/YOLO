@@ -462,29 +462,12 @@ exports/
 
 ONNX export is the fastest and simplest option, with no additional dependencies beyond the base installation.
 
-**Output Format (YOLOv9 Compatible):**
-
-The exported ONNX model uses the same output format as the [original YOLOv9 repository](https://github.com/WongKinYiu/yolov9):
-
-| Property | Value |
-|----------|-------|
-| Input name | `images` |
-| Input shape | `[batch, 3, height, width]` |
-| Output name | `output0` |
-| Output shape | `[batch, num_detections, 4+num_classes]` |
-
-For a 640x640 image with 80 COCO classes: `[1, 8400, 84]`
-- First 4 values: `x1, y1, x2, y2` (xyxy bounding box in absolute pixels)
-- Remaining 80 values: class probabilities (post-sigmoid)
-
-This format ensures compatibility with existing YOLOv9 inference code and deployment pipelines.
-
 ```shell
 # Basic ONNX export
 python -m yolo.cli export --checkpoint runs/best.ckpt --format onnx
 
-# Export with custom output path
-python -m yolo.cli export --checkpoint runs/best.ckpt --output model.onnx
+# Export with custom output path and size
+python -m yolo.cli export --checkpoint runs/best.ckpt --output model.onnx --size 640
 
 # Export with FP16 precision (CUDA only, smaller model)
 python -m yolo.cli export --checkpoint runs/best.ckpt --half
@@ -503,47 +486,355 @@ python -m yolo.cli export --checkpoint runs/best.ckpt \
     --opset 17
 ```
 
-**Output Format (YOLOv9 Compatible):**
+##### ONNX Model Format Specification
 
-The ONNX export produces output identical to the original [WongKinYiu/yolov9](https://github.com/WongKinYiu/yolov9) format, ensuring compatibility with existing inference pipelines (including .NET):
+The exported ONNX model uses the [WongKinYiu/yolov9](https://github.com/WongKinYiu/yolov9) output format, ensuring compatibility with existing inference pipelines (including .NET, C++, and mobile).
 
-| Aspect | Format |
-|--------|--------|
-| **Output shape** | `[B, 4+num_classes, num_anchors]` |
-| **Example (13 classes)** | `[1, 17, 8400]` |
-| **Box format** | XYWH (center_x, center_y, width, height) in pixels |
-| **Class scores** | Post-sigmoid (0-1 range) |
+###### Input Specification
 
-**Output tensor layout:**
+| Property | Value | Description |
+|----------|-------|-------------|
+| **Name** | `images` | Input tensor name |
+| **Shape** | `[batch, 3, height, width]` | NCHW format |
+| **Type** | `float32` | Normalized to [0, 1] |
+| **Color space** | RGB | Not BGR |
+
+Example for 320x320 model: `images=[1, 3, 320, 320]`
+
+###### Output Specification
+
+| Property | Value | Description |
+|----------|-------|-------------|
+| **Name** | `output0` | Output tensor name |
+| **Shape** | `[batch, 4+num_classes, num_anchors]` | Transposed format |
+| **Type** | `float32` | Box coords + probabilities |
+
+Example for 320x320 with 13 classes: `output0=[1, 17, 2100]`
+- `17` = 4 (box) + 13 (class scores)
+- `2100` = 40×40 + 20×20 + 10×10 anchors (for strides 8, 16, 32)
+
+Example for 640x640 with 80 classes: `output0=[1, 84, 8400]`
+- `84` = 4 (box) + 80 (class scores)
+- `8400` = 80×80 + 40×40 + 20×20 anchors
+
+###### Output Tensor Layout
 
 The output tensor has shape `[batch, 4+num_classes, num_anchors]`:
-- **First 4 channels** (`[:4, :]`): Bounding box coordinates in XYWH format (absolute pixel values)
-- **Remaining channels** (`[4:, :]`): Class probabilities (post-sigmoid, ready for thresholding)
 
-For 640x640 with 80 classes (COCO):
-- `output0=[1, 84, 8400]` where 84 = 4 (box) + 80 (classes)
-
-For 640x640 with 13 classes:
-- `output0=[1, 17, 8400]` where 17 = 4 (box) + 13 (classes)
-
-**Inference Script:**
-
-A standalone Python inference script is provided for testing ONNX models:
-
-```shell
-# Run inference on an image
-python tools/onnx_inference.py \
-    --model exports/model.onnx \
-    --image test.jpg \
-    --conf-thresh 0.25 \
-    --output result.jpg
-
-# With specific number of classes
-python tools/onnx_inference.py \
-    --model exports/model.onnx \
-    --image test.jpg \
-    --num-classes 13
 ```
+output[0, 0, :]  → center_x (cx) for all anchors
+output[0, 1, :]  → center_y (cy) for all anchors
+output[0, 2, :]  → width (w) for all anchors
+output[0, 3, :]  → height (h) for all anchors
+output[0, 4:, :] → class scores (post-sigmoid, 0-1) for all anchors
+```
+
+| Channel | Content | Range | Units |
+|---------|---------|-------|-------|
+| `[0]` | center_x | [0, input_width] | pixels |
+| `[1]` | center_y | [0, input_height] | pixels |
+| `[2]` | width | [0, input_width] | pixels |
+| `[3]` | height | [0, input_height] | pixels |
+| `[4:]` | class scores | [0, 1] | probability (post-sigmoid) |
+
+###### Box Format: XYWH (Center)
+
+Bounding boxes are in **XYWH center format** with absolute pixel coordinates:
+
+```
+┌─────────────────────────────┐
+│                             │
+│      ┌───────────┐          │
+│      │           │          │
+│      │    (cx,cy)●          │  cx = center x
+│      │           │          │  cy = center y
+│      │     w     │          │  w  = width
+│      └─────┬─────┘          │  h  = height
+│            h                │
+│                             │
+└─────────────────────────────┘
+```
+
+To convert to XYXY (top-left, bottom-right):
+```python
+x1 = cx - w / 2
+y1 = cy - h / 2
+x2 = cx + w / 2
+y2 = cy + h / 2
+```
+
+##### Preprocessing Requirements
+
+**IMPORTANT: The model requires letterbox preprocessing to maintain aspect ratio.**
+
+The model was trained with letterbox resizing (padding to maintain aspect ratio). Using simple resize (stretching) will produce incorrect bounding boxes.
+
+###### Letterbox Preprocessing Steps
+
+1. **Calculate scale** to fit image in target size while maintaining aspect ratio
+2. **Resize** image using the calculated scale
+3. **Pad** with gray (114, 114, 114) to reach target size
+4. **Convert** BGR to RGB
+5. **Normalize** to [0, 1] by dividing by 255
+6. **Transpose** from HWC to CHW format
+
+###### Python Letterbox Implementation
+
+```python
+import numpy as np
+import cv2
+
+def letterbox(image, target_size=(640, 640), color=(114, 114, 114)):
+    """
+    Resize image with letterbox (maintain aspect ratio with padding).
+
+    Args:
+        image: BGR image as numpy array (H, W, C)
+        target_size: (width, height) tuple
+        color: padding color (B, G, R)
+
+    Returns:
+        letterboxed: padded image (target_height, target_width, 3)
+        scale: scale factor used
+        pad: (pad_x, pad_y) padding added
+    """
+    h, w = image.shape[:2]
+    target_w, target_h = target_size
+
+    # Calculate scale (fit in target while maintaining aspect ratio)
+    scale = min(target_w / w, target_h / h)
+
+    # New size after scaling
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    # Resize
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    # Calculate padding
+    pad_w = (target_w - new_w) // 2
+    pad_h = (target_h - new_h) // 2
+
+    # Create padded image
+    letterboxed = np.full((target_h, target_w, 3), color, dtype=np.uint8)
+    letterboxed[pad_h:pad_h+new_h, pad_w:pad_w+new_w] = resized
+
+    return letterboxed, scale, (pad_w, pad_h)
+
+
+def preprocess(image_path, target_size=(640, 640)):
+    """
+    Full preprocessing pipeline for ONNX inference.
+
+    Returns:
+        tensor: (1, 3, H, W) float32 tensor normalized to [0, 1]
+        scale: scale factor for coordinate conversion
+        pad: (pad_x, pad_y) for coordinate conversion
+    """
+    # Load image (OpenCV loads as BGR)
+    image = cv2.imread(image_path)
+
+    # Letterbox resize
+    letterboxed, scale, pad = letterbox(image, target_size)
+
+    # BGR to RGB
+    rgb = cv2.cvtColor(letterboxed, cv2.COLOR_BGR2RGB)
+
+    # Normalize to [0, 1]
+    normalized = rgb.astype(np.float32) / 255.0
+
+    # HWC to CHW
+    chw = np.transpose(normalized, (2, 0, 1))
+
+    # Add batch dimension
+    tensor = np.expand_dims(chw, axis=0)
+
+    return tensor, scale, pad
+```
+
+##### Postprocessing
+
+###### Decode Predictions
+
+```python
+import numpy as np
+
+def decode_predictions(output, conf_threshold=0.25):
+    """
+    Decode ONNX output to detections.
+
+    Args:
+        output: ONNX output tensor [1, 4+num_classes, num_anchors]
+        conf_threshold: confidence threshold
+
+    Returns:
+        boxes: [N, 4] array of XYXY boxes
+        scores: [N] array of confidence scores
+        class_ids: [N] array of class indices
+    """
+    # Transpose to [num_anchors, 4+num_classes]
+    predictions = output[0].T
+
+    # Split box coordinates and class scores
+    boxes_xywh = predictions[:, :4]
+    class_scores = predictions[:, 4:]
+
+    # Get best class for each anchor
+    class_ids = np.argmax(class_scores, axis=1)
+    scores = np.max(class_scores, axis=1)
+
+    # Filter by confidence
+    mask = scores > conf_threshold
+    boxes_xywh = boxes_xywh[mask]
+    scores = scores[mask]
+    class_ids = class_ids[mask]
+
+    if len(boxes_xywh) == 0:
+        return np.array([]), np.array([]), np.array([])
+
+    # Convert XYWH to XYXY
+    boxes_xyxy = np.zeros_like(boxes_xywh)
+    boxes_xyxy[:, 0] = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2  # x1
+    boxes_xyxy[:, 1] = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2  # y1
+    boxes_xyxy[:, 2] = boxes_xywh[:, 0] + boxes_xywh[:, 2] / 2  # x2
+    boxes_xyxy[:, 3] = boxes_xywh[:, 1] + boxes_xywh[:, 3] / 2  # y2
+
+    return boxes_xyxy, scores, class_ids
+```
+
+###### Scale Boxes to Original Image
+
+```python
+def scale_boxes(boxes, scale, pad, original_size):
+    """
+    Scale boxes from letterboxed coordinates to original image coordinates.
+
+    Args:
+        boxes: [N, 4] XYXY boxes in letterboxed coordinates
+        scale: scale factor used in letterbox
+        pad: (pad_x, pad_y) padding used in letterbox
+        original_size: (width, height) of original image
+
+    Returns:
+        boxes: [N, 4] XYXY boxes in original image coordinates
+    """
+    pad_x, pad_y = pad
+
+    # Remove padding offset
+    boxes[:, [0, 2]] -= pad_x
+    boxes[:, [1, 3]] -= pad_y
+
+    # Scale back to original size
+    boxes /= scale
+
+    # Clip to image bounds
+    orig_w, orig_h = original_size
+    boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, orig_w)
+    boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, orig_h)
+
+    return boxes
+```
+
+###### Non-Maximum Suppression (NMS)
+
+```python
+def nms(boxes, scores, iou_threshold=0.45):
+    """
+    Apply Non-Maximum Suppression.
+
+    Args:
+        boxes: [N, 4] XYXY boxes
+        scores: [N] confidence scores
+        iou_threshold: IoU threshold for suppression
+
+    Returns:
+        keep: indices of boxes to keep
+    """
+    if len(boxes) == 0:
+        return np.array([], dtype=int)
+
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
+
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+
+        # Calculate IoU with remaining boxes
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+
+        w = np.maximum(0, xx2 - xx1)
+        h = np.maximum(0, yy2 - yy1)
+        inter = w * h
+
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+
+        # Keep boxes with IoU below threshold
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+
+    return np.array(keep, dtype=int)
+```
+
+##### Complete Inference Example
+
+```python
+import numpy as np
+import cv2
+import onnxruntime as ort
+
+# Load model
+session = ort.InferenceSession("model.onnx", providers=["CPUExecutionProvider"])
+input_name = session.get_inputs()[0].name
+input_shape = session.get_inputs()[0].shape
+input_size = (input_shape[3], input_shape[2])  # (width, height)
+
+# Load and preprocess image
+image = cv2.imread("test.jpg")
+original_size = (image.shape[1], image.shape[0])  # (width, height)
+tensor, scale, pad = preprocess("test.jpg", input_size)
+
+# Run inference
+output = session.run(None, {input_name: tensor})[0]
+
+# Decode predictions
+boxes, scores, class_ids = decode_predictions(output, conf_threshold=0.25)
+
+# Scale boxes to original image
+boxes = scale_boxes(boxes, scale, pad, original_size)
+
+# Apply NMS (per class)
+final_boxes, final_scores, final_classes = [], [], []
+for cls_id in np.unique(class_ids):
+    cls_mask = class_ids == cls_id
+    cls_boxes = boxes[cls_mask]
+    cls_scores = scores[cls_mask]
+    keep = nms(cls_boxes, cls_scores, iou_threshold=0.45)
+    final_boxes.extend(cls_boxes[keep])
+    final_scores.extend(cls_scores[keep])
+    final_classes.extend([cls_id] * len(keep))
+
+# Print results
+for box, score, cls_id in zip(final_boxes, final_scores, final_classes):
+    print(f"Class {cls_id}: {score:.2%} at [{box[0]:.0f}, {box[1]:.0f}, {box[2]:.0f}, {box[3]:.0f}]")
+```
+
+##### Anchor Grid Reference
+
+The model uses 3 detection scales with strides 8, 16, and 32:
+
+| Input Size | Stride 8 | Stride 16 | Stride 32 | Total Anchors |
+|------------|----------|-----------|-----------|---------------|
+| 320×320 | 40×40=1600 | 20×20=400 | 10×10=100 | **2100** |
+| 416×416 | 52×52=2704 | 26×26=676 | 13×13=169 | **3549** |
+| 640×640 | 80×80=6400 | 40×40=1600 | 20×20=400 | **8400** |
+
+Anchors are ordered by scale (stride 8 first, then 16, then 32), and within each scale by row-major order (left-to-right, top-to-bottom).
 
 #### Export to TFLite
 
