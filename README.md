@@ -2240,8 +2240,31 @@ yolo fit --config config.yaml \
 
 **Requirements for cache-only mode:**
 - Cache must be complete (all images cached)
-- Cache must contain label metadata
+- **Labels must be transferred separately** (labels are NOT stored in the LMDB cache)
+- Split files (train.txt, val.txt) must be transferred
 - Error raised if any image is not found in cache
+
+##### What's in the Cache vs What to Transfer
+
+The LMDB cache contains **only pre-processed images**, not labels. For remote training, you must transfer:
+
+| Item | In Cache | Transfer Required |
+|------|----------|-------------------|
+| Pre-processed images | YES | Cache directory |
+| Image paths (for mapping) | YES | (included in cache) |
+| Labels (annotations) | **NO** | `labels/` directory |
+| Split files | **NO** | `train.txt`, `val.txt` |
+
+```
+# Files required on remote server:
+dataset/
+├── .yolo_cache_640x640_f1.0/    # LMDB cache (images only)
+│   └── cache.lmdb/
+├── labels/                       # YOLO format labels (REQUIRED)
+│   └── *.txt
+├── train.txt                     # Split file (REQUIRED)
+└── val.txt                       # Split file (REQUIRED)
+```
 
 ##### Complete Workflow: Secure Remote Training
 
@@ -2268,16 +2291,24 @@ yolo cache-export \
 # 4. Transfer to remote (cache is encrypted, safe to transfer)
 scp cache_640_encrypted.tar.gz user@remote:/data/
 
+# 5. Transfer labels and split files (NOT in cache, required for training)
+scp -r dataset/labels user@remote:/data/dataset/
+scp dataset/train.txt dataset/val.txt user@remote:/data/dataset/
+
 # ============================================
 # REMOTE VM (no original images)
 # ============================================
 
-# 5. Import cache
+# 6. Import cache
 yolo cache-import \
     --archive cache_640_encrypted.tar.gz \
     --output /data/dataset/
 
-# 6. Train using only cache (decryption happens only in memory)
+# 7. Verify all required files are present
+ls /data/dataset/
+# Should show: .yolo_cache_640x640_f1.0/  labels/  train.txt  val.txt
+
+# 8. Train using only cache (decryption happens only in memory)
 export YOLO_ENCRYPTION_KEY="your-64-char-hex-key"
 yolo fit --config config.yaml \
     --data.cache_images disk \
@@ -2286,6 +2317,7 @@ yolo fit --config config.yaml \
 # Original images are NEVER on the remote VM
 # Encrypted data on disk is NEVER decrypted to files
 # Decryption happens ONLY in memory during training
+# Labels are plain text (class_id + bboxes) - no sensitive image data
 ```
 
 ##### Security Model
