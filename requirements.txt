@@ -47,3 +47,4 @@ PyTurboJPEG>=1.7.0    # For TurboJPEGLoader (requires libjpeg-turbo)
 
 # Caching
 lmdb>=1.4.0           # For unified RAM/Disk image cache
+lz4>=4.0.0            # For LZ4 compression (cache_compress: true)
