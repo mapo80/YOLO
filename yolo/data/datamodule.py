@@ -1410,6 +1410,8 @@ class YOLOFormatDataset(Dataset):
         if cache_only:
             if image_cache is None:
                 raise ValueError("cache_only=True requires image_cache to be provided")
+            if cache_labels:
+                logger.info("cache_only mode: labels loaded from cache metadata (cache_labels setting ignored)")
             self._setup_from_cache()
             return
 
