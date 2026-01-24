@@ -1891,47 +1891,97 @@ python -m yolo.cli fit --config config.yaml --data.close_mosaic_epochs=20
 
 Accelerate data loading with label caching and optional image caching. Labels are parsed once and cached; subsequent runs load instantly. The cache auto-invalidates when source files change.
 
-**Label Caching (Default: Enabled)**
+**Cache System v4.0.0** - Unified caching with JPEG and RAW format support.
 
-Labels are parsed from `.txt` files once and saved to a `.cache` file. On subsequent runs, labels load from cache instead of re-parsing all files. The cache validates against file modification times and sizes.
+#### Quick Start
 
-**Image Caching (Optional)**
+```bash
+# 1. Create cache (one time)
+cd yolo-mit
+export YOLO_ENCRYPTION_KEY="$(python -c 'import os; print(os.urandom(32).hex())')"
+python -m yolo cache-create --config config.yaml
 
-| Mode | Description |
-|------|-------------|
-| `none` | No image caching (default) |
-| `ram` | Pre-fault all pages into memory for fastest access |
-| `disk` | Uses OS-managed memory-mapping for lazy loading |
+# 2. Train using cache
+python -m yolo fit --config config.yaml
+```
 
-Both `ram` and `disk` modes use the same unified **LMDB** (Lightning Memory-Mapped Database) backend, providing:
-- Zero-copy reads via memory-mapping
-- Multi-process safe concurrent reads (DataLoader workers)
-- Efficient B+ tree indexing
-- Automatic page management
+#### Cache Modes
 
-**Configuration:**
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `none` | No image caching (default) | Small datasets, debugging |
+| `ram` | Pre-fault all pages into memory | Fast SSD, enough RAM |
+| `disk` | OS-managed memory-mapping, lazy loading | Large datasets, limited RAM |
+
+Both `ram` and `disk` modes use the same unified **LMDB** (Lightning Memory-Mapped Database) backend.
+
+#### Cache Formats
+
+| Format | Compression | Size | Quality | Best For |
+|--------|-------------|------|---------|----------|
+| `jpeg` | TurboJPEG ~10x | ~5-6 GB (32K images) | Near-lossless (quality 95) | **Recommended for disk cache** |
+| `raw` | LZ4 automatic | ~40% reduction | Lossless | RAM cache, exact reproduction |
+
+**JPEG format** (default) uses TurboJPEG for fast encoding/decoding with minimal quality loss at quality=95.
+
+**RAW format** stores uncompressed numpy arrays with automatic LZ4 compression.
+
+#### Full Configuration Reference
 
 ```yaml
 data:
-  cache_labels: true           # Enable label caching (default: true)
+  # Label caching
+  cache_labels: true           # Parse labels once, cache to .cache file (default: true)
+
+  # Image caching mode
   cache_images: none           # "none", "ram", or "disk"
-  cache_dir: null              # Directory for cache (null = alongside images)
-  cache_resize_images: true    # Resize images to image_size when caching (saves RAM)
-  cache_max_memory_gb: 8.0     # Max memory for image caching
+
+  # Cache format (v4.0.0+)
+  cache_format: jpeg           # "jpeg" (~10x smaller, fast) or "raw" (lossless with LZ4)
+  jpeg_quality: 95             # JPEG quality 1-100 (only for cache_format: jpeg)
+
+  # Image resize during caching
+  cache_resize_images: true    # Resize to image_size when caching (default: true, saves space)
+
+  # Storage options
+  cache_dir: null              # Custom cache directory (null = alongside images)
+  cache_max_memory_gb: 8.0     # Max memory for RAM mode
+
+  # Security
+  cache_encrypt: true          # AES-256 encryption (requires YOLO_ENCRYPTION_KEY env var)
+  encryption_key: null         # Or set key directly (less secure than env var)
+
+  # Performance
   cache_workers: null          # Parallel workers for caching (null = all CPU threads)
-  cache_refresh: false         # Force cache regeneration
-  cache_encrypt: false         # Encrypt cached values (requires encryption_key)
-  cache_sync: false            # Enable LMDB fsync (disable for external volumes on macOS)
-  encryption_key: null         # AES-256 key for encrypted images/cache
+  cache_sync: false            # LMDB fsync - disable for external volumes on macOS
+
+  # Cache management
+  cache_refresh: false         # Force cache regeneration (delete and rebuild)
+  cache_only: false            # Train using ONLY cache (no original images needed)
 ```
 
 #### Cache Architecture
 
 ```
                          +----------------------------------------------------------+
-                         |                      ImageCache                          |
-                         |                    (Unified LMDB)                        |
+                         |                   ImageCache v4.0.0                      |
+                         |              (Unified LMDB + JPEG/RAW formats)           |
                          +----------------------------------------------------------+
+                                                  |
+                    +-----------------------------+-----------------------------+
+                    |                                                           |
+                    v                                                           v
+         +-------------------+                                    +-------------------+
+         |   JPEG Format     |                                    |    RAW Format     |
+         | (cache_format:    |                                    | (cache_format:    |
+         |      jpeg)        |                                    |       raw)        |
+         +-------------------+                                    +-------------------+
+         | TurboJPEG encode  |                                    | LZ4 compression   |
+         | ~10x compression  |                                    | ~40% reduction    |
+         | Quality: 95       |                                    | Lossless          |
+         +-------------------+                                    +-------------------+
+                    |                                                           |
+                    +-----------------------------+-----------------------------+
                                                   |
                          +------------------------+------------------------+
                          |                                                 |
@@ -1940,11 +1990,8 @@ data:
               |     RAM Mode        |                        |     Disk Mode       |
               |  (cache_images:ram) |                        | (cache_images:disk) |
               +---------------------+                        +---------------------+
-                         |                                                 |
-                         v                                                 v
-              +---------------------+                        +---------------------+
-              |  Pre-fault pages    |                        |  Lazy OS-managed    |
-              |  into RAM at init   |                        |  memory-mapping     |
+              | Pre-fault pages     |                        | Lazy OS-managed     |
+              | into RAM at init    |                        | memory-mapping      |
               +---------------------+                        +---------------------+
                          |                                                 |
                          +------------------------+------------------------+
@@ -1952,18 +1999,18 @@ data:
                                                   v
                          +----------------------------------------------------------+
                          |                      LMDB Storage                        |
-                         |  .yolo_cache_{suffix}/cache.lmdb/                        |
-                         |  +-- data.mdb      (memory-mapped data file)             |
-                         |  +-- lock.mdb      (lock file for concurrency)           |
+                         |  .yolo_cache_{WxH}_f{fraction}/cache.lmdb/               |
+                         |  Example: .yolo_cache_320x320_f1.0/cache.lmdb/           |
+                         |           .yolo_cache_orig_f1.0/cache.lmdb/ (no resize)  |
                          +----------------------------------------------------------+
-                                                  |
-                                                  v
-                         +----------------------------------------------------------+
-                         |                    Data Format                           |
-                         |  Key: image_index (e.g., "0", "1", "2", ...)             |
-                         |  Value: [header][array_bytes]                            |
-                         |         header = dtype_id(1B) + ndim(1B) + shape(4B x N) |
-                         |         (optionally AES-256 encrypted)                   |
+                         |  Metadata (__metadata__ key):                            |
+                         |    - version: "4.0.0"                                    |
+                         |    - cache_format: "jpeg" | "raw"                        |
+                         |    - encrypted: true | false                             |
+                         |    - target_size: (W, H) | null                          |
+                         |    - image_paths: [...]                                  |
+                         |    - labels: [...] (for cache-only mode)                 |
+                         |    - train_indices: [...], val_indices: [...]            |
                          +----------------------------------------------------------+
 ```
 
@@ -2015,7 +2062,47 @@ This allows you to:
 
 **Image Resize During Caching:**
 
-When `cache_resize_images: true` (default), images are resized to `image_size` during caching. This significantly reduces memory usage - a 4K image (4000x3000) takes ~36MB in RAM, but resized to 640x640 only ~1.2MB. The resize uses letterbox padding to preserve aspect ratio.
+When `cache_resize_images: true` (default), images are resized to `image_size` during caching. This significantly reduces memory usage - a 4K image (4000x3000) takes ~36MB in RAM, but resized to 640x640 only ~1.2MB.
+
+*Resize Method - Letterboxing:*
+
+The cache uses **letterbox resize** which preserves the original aspect ratio:
+
+1. Calculate scale factor: `scale = min(target_w/orig_w, target_h/orig_h)`
+2. Resize image maintaining aspect ratio
+3. Center on gray (114, 114, 114) background canvas
+
+Example: 1920×1080 image resized to 320×320:
+- Scale: `min(320/1920, 320/1080) = 0.167`
+- New size: 320×180
+- Padding: 70px top and bottom (gray)
+
+*Interpolation Methods:*
+
+| Method | Quality | Speed | Use Case |
+|--------|---------|-------|----------|
+| NEAREST | ⭐ | ⭐⭐⭐⭐⭐ | Masks, segmentation labels |
+| **BILINEAR** | ⭐⭐⭐ | ⭐⭐⭐⭐ | **YOLO standard (cache & training)** |
+| BICUBIC | ⭐⭐⭐⭐ | ⭐⭐⭐ | High-quality photo processing |
+| LANCZOS | ⭐⭐⭐⭐⭐ | ⭐⭐ | Critical downscaling |
+
+The cache uses **PIL BILINEAR** interpolation, which matches the training pipeline:
+
+| Component | Interpolation | Consistency |
+|-----------|---------------|-------------|
+| Cache (`_resize_for_cache`) | PIL BILINEAR | ✓ |
+| LetterBox Transform (training) | PIL BILINEAR | ✓ |
+| MixUp/CutMix | PIL BILINEAR | ✓ |
+| Mosaic | OpenCV INTER_LINEAR | ≈ (equivalent) |
+
+> **Note:** PIL BILINEAR and OpenCV INTER_LINEAR are both bilinear interpolations with minimal practical differences. The choice of BILINEAR provides the optimal balance between quality and speed for object detection tasks.
+
+*Why Letterbox with Gray Padding?*
+
+- **Aspect ratio preserved**: Objects maintain correct proportions (critical for bounding box accuracy)
+- **Gray (114, 114, 114)**: Standard YOLO padding color, reduces edge artifacts
+- **Centered image**: Consistent positioning across dataset
+- **No distortion**: Unlike stretch-to-fit which can degrade detection accuracy
 
 **Encrypted Cache:**
 
@@ -2030,6 +2117,52 @@ data:
 
 This ensures cached images are encrypted in the LMDB database, maintaining security for sensitive datasets. Note: LMDB metadata (keys, sizes) remains visible; only values are encrypted.
 
+**Cache Format Details:**
+
+**JPEG Format** (Recommended for most use cases):
+
+Uses TurboJPEG for fast hardware-accelerated encoding/decoding:
+- **Compression**: ~10x smaller than RAW (e.g., 5-6 GB vs 60+ GB for 32K images)
+- **Quality**: Configurable (default 95 = near-lossless for object detection)
+- **Speed**: Faster than LZ4 due to smaller I/O
+- **Encryption**: Applied after JPEG compression
+
+```yaml
+data:
+  cache_format: jpeg     # Default
+  jpeg_quality: 95       # 1-100 (higher = better quality, larger files)
+```
+
+**RAW Format** (For lossless requirements):
+
+Stores numpy arrays with automatic LZ4 compression:
+- **Compression**: ~40% reduction with LZ4 (automatic, not configurable)
+- **Quality**: Lossless - exact array reconstruction
+- **Use case**: When exact pixel values matter (e.g., medical imaging)
+
+```yaml
+data:
+  cache_format: raw      # Lossless with automatic LZ4
+```
+
+**Processing Order (with encryption):**
+
+```
+JPEG: Image → JPEG encode → AES-256 encrypt → LMDB
+RAW:  Image → LZ4 compress → AES-256 encrypt → LMDB
+```
+
+**Storage Comparison (32K images at original size ~1240x1754):**
+
+| Format | Encryption | Approximate Size |
+|--------|------------|------------------|
+| JPEG (q=95) | No | ~5-6 GB |
+| JPEG (q=95) | Yes | ~5-6 GB |
+| RAW + LZ4 | No | ~35-40 GB |
+| RAW + LZ4 | Yes | ~35-40 GB |
+
+> **Note**: `cache_compress` option is deprecated. Use `cache_format: raw` for automatic LZ4 compression, or `cache_format: jpeg` for JPEG compression.
+
 **Performance Characteristics:**
 
 The LMDB-based cache implementation provides excellent performance for deep learning workloads:
@@ -2039,6 +2172,7 @@ The LMDB-based cache implementation provides excellent performance for deep lear
 | **Storage** | LMDB with memory-mapping | Zero-copy reads, no syscall per access |
 | **Concurrency** | Multi-reader single-writer | Perfect for DataLoader workers (spawn mode) |
 | **Serialization** | Compact header (2 + 4×ndim bytes) + raw bytes | Minimal overhead, fast encode/decode |
+| **Compression** | LZ4 frame compression (optional) | ~40% size reduction, ~4 GB/s decompress |
 | **Encryption** | AES-256-GCM on values only | Strong security, key never serialized |
 | **Multiprocessing** | Automatic reconnection in workers | Transparent pickling support |
 
@@ -2096,16 +2230,18 @@ The cache is automatically invalidated (and rebuilt) when any of these settings 
 
 | Change | Message |
 |--------|---------|
-| Cache version upgrade | `version changed (3.0.0 → 3.1.0)` |
+| Cache version upgrade | `version changed (3.2.0 → 4.0.0)` |
 | Image count changed | `image count changed (100,000 → 117,266)` |
 | Image files changed | `image files changed` |
 | Size or fraction changed | `settings changed (size/fraction)` |
 | Encryption setting changed | `encryption changed (unencrypted → encrypted)` |
+| Format changed | `format changed (jpeg → raw)` |
 
 Settings that do **not** invalidate the cache:
 - `batch_size` - only affects DataLoader batching
 - `num_workers` - only affects parallel loading
 - `cache_max_memory_gb` - only affects RAM mode limits
+- `jpeg_quality` - only affects new cache creation (not validation)
 
 #### Cache Management CLI
 
@@ -2147,14 +2283,20 @@ The cache-create command automatically reads split files (`train_split`, `val_sp
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--config` | str | - | Path to YAML config file |
+| `--config` | str | - | Path to YAML config file (reads all settings from `data:` section) |
 | `--data.root` | str | required | Dataset root directory |
-| `--data.format` | str | coco | Dataset format (coco/yolo) |
+| `--data.format` | str | yolo | Dataset format (yolo/coco) |
 | `--size` | int | from config | Image size for cache (reads `model.image_size` if not specified) |
-| `--encrypt` | flag | false | Encrypt cache with AES-256 |
+| `--no-resize` | flag | false | Store images at original size (no letterbox resize) |
+| `--encrypt` | flag | from config | Encrypt cache with AES-256 (reads `cache_encrypt` from config) |
+| `--cache-format` | str | from config | Cache format: `jpeg` (smaller) or `raw` (lossless) |
+| `--jpeg-quality` | int | from config | JPEG quality 1-100 (only for jpeg format, default: 95) |
 | `--workers` | int | auto | Parallel workers for caching |
 | `--split` | str | both | Which split to cache (train/val/both) |
 | `--sync` | flag | false | Enable fsync for crash safety (disable for external volumes) |
+| `--output-dir` | str | data.root | Custom output directory for cache |
+
+> **Note**: `--compress` is deprecated. Use `--cache-format raw` for LZ4 compression or `--cache-format jpeg` for JPEG compression.
 
 ##### Exporting Cache to Archive
 
@@ -2204,7 +2346,7 @@ yolo cache-import \
 Display cache statistics and metadata:
 
 ```shell
-yolo cache-info --cache-dir dataset/.yolo_cache_640x640_f1.0
+yolo cache-info --cache-dir dataset/.yolo_cache_320x320_f1.0
 ```
 
 **Example output:**
@@ -2212,13 +2354,16 @@ yolo cache-info --cache-dir dataset/.yolo_cache_640x640_f1.0
 ```
 Cache Information
 ─────────────────────────────────────
-  Path:        dataset/.yolo_cache_640x640_f1.0
-  Version:     3.2.0
-  Images:      117,266
-  Size:        24.3 GB
+  Path:        dataset/.yolo_cache_320x320_f1.0
+  Version:     4.0.0
+  Format:      yolo
+  Images:      32,513
+  Size:        320x320
+  Cache Format: jpeg (quality: 95)
   Encrypted:   Yes
-  Target Size: 640x640
-  Created:     2024-01-15 10:30:00
+  Labels:      32,513
+  Train:       25,995 images
+  Val:         4,858 images
 ─────────────────────────────────────
 ```
 
@@ -2240,32 +2385,35 @@ yolo fit --config config.yaml \
 - Reducing storage requirements on training machines
 
 **Requirements for cache-only mode:**
-- Cache must be complete (all images cached)
-- **Labels must be transferred separately** (labels are NOT stored in the LMDB cache)
-- Split files (train.txt, val.txt) must be transferred
+- Cache must be created with `yolo cache-create` command
+- Cache is self-contained (images, labels, and split indices included)
 - Error raised if any image is not found in cache
 
-##### What's in the Cache vs What to Transfer
+##### What's in the Cache (v4.0.0+)
 
-The LMDB cache contains **only pre-processed images**, not labels. For remote training, you must transfer:
+The `cache-create` command stores everything needed for training:
 
-| Item | In Cache | Transfer Required |
-|------|----------|-------------------|
-| Pre-processed images | YES | Cache directory |
-| Image paths (for mapping) | YES | (included in cache) |
-| Labels (annotations) | **NO** | `labels/` directory |
-| Split files | **NO** | `train.txt`, `val.txt` |
+| Item | In Cache | Notes |
+|------|----------|-------|
+| Pre-processed images | YES | JPEG or RAW format |
+| Image paths | YES | For logging/debugging |
+| Labels (YOLO format) | YES | Stored in metadata |
+| COCO annotations | YES | For COCO format datasets |
+| Train/Val split indices | YES | From split files |
+| Cache metadata | YES | Version, format, encryption, etc. |
 
 ```
-# Files required on remote server:
+# Files required on remote server (cache-only mode):
 dataset/
-├── .yolo_cache_640x640_f1.0/    # LMDB cache (images only)
-│   └── cache.lmdb/
-├── labels/                       # YOLO format labels (REQUIRED)
-│   └── *.txt
-├── train.txt                     # Split file (REQUIRED)
-└── val.txt                       # Split file (REQUIRED)
+└── .yolo_cache_320x320_f1.0/    # Complete cache (everything included)
+    └── cache.lmdb/
+        ├── data.mdb             # Images + metadata
+        └── lock.mdb             # LMDB lock file
+
+# No separate labels/, train.txt, val.txt needed!
 ```
+
+> **Note**: For backward compatibility, if labels are not in cache, the system falls back to loading from `labels/` directory.
 
 ##### Complete Workflow: Secure Remote Training
 
@@ -2280,45 +2428,43 @@ This workflow demonstrates how to train on a remote VM without ever exposing ori
 export YOLO_ENCRYPTION_KEY=$(python -c "import os; print(os.urandom(32).hex())")
 echo "Save this key: $YOLO_ENCRYPTION_KEY"
 
-# 2. Create encrypted cache
-yolo cache-create --config config.yaml --size 640 --encrypt
-# Creates: dataset/.yolo_cache_640x640_f1.0/ (encrypted LMDB)
+# 2. Create encrypted cache (includes images, labels, split indices)
+cd yolo-mit
+yolo cache-create --config config.yaml
+# Creates: dataset/.yolo_cache_320x320_f1.0/ (encrypted LMDB with everything)
 
 # 3. Export to archive
 yolo cache-export \
-    --cache-dir dataset/.yolo_cache_640x640_f1.0 \
-    --output cache_640_encrypted.tar.gz
+    --cache-dir ../dataset/.yolo_cache_320x320_f1.0 \
+    --output cache_encrypted.tar.gz
 
-# 4. Transfer to remote (cache is encrypted, safe to transfer)
-scp cache_640_encrypted.tar.gz user@remote:/data/
-
-# 5. Transfer labels and split files (NOT in cache, required for training)
-scp -r dataset/labels user@remote:/data/dataset/
-scp dataset/train.txt dataset/val.txt user@remote:/data/dataset/
+# 4. Transfer to remote (cache is encrypted + self-contained)
+scp cache_encrypted.tar.gz user@remote:/data/
 
 # ============================================
-# REMOTE VM (no original images)
+# REMOTE VM (no original images needed!)
 # ============================================
 
-# 6. Import cache
+# 5. Import cache
 yolo cache-import \
-    --archive cache_640_encrypted.tar.gz \
+    --archive cache_encrypted.tar.gz \
     --output /data/dataset/
 
-# 7. Verify all required files are present
+# 6. Verify cache is present
 ls /data/dataset/
-# Should show: .yolo_cache_640x640_f1.0/  labels/  train.txt  val.txt
+# Should show: .yolo_cache_320x320_f1.0/
 
-# 8. Train using only cache (decryption happens only in memory)
+# 7. Train using only cache (decryption happens only in memory)
 export YOLO_ENCRYPTION_KEY="your-64-char-hex-key"
 yolo fit --config config.yaml \
+    --data.root /data/dataset \
     --data.cache_images disk \
     --data.cache_only true
 
-# Original images are NEVER on the remote VM
-# Encrypted data on disk is NEVER decrypted to files
-# Decryption happens ONLY in memory during training
-# Labels are plain text (class_id + bboxes) - no sensitive image data
+# ✓ Original images are NEVER on the remote VM
+# ✓ Encrypted data on disk is NEVER decrypted to files
+# ✓ Decryption happens ONLY in memory during training
+# ✓ Labels are stored in encrypted cache metadata
 ```
 
 ##### Security Model

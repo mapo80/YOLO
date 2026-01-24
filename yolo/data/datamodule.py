@@ -190,9 +190,11 @@ class YOLODataModule(L.LightningDataModule):
         cache_max_memory_gb: Maximum RAM for image caching in GB (default: 8.0)
         cache_workers: Number of parallel workers for caching (default: None = all CPU threads)
         cache_refresh: Force cache regeneration (default: False)
+        cache_format: Cache format - 'jpeg' (~10x smaller, fast TurboJPEG) or 'raw' (lossless with LZ4)
+        jpeg_quality: JPEG quality (1-100) for cache_format='jpeg' (default: 95)
         cache_only: Load images only from cache, without requiring original images on disk.
             Useful for training on remote machines where only the encrypted cache is available.
-            Requires a complete cache created by cache-create command.
+            Requires a complete cache created by `yolo cache-create` command.
         image_size: DO NOT SPECIFY - automatically linked from model.image_size via CLI.
     """
 
@@ -250,6 +252,8 @@ class YOLODataModule(L.LightningDataModule):
         cache_workers: Optional[int] = None,  # None = auto (all CPU threads)
         cache_refresh: bool = False,
         cache_encrypt: bool = False,
+        cache_format: Literal["jpeg", "raw"] = "jpeg",  # 'jpeg' (~10x smaller) or 'raw' (lossless with LZ4)
+        jpeg_quality: int = 95,  # JPEG quality (1-100), only for cache_format='jpeg'
         cache_only: bool = False,
         cache_sync: bool = False,  # Enable LMDB fsync for crash safety (disable for external volumes on macOS)
         # Encryption key for encrypted images (.enc) and/or encrypted cache
@@ -352,6 +356,8 @@ class YOLODataModule(L.LightningDataModule):
                 cache_suffix=cache_suffix,
                 refresh=self.hparams.cache_refresh,
                 sync=self.hparams.cache_sync,
+                cache_format=self.hparams.cache_format,
+                jpeg_quality=self.hparams.jpeg_quality,
             )
 
         # Get data fraction for sampling
@@ -698,6 +704,8 @@ class CocoDetectionWrapper(CocoDetection):
         cache_only: bool = False,
         skip_finalize: bool = False,
         split_type: Optional[str] = None,
+        creating_cache: bool = False,
+        cache_index_offset: int = 0,
     ):
         self._cache_only = cache_only
         self._image_cache = image_cache
@@ -707,6 +715,8 @@ class CocoDetectionWrapper(CocoDetection):
         self.root = root  # Store root for cache-only mode
         self._skip_finalize = skip_finalize
         self._split_type = split_type  # "train" or "val" for cache-only mode
+        self._creating_cache = creating_cache
+        self._cache_index_offset = cache_index_offset
 
         # In cache-only mode, load image paths and annotations from cache metadata
         if cache_only:
@@ -732,9 +742,15 @@ class CocoDetectionWrapper(CocoDetection):
         if data_fraction < 1.0:
             self._apply_stratified_sampling(data_fraction)
 
-        # Pre-cache images if using RAM or disk cache
+        # Handle image cache
         if self._image_cache is not None and self._image_cache.mode in ("ram", "disk"):
-            self._precache_images()
+            if self._creating_cache and not self._skip_finalize:
+                # Creating new cache standalone (NOT called from cache_archive.py)
+                # When skip_finalize=True, cache_archive.py handles caching after collecting all paths
+                self._precache_images()
+            elif not self._creating_cache:
+                # Normal mode: require existing cache (created with `yolo cache-create`)
+                self._open_existing_cache()
 
     def __getstate__(self) -> Dict[str, Any]:
         """Prepare state for pickling (spawn multiprocessing compatibility)."""
@@ -821,6 +837,53 @@ class CocoDetectionWrapper(CocoDetection):
             f"({len(class_to_ids)} classes, {fraction*100:.1f}%)"
         )
 
+    def _open_existing_cache(self) -> None:
+        """
+        Open existing cache in read-only mode.
+
+        Cache must be created externally with `yolo cache-create`.
+        Raises ValueError if cache doesn't exist.
+        """
+        from yolo.utils.progress import spinner, console
+
+        cache_mode = self._image_cache.mode
+
+        # Get all image paths (fast - just string lookups)
+        image_paths = [
+            Path(os.path.join(self.root, self.coco.loadImgs(id)[0]["file_name"]))
+            for id in self.ids
+        ]
+
+        # Initialize/validate cache
+        dataset_root = Path(self.root)
+        with spinner(f"Validating {cache_mode.upper()} cache ({len(image_paths):,} images)..."):
+            cache_exists = self._image_cache.initialize(
+                num_images=len(image_paths),
+                cache_dir=dataset_root,
+                paths=image_paths,
+            )
+
+        if not self._image_cache._enabled:
+            self._image_cache = None
+            return
+
+        cache_location = self._image_cache.cache_path or "alongside images"
+
+        if cache_exists:
+            console.print(f"[green]✓[/green] {cache_mode.upper()} cache found: {len(image_paths):,} images ready ({cache_location})")
+            return
+
+        # Cache doesn't exist or is invalid - raise error with helpful message
+        reason = getattr(self._image_cache, '_invalidation_reason', 'not found')
+        raise ValueError(
+            f"Cache required (cache_images: {cache_mode}) but {reason}.\n\n"
+            f"Create the cache with:\n"
+            f"  yolo cache-create --config your_config.yaml\n\n"
+            f"Or disable caching with:\n"
+            f"  data:\n"
+            f"    cache_images: none"
+        )
+
     def _precache_images(self) -> None:
         """Pre-load all images into cache (RAM or disk, parallelized)."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -834,23 +897,29 @@ class CocoDetectionWrapper(CocoDetection):
             for id in self.ids
         ]
 
-        # Initialize unified LMDB cache with spinner
-        dataset_root = Path(self.root)
-        with spinner(f"Validating {cache_mode.upper()} cache ({len(image_paths):,} images)..."):
-            cache_exists = self._image_cache.initialize(
-                num_images=len(image_paths),
-                cache_dir=dataset_root,
-                paths=image_paths,
-            )
-        cache_location = self._image_cache.cache_path or "alongside images"
+        # Check if cache was already initialized externally (e.g., by cache_archive.py)
+        # In that case, skip initialization and just do the caching
+        if getattr(self._image_cache, '_initialized', False):
+            cache_exists = False  # Force caching since we're called to populate
+            cache_location = self._image_cache.cache_path or "alongside images"
+        else:
+            # Initialize unified LMDB cache with spinner
+            dataset_root = Path(self.root)
+            with spinner(f"Validating {cache_mode.upper()} cache ({len(image_paths):,} images)..."):
+                cache_exists = self._image_cache.initialize(
+                    num_images=len(image_paths),
+                    cache_dir=dataset_root,
+                    paths=image_paths,
+                )
+            cache_location = self._image_cache.cache_path or "alongside images"
 
-        if not self._image_cache._enabled:
-            self._image_cache = None
-            return
+            if not self._image_cache._enabled:
+                self._image_cache = None
+                return
 
-        if cache_exists:
-            console.print(f"[green]✓[/green] {cache_mode.upper()} cache found: {len(image_paths):,} images ready ({cache_location})")
-            return
+            if cache_exists:
+                console.print(f"[green]✓[/green] {cache_mode.upper()} cache found: {len(image_paths):,} images ready ({cache_location})")
+                return
 
         # Show why cache is being rebuilt
         if getattr(self._image_cache, '_refresh_requested', False):
@@ -859,8 +928,9 @@ class CocoDetectionWrapper(CocoDetection):
             reason = self._image_cache._invalidation_reason
             console.print(f"[yellow]⚠[/yellow] Cache invalidated: {reason} - rebuilding")
 
-        # All images need to be cached
-        work_items = [(idx, path) for idx, path in enumerate(image_paths)]
+        # All images need to be cached (with offset for multi-dataset caching)
+        offset = getattr(self, '_cache_index_offset', 0)
+        work_items = [(offset + idx, path) for idx, path in enumerate(image_paths)]
         cache_desc = f"Creating {cache_mode} cache ({len(image_paths)} images)"
 
         # Determine size info for display
@@ -1318,6 +1388,8 @@ class YOLOFormatDataset(Dataset):
         split_file: Optional[str] = None,
         split_type: Optional[Literal["train", "val"]] = None,
         skip_finalize: bool = False,
+        creating_cache: bool = False,
+        cache_index_offset: int = 0,
     ):
         self.images_dir = Path(images_dir)
         self.labels_dir = Path(labels_dir)
@@ -1331,6 +1403,8 @@ class YOLOFormatDataset(Dataset):
         self._split_file = split_file
         self._split_type = split_type
         self._skip_finalize = skip_finalize
+        self._creating_cache = creating_cache
+        self._cache_index_offset = cache_index_offset
 
         # In cache-only mode, load image paths from cache metadata
         if cache_only:
@@ -1362,9 +1436,15 @@ class YOLOFormatDataset(Dataset):
         if data_fraction < 1.0:
             self._apply_stratified_sampling(data_fraction)
 
-        # Pre-cache images if using RAM or disk cache
+        # Handle image cache
         if self._image_cache is not None and self._image_cache.mode in ("ram", "disk"):
-            self._precache_images()
+            if self._creating_cache and not self._skip_finalize:
+                # Creating new cache standalone (NOT called from cache_archive.py)
+                # When skip_finalize=True, cache_archive.py handles caching after collecting all paths
+                self._precache_images()
+            elif not self._creating_cache:
+                # Normal mode: require existing cache (created with `yolo cache-create`)
+                self._open_existing_cache()
 
     def __getstate__(self) -> Dict[str, Any]:
         """Prepare state for pickling (spawn multiprocessing compatibility)."""
@@ -1585,14 +1665,18 @@ class YOLOFormatDataset(Dataset):
             f"({split_name} split from cache metadata)"
         )
 
-    def _precache_images(self) -> None:
-        """Pre-load all images into cache (RAM or disk, parallelized)."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from yolo.utils.progress import progress_bar, spinner, console
+    def _open_existing_cache(self) -> None:
+        """
+        Open existing cache in read-only mode.
+
+        Cache must be created externally with `yolo cache-create`.
+        Raises ValueError if cache doesn't exist.
+        """
+        from yolo.utils.progress import spinner, console
 
         cache_mode = self._image_cache.mode
 
-        # Initialize unified LMDB cache with spinner
+        # Initialize/validate cache
         dataset_root = self.images_dir.parent
         with spinner(f"Validating {cache_mode.upper()} cache ({len(self.image_files):,} images)..."):
             cache_exists = self._image_cache.initialize(
@@ -1600,15 +1684,58 @@ class YOLOFormatDataset(Dataset):
                 cache_dir=dataset_root,
                 paths=self.image_files,
             )
-        cache_location = self._image_cache.cache_path or "alongside images"
 
         if not self._image_cache._enabled:
             self._image_cache = None
             return
 
+        cache_location = self._image_cache.cache_path or "alongside images"
+
         if cache_exists:
             console.print(f"[green]✓[/green] {cache_mode.upper()} cache found: {len(self.image_files):,} images ready ({cache_location})")
             return
+
+        # Cache doesn't exist or is invalid - raise error with helpful message
+        reason = getattr(self._image_cache, '_invalidation_reason', 'not found')
+        raise ValueError(
+            f"Cache required (cache_images: {cache_mode}) but {reason}.\n\n"
+            f"Create the cache with:\n"
+            f"  yolo cache-create --config your_config.yaml\n\n"
+            f"Or disable caching with:\n"
+            f"  data:\n"
+            f"    cache_images: none"
+        )
+
+    def _precache_images(self) -> None:
+        """Pre-load all images into cache (RAM or disk, parallelized)."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from yolo.utils.progress import progress_bar, spinner, console
+
+        cache_mode = self._image_cache.mode
+
+        # Check if cache was already initialized externally (e.g., by cache_archive.py)
+        # In that case, skip initialization and just do the caching
+        if getattr(self._image_cache, '_initialized', False):
+            cache_exists = False  # Force caching since we're called to populate
+            cache_location = self._image_cache.cache_path or "alongside images"
+        else:
+            # Initialize unified LMDB cache with spinner
+            dataset_root = self.images_dir.parent
+            with spinner(f"Validating {cache_mode.upper()} cache ({len(self.image_files):,} images)..."):
+                cache_exists = self._image_cache.initialize(
+                    num_images=len(self.image_files),
+                    cache_dir=dataset_root,
+                    paths=self.image_files,
+                )
+            cache_location = self._image_cache.cache_path or "alongside images"
+
+            if not self._image_cache._enabled:
+                self._image_cache = None
+                return
+
+            if cache_exists:
+                console.print(f"[green]✓[/green] {cache_mode.upper()} cache found: {len(self.image_files):,} images ready ({cache_location})")
+                return
 
         # Show why cache is being rebuilt
         if getattr(self._image_cache, '_refresh_requested', False):
@@ -1617,8 +1744,9 @@ class YOLOFormatDataset(Dataset):
             reason = self._image_cache._invalidation_reason
             console.print(f"[yellow]⚠[/yellow] Cache invalidated: {reason} - rebuilding")
 
-        # All images need to be cached
-        work_items = [(idx, path) for idx, path in enumerate(self.image_files)]
+        # All images need to be cached (with offset for multi-dataset caching)
+        offset = getattr(self, '_cache_index_offset', 0)
+        work_items = [(offset + idx, path) for idx, path in enumerate(self.image_files)]
         cache_desc = f"Creating {cache_mode} cache ({len(self.image_files)} images)"
 
         # Determine size info for display

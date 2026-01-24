@@ -187,7 +187,8 @@ class ImageCache:
     # v3.0.0: Initial LMDB implementation
     # v3.1.0: Fast hash computation (sampled paths instead of all)
     # v3.2.0: Store original image size for correct bbox transformation with resized cache
-    CACHE_VERSION = "3.2.0"
+    # v4.0.0: Unified cache system with cache_format: jpeg|raw
+    CACHE_VERSION = "4.0.0"
 
     # Dtype mapping for efficient serialization
     DTYPE_TO_ID = {
@@ -210,6 +211,9 @@ class ImageCache:
         refresh: bool = False,
         sync: bool = False,
         expected_total_images: Optional[int] = None,
+        cache_format: Literal["jpeg", "raw"] = "jpeg",
+        jpeg_quality: int = 95,
+        compress: bool = False,  # Deprecated: LZ4 is now automatic for raw format
     ):
         """
         Initialize image cache.
@@ -225,6 +229,11 @@ class ImageCache:
             sync: Enable LMDB fsync for crash safety. Default False for external volume compatibility.
             expected_total_images: Expected total number of images for map size estimation.
                 Useful when multiple datasets will share the same cache.
+            cache_format: Cache format - 'jpeg' (compressed, smaller) or 'raw' (lossless).
+                JPEG is ~10x smaller and uses TurboJPEG for fast encoding/decoding.
+                RAW stores uncompressed numpy arrays with automatic LZ4 compression.
+            jpeg_quality: JPEG quality (1-100). Only used when cache_format='jpeg'. Default 95.
+            compress: Deprecated. LZ4 compression is now automatic for 'raw' format only.
         """
         self.mode = mode
         self.cache_dir = Path(cache_dir) if cache_dir else None
@@ -235,6 +244,13 @@ class ImageCache:
         self._sync = sync
         self._enabled = mode != "none"
         self._expected_total_images = expected_total_images
+
+        # Cache format settings
+        self._cache_format = cache_format
+        self._jpeg_quality = jpeg_quality
+
+        # LZ4 compression: automatic for RAW format, disabled for JPEG (already compressed)
+        self._compress = (cache_format == "raw")
 
         # LMDB environment
         self._env = None
@@ -252,6 +268,42 @@ class ImageCache:
             self._crypto = CryptoManager(key_hex=encryption_key)
             self._encrypt_cache = True
             logger.info("Disk cache encryption enabled")
+
+        # Setup TurboJPEG for JPEG format (fast JPEG encoding/decoding)
+        self._turbojpeg = None
+        self._tjpf_rgb = None
+        if cache_format == "jpeg" and mode != "none":
+            try:
+                from turbojpeg import TurboJPEG, TJPF_RGB
+                self._turbojpeg = TurboJPEG()
+                self._tjpf_rgb = TJPF_RGB
+                logger.info(f"Disk cache JPEG format enabled (quality={jpeg_quality})")
+            except ImportError:
+                raise ImportError(
+                    "JPEG cache format requested but PyTurboJPEG not installed. "
+                    "Install with: pip install PyTurboJPEG\n"
+                    "Also requires libjpeg-turbo system library:\n"
+                    "  macOS: brew install libjpeg-turbo\n"
+                    "  Ubuntu: sudo apt-get install libturbojpeg"
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to initialize TurboJPEG: {e}\n"
+                    "Make sure libjpeg-turbo is installed:\n"
+                    "  macOS: brew install libjpeg-turbo\n"
+                    "  Ubuntu: sudo apt-get install libturbojpeg"
+                )
+
+        # Setup LZ4 for RAW format
+        if self._compress and mode != "none":
+            try:
+                import lz4.frame
+                logger.info("Disk cache LZ4 compression enabled (RAW format)")
+            except ImportError:
+                raise ImportError(
+                    "LZ4 compression required for RAW format but lz4 not installed. "
+                    "Install with: pip install lz4"
+                )
 
     def _build_cache_dir(self, base_dir: Path) -> Path:
         """Build cache directory path with optional suffix."""
@@ -400,6 +452,13 @@ class ImageCache:
                     env.close()
                     return False
 
+                # Validate cache format (jpeg vs raw)
+                cached_format = meta.get("cache_format", "raw")  # Default raw for old caches
+                if cached_format != self._cache_format:
+                    self._invalidation_reason = f"format changed ({cached_format} → {self._cache_format})"
+                    env.close()
+                    return False
+
                 # Validate number of images
                 cached_count = meta.get("num_images", 0)
                 if cached_count != len(paths):
@@ -515,6 +574,9 @@ class ImageCache:
             "paths_hash": self._compute_paths_hash(paths),
             "target_size": self.target_size,
             "encrypted": self._encrypt_cache,
+            "cache_format": self._cache_format,  # 'jpeg' or 'raw'
+            "jpeg_quality": self._jpeg_quality if self._cache_format == "jpeg" else None,
+            "compressed": self._compress,  # LZ4 compression (auto for raw)
             "image_paths": paths_list,  # Store paths for cache-only mode
         }
 
@@ -869,6 +931,8 @@ class ImageCache:
         # Don't serialize LMDB env - workers will re-open it
         state["_env"] = None
         state["_crypto"] = None  # Will be re-initialized if needed
+        state["_turbojpeg"] = None  # Will be re-initialized if needed
+        state["_tjpf_rgb"] = None
         # Don't serialize cached_indices - will be reloaded from LMDB in worker
         state["_cached_indices"] = set()
         return state
@@ -900,9 +964,118 @@ class ImageCache:
                     "Cache reads will fail."
                 )
 
+        # Re-initialize TurboJPEG for JPEG format
+        if self._cache_format == "jpeg":
+            try:
+                from turbojpeg import TurboJPEG, TJPF_RGB
+                self._turbojpeg = TurboJPEG()
+                self._tjpf_rgb = TJPF_RGB
+            except Exception as e:
+                logger.warning(f"Failed to initialize TurboJPEG in worker: {e}")
+
     def _serialize(self, arr: np.ndarray, orig_size: Optional[Tuple[int, int]] = None) -> bytes:
         """
-        Serialize numpy array to bytes with compact header.
+        Serialize numpy array to bytes.
+
+        Dispatches to JPEG or RAW serialization based on cache_format setting.
+
+        Args:
+            arr: Image array to serialize (RGB, uint8)
+            orig_size: Original image size (width, height) before resize, or None if not resized
+
+        Returns:
+            Serialized bytes
+        """
+        if self._cache_format == "jpeg":
+            return self._serialize_jpeg(arr, orig_size)
+        else:
+            return self._serialize_raw(arr, orig_size)
+
+    def _deserialize(self, data: bytes) -> Tuple[np.ndarray, Optional[Tuple[int, int]]]:
+        """
+        Deserialize bytes to numpy array and original size.
+
+        Dispatches to JPEG or RAW deserialization based on cache_format setting.
+
+        Returns:
+            Tuple of (image array, original size or None)
+        """
+        if self._cache_format == "jpeg":
+            return self._deserialize_jpeg(data)
+        else:
+            return self._deserialize_raw(data)
+
+    def _serialize_jpeg(self, arr: np.ndarray, orig_size: Optional[Tuple[int, int]] = None) -> bytes:
+        """
+        Serialize image as JPEG bytes using TurboJPEG (5-10x faster than PIL).
+
+        Format:
+        - Header: orig_w (4B) + orig_h (4B) - only if orig_size provided
+        - JPEG data
+
+        Args:
+            arr: Image array (RGB, uint8, shape HxWx3)
+            orig_size: Original image size (width, height) before resize
+
+        Returns:
+            Serialized bytes with optional header + JPEG data
+        """
+        import struct
+
+        # TurboJPEG encode - expects numpy array in RGB format
+        jpeg_bytes = self._turbojpeg.encode(
+            arr,
+            quality=self._jpeg_quality,
+            pixel_format=self._tjpf_rgb
+        )
+
+        # Header: has_orig_size (1B) + orig_w (4B) + orig_h (4B) if present
+        has_orig_size = 1 if orig_size is not None else 0
+        header = struct.pack("<B", has_orig_size)
+        if orig_size is not None:
+            header += struct.pack("<II", orig_size[0], orig_size[1])
+
+        data = header + jpeg_bytes
+
+        # NO LZ4 for JPEG (already compressed, LZ4 would be counterproductive)
+        # Only Encryption
+        if self._encrypt_cache and self._crypto is not None:
+            data = self._crypto.encrypt(data)
+
+        return data
+
+    def _deserialize_jpeg(self, data: bytes) -> Tuple[np.ndarray, Optional[Tuple[int, int]]]:
+        """
+        Deserialize JPEG bytes to numpy array using TurboJPEG.
+
+        Returns:
+            Tuple of (image array RGB, original size or None)
+        """
+        import struct
+
+        # Decryption only (no LZ4 for JPEG)
+        if self._encrypt_cache and self._crypto is not None:
+            data = self._crypto.decrypt(data)
+
+        # Parse header
+        has_orig_size = struct.unpack("<B", data[:1])[0]
+        header_end = 1
+        orig_size = None
+        if has_orig_size:
+            orig_w, orig_h = struct.unpack("<II", data[1:9])
+            orig_size = (orig_w, orig_h)
+            header_end = 9
+
+        jpeg_bytes = data[header_end:]
+
+        # TurboJPEG decode - returns numpy array in RGB format
+        arr = self._turbojpeg.decode(jpeg_bytes, pixel_format=self._tjpf_rgb)
+
+        return arr, orig_size
+
+    def _serialize_raw(self, arr: np.ndarray, orig_size: Optional[Tuple[int, int]] = None) -> bytes:
+        """
+        Serialize numpy array to bytes with compact header (RAW format with LZ4).
 
         Args:
             arr: Image array to serialize
@@ -928,22 +1101,34 @@ class ImageCache:
 
         data = header + arr.tobytes()
 
+        # LZ4 compression (automatic for RAW format, before encryption)
+        if self._compress:
+            import lz4.frame
+            data = lz4.frame.compress(data)
+
+        # Encryption (after compression for better ratio)
         if self._encrypt_cache and self._crypto is not None:
             data = self._crypto.encrypt(data)
 
         return data
 
-    def _deserialize(self, data: bytes) -> Tuple[np.ndarray, Optional[Tuple[int, int]]]:
+    def _deserialize_raw(self, data: bytes) -> Tuple[np.ndarray, Optional[Tuple[int, int]]]:
         """
-        Deserialize bytes to numpy array and original size.
+        Deserialize RAW bytes to numpy array and original size.
 
         Returns:
             Tuple of (image array, original size or None)
         """
         import struct
 
+        # Decryption (first)
         if self._encrypt_cache and self._crypto is not None:
             data = self._crypto.decrypt(data)
+
+        # LZ4 decompression (after decryption, automatic for RAW format)
+        if self._compress:
+            import lz4.frame
+            data = lz4.frame.decompress(data)
 
         # Parse header (little-endian)
         dtype_id, ndim, has_orig_size = struct.unpack("<BBB", data[:3])

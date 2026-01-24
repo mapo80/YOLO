@@ -1257,6 +1257,30 @@ Examples:
         action="store_true",
         help="Enable LMDB fsync for crash safety. Default: disabled for external volume compatibility.",
     )
+    parser.add_argument(
+        "--no-resize",
+        action="store_true",
+        dest="no_resize",
+        help="Store images at original size (no letterbox resize). Cache will be larger but preserves full resolution.",
+    )
+    parser.add_argument(
+        "--cache-format",
+        type=str,
+        default=None,
+        choices=["jpeg", "raw"],
+        help="Cache format: 'jpeg' (10x smaller, fast TurboJPEG) or 'raw' (lossless with LZ4). Default: jpeg",
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=None,
+        help="JPEG quality (1-100). Only used with --cache-format jpeg. Default: 95",
+    )
+    parser.add_argument(
+        "--compress",
+        action="store_true",
+        help="[Deprecated] LZ4 compression is now automatic for 'raw' format. Use --cache-format raw instead.",
+    )
 
     try:
         args = parser.parse_args(sys.argv[2:] if argv is None else argv)
@@ -1275,6 +1299,7 @@ Examples:
     data_fraction = args.data_fraction
     train_split = None
     val_split = None
+    cache_resize_images = True  # Default: resize images
 
     # Default image size
     image_size = args.size
@@ -1296,6 +1321,28 @@ Examples:
             train_split = getattr(data_cfg, "train_split", None)
             val_split = getattr(data_cfg, "val_split", None)
 
+        # Check cache_resize_images from config (default: True)
+        cache_resize_images = True
+        if hasattr(config, "data") and hasattr(config.data, "cache_resize_images"):
+            cache_resize_images = config.data.cache_resize_images
+
+        # Check cache_format from config (default: jpeg)
+        if args.cache_format is None and hasattr(config, "data") and hasattr(config.data, "cache_format"):
+            args.cache_format = config.data.cache_format
+
+        # Check jpeg_quality from config (default: 95)
+        if args.jpeg_quality is None and hasattr(config, "data") and hasattr(config.data, "jpeg_quality"):
+            args.jpeg_quality = config.data.jpeg_quality
+
+        # Check cache_encrypt from config (default: False)
+        if not args.encrypt and hasattr(config, "data") and hasattr(config.data, "cache_encrypt"):
+            args.encrypt = config.data.cache_encrypt
+
+        # Deprecated: Check cache_compress from config - now automatic for raw format
+        if args.compress and hasattr(config, "data") and hasattr(config.data, "cache_compress"):
+            # Migrate old config: cache_compress: true -> cache_format: raw
+            print("Warning: cache_compress is deprecated. Use cache_format: raw instead.", file=sys.stderr)
+
         # Read image_size from config if --size not provided
         if image_size is None:
             # Try model.image_size first (common in training configs)
@@ -1315,11 +1362,17 @@ Examples:
                 except (TypeError, IndexError):
                     image_size = int(cfg_size)
 
-    # Validate required parameters
-    if image_size is None:
+    # Handle --no-resize flag or cache_resize_images: false from config
+    # Priority: --no-resize flag > cache_resize_images from config > default (resize)
+    if args.no_resize:
+        image_size = None  # None means no resize - store at original size
+    elif args.config and not cache_resize_images:
+        # cache_resize_images: false in config
+        image_size = None
+    elif image_size is None:
         print(
             "Error: Image size not specified.\n"
-            "Provide --size or set model.image_size in your config YAML.",
+            "Provide --size, set model.image_size in your config YAML, or use --no-resize.",
             file=sys.stderr
         )
         return 1
@@ -1330,11 +1383,20 @@ Examples:
     # Import and create cache
     from yolo.tools.cache_archive import create_cache
 
+    # Determine cache format (default: jpeg)
+    cache_format = args.cache_format or "jpeg"
+    jpeg_quality = args.jpeg_quality or 95
+
+    # Deprecated: if --compress is used without --cache-format, switch to raw
+    if args.compress and args.cache_format is None:
+        cache_format = "raw"
+        print("Note: --compress is deprecated. Using --cache-format raw instead.", file=sys.stderr)
+
     try:
         cache_path = create_cache(
             data_root=Path(data_root),
             data_format=data_format,
-            image_size=(image_size, image_size),
+            image_size=(image_size, image_size) if image_size else None,
             train_images=train_images,
             val_images=val_images,
             train_labels=train_labels,
@@ -1344,6 +1406,8 @@ Examples:
             train_split=train_split,
             val_split=val_split,
             encrypt=args.encrypt,
+            cache_format=cache_format,
+            jpeg_quality=jpeg_quality,
             workers=args.workers,
             split=args.split,
             data_fraction=data_fraction,

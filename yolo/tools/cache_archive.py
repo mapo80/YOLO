@@ -53,6 +53,9 @@ def create_cache(
     data_fraction: float = 1.0,
     output_dir: Optional[Path] = None,
     sync: bool = False,
+    cache_format: Literal["jpeg", "raw"] = "jpeg",
+    jpeg_quality: int = 95,
+    compress: bool = False,  # Deprecated: LZ4 is now automatic for raw format
 ) -> Path:
     """
     Create LMDB cache from dataset without running training.
@@ -77,6 +80,11 @@ def create_cache(
         output_dir: Directory where cache will be created (default: data_root).
             Useful when data_root is on a slow/external volume.
         sync: Enable LMDB fsync for crash safety (default: False for compatibility).
+        cache_format: Cache format - 'jpeg' (compressed, ~10x smaller) or 'raw' (lossless).
+            JPEG uses TurboJPEG for fast encoding/decoding.
+            RAW stores uncompressed numpy arrays with automatic LZ4 compression.
+        jpeg_quality: JPEG quality (1-100). Only used when cache_format='jpeg'. Default 95.
+        compress: Deprecated. LZ4 compression is now automatic for 'raw' format only.
 
     Returns:
         Path to the created cache directory.
@@ -102,8 +110,11 @@ def create_cache(
                 "Generate a key with: python -c \"import os; print(os.urandom(32).hex())\""
             )
 
-    # Build cache suffix
-    size_str = f"{image_size[0]}x{image_size[1]}"
+    # Build cache suffix (must match datamodule.py naming)
+    if image_size is not None:
+        size_str = f"{image_size[0]}x{image_size[1]}"
+    else:
+        size_str = "orig"  # Must match datamodule.py
     cache_suffix = f"{size_str}_f{data_fraction}"
 
     # Use output_dir if specified, otherwise use data_root
@@ -138,10 +149,20 @@ def create_cache(
         refresh=True,  # Always create fresh cache
         sync=sync,
         expected_total_images=expected_total_images,
+        cache_format=cache_format,
+        jpeg_quality=jpeg_quality,
     )
 
     logger.info(f"Creating cache for {data_format} dataset at {data_root}")
-    logger.info(f"  Image size: {image_size[0]}x{image_size[1]}")
+    if image_size is not None:
+        logger.info(f"  Image size: {image_size[0]}x{image_size[1]}")
+    else:
+        logger.info(f"  Image size: original (no resize)")
+    logger.info(f"  Cache format: {cache_format}")
+    if cache_format == "jpeg":
+        logger.info(f"  JPEG quality: {jpeg_quality}")
+    else:
+        logger.info(f"  LZ4 compression: enabled (automatic for raw)")
     logger.info(f"  Encryption: {'enabled' if encrypt else 'disabled'}")
     logger.info(f"  Split: {split}")
 
@@ -179,7 +200,9 @@ def create_cache(
                 image_cache=image_cache,
                 data_fraction=data_fraction,
                 cache_workers=workers,
-                skip_finalize=True,  # Don't finalize yet, we'll do it after all splits
+                skip_finalize=True,
+                creating_cache=True,
+                cache_index_offset=0,
             )
             datasets_to_cache.append(("all", dataset))
 
@@ -245,7 +268,9 @@ def create_cache(
                     image_cache=image_cache,
                     data_fraction=data_fraction,
                     cache_workers=workers,
-                    skip_finalize=True,  # Don't finalize yet, we'll do it after all splits
+                    skip_finalize=True,
+                    creating_cache=True,
+                    cache_index_offset=current_index,
                 )
                 datasets_to_cache.append(("train", dataset))
 
@@ -276,7 +301,9 @@ def create_cache(
                     image_cache=image_cache,
                     data_fraction=data_fraction,
                     cache_workers=workers,
-                    skip_finalize=True,  # Don't finalize yet, we'll do it after all splits
+                    skip_finalize=True,
+                    creating_cache=True,
+                    cache_index_offset=current_index,
                 )
                 datasets_to_cache.append(("val", dataset))
 
@@ -299,6 +326,7 @@ def create_cache(
             if not ann_file.exists():
                 raise FileNotFoundError(f"Training annotations not found: {ann_file}")
 
+            train_offset = current_index
             dataset = CocoDetectionWrapper(
                 root=str(images_dir),
                 annFile=str(ann_file),
@@ -308,9 +336,12 @@ def create_cache(
                 image_cache=image_cache,
                 data_fraction=data_fraction,
                 cache_workers=workers,
-                skip_finalize=True,  # Don't finalize yet, we'll do it after all splits
+                skip_finalize=True,
+                creating_cache=True,
+                cache_index_offset=train_offset,
             )
             datasets_to_cache.append(("train", dataset))
+            current_index += len(dataset)
 
             # Collect COCO annotations for cache-only mode
             coco_annotations_to_save["train"] = _extract_coco_annotations(dataset)
@@ -323,6 +354,7 @@ def create_cache(
             if not ann_file.exists():
                 raise FileNotFoundError(f"Validation annotations not found: {ann_file}")
 
+            val_offset = current_index
             dataset = CocoDetectionWrapper(
                 root=str(images_dir),
                 annFile=str(ann_file),
@@ -332,9 +364,12 @@ def create_cache(
                 image_cache=image_cache,
                 data_fraction=data_fraction,
                 cache_workers=workers,
-                skip_finalize=True,  # Don't finalize yet, we'll do it after all splits
+                skip_finalize=True,
+                creating_cache=True,
+                cache_index_offset=val_offset,
             )
             datasets_to_cache.append(("val", dataset))
+            current_index += len(dataset)
 
             # Collect COCO annotations for cache-only mode
             coco_annotations_to_save["val"] = _extract_coco_annotations(dataset)
@@ -344,28 +379,6 @@ def create_cache(
             f"No datasets to cache. Check that paths are provided for split='{split}' "
             f"and format='{data_format}'."
         )
-
-    # Iterate through datasets to populate cache (parallel read, sequential write)
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from PIL import Image
-    import numpy as np
-
-    # Use workers from config (cache_workers), fallback to CPU count or 10
-    num_workers = workers or min(10, (os.cpu_count() or 4))
-
-    def load_single_image(args):
-        """Load and resize a single image (I/O bound - parallelizable)."""
-        idx, img_path, target_size = args
-        try:
-            img = Image.open(img_path).convert("RGB")
-            orig_size = img.size if target_size is not None else None
-            if target_size is not None:
-                # Resize with letterboxing (maintain aspect ratio)
-                img = _resize_for_cache(img, target_size)
-            img_np = np.asarray(img).copy()
-            return idx, img_np, orig_size, None
-        except Exception as e:
-            return idx, None, None, str(e)
 
     # Collect all image paths from all datasets for proper LMDB initialization
     all_image_paths = []
@@ -389,7 +402,7 @@ def create_cache(
         dataset_info.append((split_name, dataset, start_idx, len(image_paths), image_paths))
         all_image_paths.extend(image_paths)
 
-    # Initialize LMDB cache with ALL image paths
+    # Initialize LMDB cache ONCE with ALL image paths
     logger.info(f"Initializing cache for {len(all_image_paths):,} total images...")
     image_cache.initialize(
         num_images=len(all_image_paths),
@@ -397,46 +410,13 @@ def create_cache(
         paths=all_image_paths,
     )
 
+    # Use _precache_images() from datasets (unified caching logic)
+    # The datasets were created with skip_finalize=True, so they didn't cache in __init__
+    # Now we call their _precache_images() method which uses the already-initialized cache
     total_images = 0
     for split_name, dataset, start_idx, num_images, image_paths in dataset_info:
-        logger.info(f"Caching {split_name} split ({num_images:,} images) with {num_workers} workers...")
-
-        # Prepare work items: (global_idx, path, target_size)
-        # global_idx = start_idx + local_idx
-        work_items = [(start_idx + idx, path, image_size) for idx, path in enumerate(image_paths)]
-
-        cached_count = 0
-        failed_count = 0
-
-        # Parallel loading, sequential writing to LMDB
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = {
-                executor.submit(load_single_image, item): item[0]
-                for item in work_items
-            }
-
-            for future in as_completed(futures):
-                idx, img_np, orig_size, error = future.result()
-                if error is None and img_np is not None:
-                    # Write to cache (sequential - LMDB handles locking)
-                    image_cache.put(idx, img_np, orig_size=orig_size)
-                    cached_count += 1
-                else:
-                    failed_count += 1
-                    if failed_count <= 3:
-                        logger.warning(f"Failed to cache image {idx}: {error}")
-
-                # Progress logging every 1000 images
-                total_processed = cached_count + failed_count
-                if total_processed % 1000 == 0:
-                    logger.info(f"  Cached {total_processed:,}/{num_images:,} images...")
-
-        # Final log for this split
-        logger.info(f"  Cached {cached_count:,}/{num_images:,} images (done)")
-
-        if failed_count > 0:
-            logger.warning(f"  Failed to cache {failed_count} images in {split_name} split")
-
+        logger.info(f"Caching {split_name} split ({num_images:,} images)...")
+        dataset._precache_images()
         total_images += num_images
 
     # Save dataset format to cache metadata (for format verification)
@@ -876,6 +856,8 @@ def get_cache_info(cache_dir: Path) -> Dict[str, Any]:
         "num_images": metadata.get("num_images", num_images),
         "target_size": metadata.get("target_size"),
         "encrypted": metadata.get("encrypted", False),
+        "cache_format": metadata.get("cache_format", "raw"),  # Default raw for old caches
+        "jpeg_quality": metadata.get("jpeg_quality"),
         "size_bytes": total_size,
         "size_human": _format_size(total_size),
         "cache_suffix": metadata.get("cache_suffix"),
