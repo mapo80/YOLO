@@ -45,6 +45,8 @@ def create_cache(
     val_labels: Optional[str] = None,
     train_ann: Optional[str] = None,
     val_ann: Optional[str] = None,
+    train_split: Optional[str] = None,
+    val_split: Optional[str] = None,
     encrypt: bool = False,
     workers: Optional[int] = None,
     split: Literal["train", "val", "both"] = "both",
@@ -109,6 +111,22 @@ def create_cache(
     if output_dir:
         cache_base_dir.mkdir(parents=True, exist_ok=True)
 
+    # Pre-count images for COCO format to allocate correct map size
+    expected_total_images = None
+    if data_format == "coco":
+        total_coco_images = 0
+        if split in ("train", "both") and train_ann:
+            ann_file = data_root / train_ann
+            if ann_file.exists():
+                total_coco_images += _count_coco_images(ann_file)
+        if split in ("val", "both") and val_ann:
+            ann_file = data_root / val_ann
+            if ann_file.exists():
+                total_coco_images += _count_coco_images(ann_file)
+        if total_coco_images > 0:
+            expected_total_images = total_coco_images
+            logger.info(f"Pre-counted COCO images: {expected_total_images:,}")
+
     # Create image cache
     image_cache = ImageCache(
         mode="disk",
@@ -119,6 +137,7 @@ def create_cache(
         cache_suffix=cache_suffix,
         refresh=True,  # Always create fresh cache
         sync=sync,
+        expected_total_images=expected_total_images,
     )
 
     logger.info(f"Creating cache for {data_format} dataset at {data_root}")
@@ -128,15 +147,26 @@ def create_cache(
 
     datasets_to_cache = []
 
+    # Variables for YOLO cache-only mode (labels + split indices)
+    yolo_labels_to_save = {}
+    yolo_split_indices = {"train": [], "val": []}
+    current_index = 0
+
     # Setup datasets based on format and split
     if data_format == "yolo":
-        if split in ("train", "both") and train_images and train_labels:
+        # Check if train and val use the same directories (common YOLO setup with split files)
+        same_dirs = (train_images == val_images and train_labels == val_labels)
+
+        if same_dirs and split == "both" and train_images and train_labels:
+            # Single directory with split files - create ONE dataset with all images
             images_dir = data_root / train_images
             labels_dir = data_root / train_labels
             if not images_dir.exists():
-                raise FileNotFoundError(f"Training images directory not found: {images_dir}")
+                raise FileNotFoundError(f"Images directory not found: {images_dir}")
             if not labels_dir.exists():
-                raise FileNotFoundError(f"Training labels directory not found: {labels_dir}")
+                raise FileNotFoundError(f"Labels directory not found: {labels_dir}")
+
+            logger.info(f"Detected shared train/val directories - caching all images once")
 
             dataset = YOLOFormatDataset(
                 images_dir=str(images_dir),
@@ -149,30 +179,114 @@ def create_cache(
                 image_cache=image_cache,
                 data_fraction=data_fraction,
                 cache_workers=workers,
+                skip_finalize=True,  # Don't finalize yet, we'll do it after all splits
             )
-            datasets_to_cache.append(("train", dataset))
+            datasets_to_cache.append(("all", dataset))
 
-        if split in ("val", "both") and val_images and val_labels:
-            images_dir = data_root / val_images
-            labels_dir = data_root / val_labels
-            if not images_dir.exists():
-                raise FileNotFoundError(f"Validation images directory not found: {images_dir}")
-            if not labels_dir.exists():
-                raise FileNotFoundError(f"Validation labels directory not found: {labels_dir}")
+            # Collect YOLO labels for cache-only mode (all images)
+            yolo_labels_to_save["all"] = _extract_yolo_labels(dataset)
 
-            dataset = YOLOFormatDataset(
-                images_dir=str(images_dir),
-                labels_dir=str(labels_dir),
-                transforms=None,
-                image_size=image_size,
-                image_loader=None,
-                cache_labels=True,
-                cache_refresh=True,
-                image_cache=image_cache,
-                data_fraction=data_fraction,
-                cache_workers=workers,
-            )
-            datasets_to_cache.append(("val", dataset))
+            # Build filename to index mapping for split file processing
+            all_count = len(dataset)
+            image_files = dataset.image_files
+            filename_to_idx = {f.name: idx for idx, f in enumerate(image_files)}
+
+            # Read split files to determine train/val indices
+            if train_split and val_split:
+                train_split_path = data_root / train_split
+                val_split_path = data_root / val_split
+
+                if not train_split_path.exists():
+                    raise FileNotFoundError(f"Train split file not found: {train_split_path}")
+                if not val_split_path.exists():
+                    raise FileNotFoundError(f"Val split file not found: {val_split_path}")
+
+                # Read train split
+                with open(train_split_path, "r") as f:
+                    train_files = {Path(line.strip()).name for line in f if line.strip()}
+                yolo_split_indices["train"] = [
+                    idx for idx, img_file in enumerate(image_files)
+                    if img_file.name in train_files
+                ]
+
+                # Read val split
+                with open(val_split_path, "r") as f:
+                    val_files = {Path(line.strip()).name for line in f if line.strip()}
+                yolo_split_indices["val"] = [
+                    idx for idx, img_file in enumerate(image_files)
+                    if img_file.name in val_files
+                ]
+
+                logger.info(f"Split indices from files: train={len(yolo_split_indices['train'])}, val={len(yolo_split_indices['val'])}")
+            else:
+                # No split files provided - all indices available for both
+                logger.warning("No split files provided - all images will be available for both train and val")
+                yolo_split_indices["train"] = list(range(all_count))
+                yolo_split_indices["val"] = list(range(all_count))
+
+        else:
+            # Separate directories for train/val - original logic
+            if split in ("train", "both") and train_images and train_labels:
+                images_dir = data_root / train_images
+                labels_dir = data_root / train_labels
+                if not images_dir.exists():
+                    raise FileNotFoundError(f"Training images directory not found: {images_dir}")
+                if not labels_dir.exists():
+                    raise FileNotFoundError(f"Training labels directory not found: {labels_dir}")
+
+                dataset = YOLOFormatDataset(
+                    images_dir=str(images_dir),
+                    labels_dir=str(labels_dir),
+                    transforms=None,
+                    image_size=image_size,
+                    image_loader=None,
+                    cache_labels=True,
+                    cache_refresh=True,
+                    image_cache=image_cache,
+                    data_fraction=data_fraction,
+                    cache_workers=workers,
+                    skip_finalize=True,  # Don't finalize yet, we'll do it after all splits
+                )
+                datasets_to_cache.append(("train", dataset))
+
+                # Collect YOLO labels for cache-only mode
+                yolo_labels_to_save["train"] = _extract_yolo_labels(dataset)
+
+                # Track split indices
+                train_count = len(dataset)
+                yolo_split_indices["train"] = list(range(current_index, current_index + train_count))
+                current_index += train_count
+
+            if split in ("val", "both") and val_images and val_labels:
+                images_dir = data_root / val_images
+                labels_dir = data_root / val_labels
+                if not images_dir.exists():
+                    raise FileNotFoundError(f"Validation images directory not found: {images_dir}")
+                if not labels_dir.exists():
+                    raise FileNotFoundError(f"Validation labels directory not found: {labels_dir}")
+
+                dataset = YOLOFormatDataset(
+                    images_dir=str(images_dir),
+                    labels_dir=str(labels_dir),
+                    transforms=None,
+                    image_size=image_size,
+                    image_loader=None,
+                    cache_labels=True,
+                    cache_refresh=False,  # Don't refresh - reuse cache from train
+                    image_cache=image_cache,
+                    data_fraction=data_fraction,
+                    cache_workers=workers,
+                    skip_finalize=True,  # Don't finalize yet, we'll do it after all splits
+                )
+                datasets_to_cache.append(("val", dataset))
+
+                # Collect YOLO labels for cache-only mode
+                yolo_labels_to_save["val"] = _extract_yolo_labels(dataset)
+
+                # Track split indices
+                val_count = len(dataset)
+                yolo_split_indices["val"] = list(range(current_index, current_index + val_count))
+                current_index += val_count
 
     else:  # COCO format
         coco_annotations_to_save = {}
@@ -194,6 +308,7 @@ def create_cache(
                 image_cache=image_cache,
                 data_fraction=data_fraction,
                 cache_workers=workers,
+                skip_finalize=True,  # Don't finalize yet, we'll do it after all splits
             )
             datasets_to_cache.append(("train", dataset))
 
@@ -217,6 +332,7 @@ def create_cache(
                 image_cache=image_cache,
                 data_fraction=data_fraction,
                 cache_workers=workers,
+                skip_finalize=True,  # Don't finalize yet, we'll do it after all splits
             )
             datasets_to_cache.append(("val", dataset))
 
@@ -229,37 +345,156 @@ def create_cache(
             f"and format='{data_format}'."
         )
 
-    # Iterate through datasets to populate cache
-    total_images = 0
+    # Iterate through datasets to populate cache (parallel read, sequential write)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from PIL import Image
+    import numpy as np
+
+    # Use workers from config (cache_workers), fallback to CPU count or 10
+    num_workers = workers or min(10, (os.cpu_count() or 4))
+
+    def load_single_image(args):
+        """Load and resize a single image (I/O bound - parallelizable)."""
+        idx, img_path, target_size = args
+        try:
+            img = Image.open(img_path).convert("RGB")
+            orig_size = img.size if target_size is not None else None
+            if target_size is not None:
+                # Resize with letterboxing (maintain aspect ratio)
+                img = _resize_for_cache(img, target_size)
+            img_np = np.asarray(img).copy()
+            return idx, img_np, orig_size, None
+        except Exception as e:
+            return idx, None, None, str(e)
+
+    # Collect all image paths from all datasets for proper LMDB initialization
+    all_image_paths = []
+    dataset_info = []  # (split_name, dataset, start_idx, num_images, image_paths)
+
     for split_name, dataset in datasets_to_cache:
-        logger.info(f"Caching {split_name} split ({len(dataset)} images)...")
-        for i in range(len(dataset)):
-            # Access each item to trigger caching
-            try:
-                _ = dataset[i]
-            except Exception as e:
-                logger.warning(f"Failed to cache image {i}: {e}")
-            if (i + 1) % 1000 == 0:
-                logger.info(f"  Cached {i + 1}/{len(dataset)} images...")
-        total_images += len(dataset)
+        # Get image paths from dataset
+        if hasattr(dataset, 'image_files'):
+            # YOLO format
+            image_paths = list(dataset.image_files)
+        elif hasattr(dataset, 'coco') and hasattr(dataset, 'ids'):
+            # COCO format
+            image_paths = [
+                Path(dataset.root) / dataset.coco.loadImgs(img_id)[0]["file_name"]
+                for img_id in dataset.ids
+            ]
+        else:
+            raise ValueError(f"Unknown dataset type: {type(dataset)}")
+
+        start_idx = len(all_image_paths)
+        dataset_info.append((split_name, dataset, start_idx, len(image_paths), image_paths))
+        all_image_paths.extend(image_paths)
+
+    # Initialize LMDB cache with ALL image paths
+    logger.info(f"Initializing cache for {len(all_image_paths):,} total images...")
+    image_cache.initialize(
+        num_images=len(all_image_paths),
+        cache_dir=cache_base_dir,
+        paths=all_image_paths,
+    )
+
+    total_images = 0
+    for split_name, dataset, start_idx, num_images, image_paths in dataset_info:
+        logger.info(f"Caching {split_name} split ({num_images:,} images) with {num_workers} workers...")
+
+        # Prepare work items: (global_idx, path, target_size)
+        # global_idx = start_idx + local_idx
+        work_items = [(start_idx + idx, path, image_size) for idx, path in enumerate(image_paths)]
+
+        cached_count = 0
+        failed_count = 0
+
+        # Parallel loading, sequential writing to LMDB
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(load_single_image, item): item[0]
+                for item in work_items
+            }
+
+            for future in as_completed(futures):
+                idx, img_np, orig_size, error = future.result()
+                if error is None and img_np is not None:
+                    # Write to cache (sequential - LMDB handles locking)
+                    image_cache.put(idx, img_np, orig_size=orig_size)
+                    cached_count += 1
+                else:
+                    failed_count += 1
+                    if failed_count <= 3:
+                        logger.warning(f"Failed to cache image {idx}: {error}")
+
+                # Progress logging every 1000 images
+                total_processed = cached_count + failed_count
+                if total_processed % 1000 == 0:
+                    logger.info(f"  Cached {total_processed:,}/{num_images:,} images...")
+
+        # Final log for this split
+        logger.info(f"  Cached {cached_count:,}/{num_images:,} images (done)")
+
+        if failed_count > 0:
+            logger.warning(f"  Failed to cache {failed_count} images in {split_name} split")
+
+        total_images += num_images
 
     # Save dataset format to cache metadata (for format verification)
     logger.info(f"Saving dataset format '{data_format}' to cache metadata...")
     image_cache.save_format(data_format)
 
-    # Save COCO annotations to cache (for cache-only mode)
+    # Save COCO annotations and split indices to cache (for cache-only mode)
     if data_format == "coco" and coco_annotations_to_save:
         logger.info("Saving COCO annotations to cache metadata...")
-        # Merge annotations from all splits
+        # Merge annotations from all splits with global indices
         merged_annotations = {
             "annotations": {},
             "categories": [],
         }
-        for split_name, annots in coco_annotations_to_save.items():
-            merged_annotations["annotations"].update(annots["annotations"])
-            if not merged_annotations["categories"]:
-                merged_annotations["categories"] = annots["categories"]
+        coco_split_indices = {"train": [], "val": []}
+
+        for split_name, dataset, start_idx, num_images, image_paths in dataset_info:
+            if split_name in coco_annotations_to_save:
+                annots = coco_annotations_to_save[split_name]
+                # Re-index annotations with global indices
+                for local_idx_str, ann_list in annots["annotations"].items():
+                    global_idx = start_idx + int(local_idx_str)
+                    merged_annotations["annotations"][str(global_idx)] = ann_list
+                if not merged_annotations["categories"]:
+                    merged_annotations["categories"] = annots["categories"]
+
+                # Track split indices
+                coco_split_indices[split_name] = list(range(start_idx, start_idx + num_images))
+
         image_cache.save_coco_annotations(merged_annotations)
+
+        # Save split indices for COCO
+        logger.info("Saving COCO split indices to cache metadata...")
+        image_cache.save_split_indices(
+            train_indices=coco_split_indices.get("train", []),
+            val_indices=coco_split_indices.get("val", []),
+        )
+
+    # Save YOLO labels and split indices to cache (for cache-only mode)
+    if data_format == "yolo" and yolo_labels_to_save:
+        logger.info("Saving YOLO labels to cache metadata...")
+        # Merge labels from all splits (maintaining order: train first, then val, or all)
+        merged_labels = []
+        if "all" in yolo_labels_to_save:
+            # Shared directory case - all labels together
+            merged_labels = yolo_labels_to_save["all"]
+        else:
+            for split_name in ["train", "val"]:
+                if split_name in yolo_labels_to_save:
+                    merged_labels.extend(yolo_labels_to_save[split_name])
+        image_cache.save_labels(merged_labels)
+
+        # Save split indices
+        logger.info("Saving split indices to cache metadata...")
+        image_cache.save_split_indices(
+            train_indices=yolo_split_indices.get("train", []),
+            val_indices=yolo_split_indices.get("val", []),
+        )
 
     # Finalize cache
     if image_cache._env is not None:
@@ -268,6 +503,33 @@ def create_cache(
     cache_path = image_cache.cache_path
     logger.info(f"Cache created successfully: {cache_path}")
     logger.info(f"  Total images cached: {total_images}")
+
+    # Run sanity check
+    logger.info("Running cache sanity check...")
+    check_result = image_cache.sanity_check()
+
+    if check_result["valid"]:
+        logger.info("✓ Cache sanity check passed")
+        stats = check_result["stats"]
+        logger.info(f"  Format: {stats.get('format', 'unknown')}")
+        logger.info(f"  Images: {stats.get('num_images_cached', 0)}")
+        logger.info(f"  Size: {stats.get('target_size', 'original')}")
+        logger.info(f"  Encrypted: {stats.get('encrypted', False)}")
+        if stats.get('num_labels'):
+            logger.info(f"  Labels: {stats.get('num_labels', 0)}")
+        if stats.get('num_train_indices'):
+            logger.info(f"  Train indices: {stats.get('num_train_indices', 0)}")
+            logger.info(f"  Val indices: {stats.get('num_val_indices', 0)}")
+    else:
+        for error in check_result["errors"]:
+            logger.error(f"✗ {error}")
+        raise ValueError(
+            f"Cache sanity check failed with {len(check_result['errors'])} error(s). "
+            "Delete the cache and try again."
+        )
+
+    for warning in check_result.get("warnings", []):
+        logger.warning(f"⚠ {warning}")
 
     return cache_path
 
@@ -295,6 +557,84 @@ def _extract_coco_annotations(dataset) -> Dict[str, Any]:
         "annotations": annotations,
         "categories": categories,
     }
+
+
+def _count_coco_images(ann_file: Path) -> int:
+    """
+    Count number of images in a COCO annotation file.
+
+    Args:
+        ann_file: Path to COCO annotation JSON file.
+
+    Returns:
+        Number of images in the annotation file.
+    """
+    import json
+
+    with open(ann_file, "r") as f:
+        data = json.load(f)
+    return len(data.get("images", []))
+
+
+def _resize_for_cache(img, target_size: Tuple[int, int]):
+    """
+    Resize image with letterboxing (maintain aspect ratio, pad with gray).
+
+    Args:
+        img: PIL Image to resize.
+        target_size: Target size (width, height).
+
+    Returns:
+        Resized PIL Image.
+    """
+    from PIL import Image
+
+    target_w, target_h = target_size
+    orig_w, orig_h = img.size
+
+    # Calculate scale to fit within target while maintaining aspect ratio
+    scale = min(target_w / orig_w, target_h / orig_h)
+    new_w = int(orig_w * scale)
+    new_h = int(orig_h * scale)
+
+    # Resize image
+    img_resized = img.resize((new_w, new_h), Image.BILINEAR)
+
+    # Create gray background and paste resized image centered
+    new_img = Image.new("RGB", (target_w, target_h), (114, 114, 114))
+    paste_x = (target_w - new_w) // 2
+    paste_y = (target_h - new_h) // 2
+    new_img.paste(img_resized, (paste_x, paste_y))
+
+    return new_img
+
+
+def _extract_yolo_labels(dataset) -> List[Dict[str, Any]]:
+    """
+    Extract YOLO labels from a YOLOFormatDataset.
+
+    This function extracts all labels from a YOLO dataset for storage
+    in cache metadata, enabling cache-only mode without label files.
+
+    Args:
+        dataset: YOLOFormatDataset instance with cached labels.
+
+    Returns:
+        List of label dictionaries, each containing:
+        - 'labels': numpy array of class indices
+        - 'boxes_norm': numpy array of normalized bbox coordinates [x_center, y_center, w, h]
+    """
+    # Use the dataset's internal label cache if available
+    if hasattr(dataset, "_labels_cache") and dataset._labels_cache is not None:
+        return dataset._labels_cache
+
+    # Fallback: parse labels from files
+    labels = []
+    for i in range(len(dataset)):
+        label_data = dataset._parse_label_file(dataset.image_files[i])
+        labels.append(label_data)
+
+    return labels
 
 
 def export_cache(
@@ -596,4 +936,5 @@ __all__ = [
     "import_cache",
     "get_cache_info",
     "print_cache_info",
+    "_extract_yolo_labels",
 ]

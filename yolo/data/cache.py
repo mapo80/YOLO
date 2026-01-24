@@ -209,6 +209,7 @@ class ImageCache:
         cache_suffix: Optional[str] = None,
         refresh: bool = False,
         sync: bool = False,
+        expected_total_images: Optional[int] = None,
     ):
         """
         Initialize image cache.
@@ -222,6 +223,8 @@ class ImageCache:
             cache_suffix: Optional suffix for cache folder (e.g., "640x640_f0.1").
             refresh: Force cache regeneration (delete existing cache).
             sync: Enable LMDB fsync for crash safety. Default False for external volume compatibility.
+            expected_total_images: Expected total number of images for map size estimation.
+                Useful when multiple datasets will share the same cache.
         """
         self.mode = mode
         self.cache_dir = Path(cache_dir) if cache_dir else None
@@ -231,6 +234,7 @@ class ImageCache:
         self._refresh = refresh
         self._sync = sync
         self._enabled = mode != "none"
+        self._expected_total_images = expected_total_images
 
         # LMDB environment
         self._env = None
@@ -330,6 +334,9 @@ class ImageCache:
 
     def _estimate_map_size(self, num_images: int, paths: List[Path]) -> int:
         """Estimate LMDB map size based on image count and sizes."""
+        # Use expected_total_images if provided (for multi-dataset caches)
+        effective_num_images = self._expected_total_images or num_images
+
         if self.target_size is not None:
             w, h = self.target_size
             bytes_per_image = w * h * 3 + 32  # RGB + header overhead
@@ -338,7 +345,7 @@ class ImageCache:
             bytes_per_image = 640 * 640 * 3 + 32  # Default estimate
 
         # Add 50% margin for LMDB overhead and growth
-        total_size = int(num_images * bytes_per_image * 1.5)
+        total_size = int(effective_num_images * bytes_per_image * 1.5)
 
         # Minimum 100MB, maximum based on available space
         return max(100 * 1024 * 1024, total_size)
@@ -639,6 +646,50 @@ class ImageCache:
         with self._env.begin(write=True) as txn:
             txn.put(b"__metadata__", pickle.dumps(meta))
 
+    def save_split_indices(self, train_indices: List[int], val_indices: List[int]) -> None:
+        """
+        Save train/val split indices to cache metadata.
+
+        This enables cache-only mode where split information is loaded
+        from cache without needing the original train.txt/val.txt files.
+
+        Args:
+            train_indices: List of indices for training split.
+            val_indices: List of indices for validation split.
+        """
+        if self._env is None:
+            return
+
+        meta = self.get_metadata() or {}
+        meta["train_indices"] = train_indices
+        meta["val_indices"] = val_indices
+
+        with self._env.begin(write=True) as txn:
+            txn.put(b"__metadata__", pickle.dumps(meta))
+
+    def get_split_indices(self) -> Optional[Dict[str, List[int]]]:
+        """
+        Get train/val split indices from cache metadata.
+
+        This enables cache-only mode where split information is loaded
+        from cache without needing the original train.txt/val.txt files.
+
+        Returns:
+            Dict with 'train' and 'val' keys containing index lists, or None
+            if split indices are not available in the cache.
+        """
+        meta = self.get_metadata()
+        if meta is None:
+            return None
+
+        train_indices = meta.get("train_indices")
+        val_indices = meta.get("val_indices")
+
+        if train_indices is None or val_indices is None:
+            return None
+
+        return {"train": train_indices, "val": val_indices}
+
     def save_coco_annotations(self, coco_annotations: Dict) -> None:
         """
         Save COCO annotations to cache metadata for COCO format cache-only mode.
@@ -684,6 +735,121 @@ class ImageCache:
         if meta is None:
             return None
         return meta.get("format")
+
+    def sanity_check(self) -> Dict[str, Any]:
+        """
+        Perform sanity check on cache integrity.
+
+        Verifies that the cache is complete and consistent:
+        - Metadata exists and is readable
+        - Number of cached images matches metadata
+        - Labels exist (for YOLO format)
+        - Image size matches metadata
+        - Encryption status is consistent
+
+        Returns:
+            Dictionary with check results:
+            - 'valid': bool - True if all checks pass
+            - 'errors': List[str] - List of error messages
+            - 'warnings': List[str] - List of warning messages
+            - 'stats': Dict - Cache statistics (num_images, format, etc.)
+        """
+        result = {
+            "valid": True,
+            "errors": [],
+            "warnings": [],
+            "stats": {},
+        }
+
+        # Check if cache is initialized
+        if self._env is None:
+            result["valid"] = False
+            result["errors"].append("Cache not initialized (LMDB environment is None)")
+            return result
+
+        # Get metadata
+        meta = self.get_metadata()
+        if meta is None:
+            result["valid"] = False
+            result["errors"].append("Cache metadata not found or unreadable")
+            return result
+
+        # Extract stats
+        result["stats"]["format"] = meta.get("format", "unknown")
+        result["stats"]["num_images_metadata"] = meta.get("num_images", 0)
+        result["stats"]["target_size"] = meta.get("target_size")
+        result["stats"]["encrypted"] = meta.get("encrypted", False)
+        result["stats"]["version"] = meta.get("version", "unknown")
+
+        # Check cached images count
+        num_cached = len(self._cached_indices)
+        num_expected = meta.get("num_images", 0)
+        result["stats"]["num_images_cached"] = num_cached
+
+        if num_cached != num_expected:
+            result["valid"] = False
+            result["errors"].append(
+                f"Image count mismatch: cached {num_cached}, expected {num_expected}"
+            )
+
+        # Check image_paths exist
+        image_paths = meta.get("image_paths")
+        if image_paths is None:
+            result["valid"] = False
+            result["errors"].append("image_paths not found in metadata (required for cache-only mode)")
+        else:
+            result["stats"]["num_image_paths"] = len(image_paths)
+            if len(image_paths) != num_expected:
+                result["valid"] = False
+                result["errors"].append(
+                    f"image_paths count mismatch: {len(image_paths)}, expected {num_expected}"
+                )
+
+        # Check format-specific data
+        data_format = meta.get("format")
+        if data_format == "yolo":
+            labels = meta.get("labels")
+            if labels is None:
+                result["valid"] = False
+                result["errors"].append("YOLO labels not found in metadata")
+            else:
+                result["stats"]["num_labels"] = len(labels)
+                if len(labels) != num_expected:
+                    result["valid"] = False
+                    result["errors"].append(
+                        f"Labels count mismatch: {len(labels)}, expected {num_expected}"
+                    )
+
+        elif data_format == "coco":
+            coco_ann = meta.get("coco_annotations")
+            if coco_ann is None:
+                result["valid"] = False
+                result["errors"].append("COCO annotations not found in metadata")
+            else:
+                annotations = coco_ann.get("annotations", {})
+                categories = coco_ann.get("categories", [])
+                result["stats"]["num_annotations"] = len(annotations)
+                result["stats"]["num_categories"] = len(categories)
+
+        # Check split indices (optional but recommended)
+        train_indices = meta.get("train_indices")
+        val_indices = meta.get("val_indices")
+        if train_indices is not None and val_indices is not None:
+            result["stats"]["num_train_indices"] = len(train_indices)
+            result["stats"]["num_val_indices"] = len(val_indices)
+        else:
+            result["warnings"].append(
+                "Split indices not found in metadata (will need split files for training)"
+            )
+
+        # Check encryption consistency
+        if meta.get("encrypted", False) and not self._encrypt_cache:
+            result["valid"] = False
+            result["errors"].append(
+                "Cache is encrypted but cache_encrypt=False in config"
+            )
+
+        return result
 
     def get_coco_annotations(self) -> Optional[Dict]:
         """

@@ -1217,8 +1217,8 @@ Examples:
     parser.add_argument(
         "--size",
         type=int,
-        default=640,
-        help="Image size for cache (default: 640)",
+        default=None,
+        help="Image size for cache (default: from config model.image_size, or 640)",
     )
     parser.add_argument(
         "--encrypt",
@@ -1273,6 +1273,11 @@ Examples:
     train_ann = args.train_ann
     val_ann = args.val_ann
     data_fraction = args.data_fraction
+    train_split = None
+    val_split = None
+
+    # Default image size
+    image_size = args.size
 
     if args.config:
         from omegaconf import OmegaConf
@@ -1288,8 +1293,36 @@ Examples:
             train_ann = train_ann or getattr(data_cfg, "train_ann", None)
             val_ann = val_ann or getattr(data_cfg, "val_ann", None)
             data_fraction = getattr(data_cfg, "data_fraction", data_fraction)
+            train_split = getattr(data_cfg, "train_split", None)
+            val_split = getattr(data_cfg, "val_split", None)
+
+        # Read image_size from config if --size not provided
+        if image_size is None:
+            # Try model.image_size first (common in training configs)
+            if hasattr(config, "model") and hasattr(config.model, "image_size"):
+                cfg_size = config.model.image_size
+                # Handle [H, W] list format - use first dimension (assume square)
+                # Note: OmegaConf ListConfig doesn't match isinstance(list/tuple)
+                try:
+                    image_size = int(cfg_size[0])
+                except (TypeError, IndexError):
+                    image_size = int(cfg_size)
+            # Fallback to data.image_size
+            elif hasattr(config, "data") and hasattr(config.data, "image_size"):
+                cfg_size = config.data.image_size
+                try:
+                    image_size = int(cfg_size[0])
+                except (TypeError, IndexError):
+                    image_size = int(cfg_size)
 
     # Validate required parameters
+    if image_size is None:
+        print(
+            "Error: Image size not specified.\n"
+            "Provide --size or set model.image_size in your config YAML.",
+            file=sys.stderr
+        )
+        return 1
     if data_root is None:
         print("Error: --data.root is required (or provide --config with data.root)", file=sys.stderr)
         return 1
@@ -1301,13 +1334,15 @@ Examples:
         cache_path = create_cache(
             data_root=Path(data_root),
             data_format=data_format,
-            image_size=(args.size, args.size),
+            image_size=(image_size, image_size),
             train_images=train_images,
             val_images=val_images,
             train_labels=train_labels,
             val_labels=val_labels,
             train_ann=train_ann,
             val_ann=val_ann,
+            train_split=train_split,
+            val_split=val_split,
             encrypt=args.encrypt,
             workers=args.workers,
             split=args.split,

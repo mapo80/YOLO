@@ -2125,11 +2125,10 @@ The CLI provides commands to create, export, import, and inspect dataset caches.
 Create a cache independently from training, useful for preparing datasets before deployment:
 
 ```shell
-# Create cache from config file
-yolo cache-create --config config.yaml --size 640
+# Create cache from config file (reads image_size from model.image_size in config)
+yolo cache-create --config config.yaml --encrypt
 
-# Create encrypted cache
-export YOLO_ENCRYPTION_KEY=$(python -c "import os; print(os.urandom(32).hex())")
+# Or specify size explicitly (overrides config)
 yolo cache-create --config config.yaml --size 640 --encrypt
 
 # Create cache with direct parameters
@@ -2142,6 +2141,8 @@ yolo cache-create \
     --encrypt
 ```
 
+The cache-create command automatically reads split files (`train_split`, `val_split`) from the config to store correct train/val indices in the cache metadata. This enables true `cache_only` mode where no original files are needed.
+
 **Parameters:**
 
 | Parameter | Type | Default | Description |
@@ -2149,7 +2150,7 @@ yolo cache-create \
 | `--config` | str | - | Path to YAML config file |
 | `--data.root` | str | required | Dataset root directory |
 | `--data.format` | str | coco | Dataset format (coco/yolo) |
-| `--size` | int | 640 | Image size for cache |
+| `--size` | int | from config | Image size for cache (reads `model.image_size` if not specified) |
 | `--encrypt` | flag | false | Encrypt cache with AES-256 |
 | `--workers` | int | auto | Parallel workers for caching |
 | `--split` | str | both | Which split to cache (train/val/both) |

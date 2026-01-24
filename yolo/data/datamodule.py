@@ -382,7 +382,8 @@ class YOLODataModule(L.LightningDataModule):
                     data_fraction=data_fraction,
                     cache_workers=self.hparams.cache_workers,
                     cache_only=cache_only,
-                    split_file=self.hparams.train_split,
+                    split_file=None if cache_only else self.hparams.train_split,
+                    split_type="train" if cache_only else None,
                 )
             else:
                 base_train_dataset = CocoDetectionWrapper(
@@ -395,6 +396,7 @@ class YOLODataModule(L.LightningDataModule):
                     data_fraction=data_fraction,
                     cache_workers=self.hparams.cache_workers,
                     cache_only=cache_only,
+                    split_type="train" if cache_only else None,
                 )
 
             # Create post-mosaic transforms (applied after multi-image augmentation)
@@ -441,7 +443,8 @@ class YOLODataModule(L.LightningDataModule):
                     data_fraction=data_fraction,
                     cache_workers=self.hparams.cache_workers,
                     cache_only=cache_only,
-                    split_file=self.hparams.val_split,
+                    split_file=None if cache_only else self.hparams.val_split,
+                    split_type="val" if cache_only else None,
                 )
             else:
                 self.val_dataset = CocoDetectionWrapper(
@@ -454,6 +457,7 @@ class YOLODataModule(L.LightningDataModule):
                     data_fraction=data_fraction,
                     cache_workers=self.hparams.cache_workers,
                     cache_only=cache_only,
+                    split_type="val" if cache_only else None,
                 )
 
             # Extract class names from dataset
@@ -546,6 +550,17 @@ class YOLODataModule(L.LightningDataModule):
     def _extract_class_names(self, is_yolo_format: bool) -> None:
         """Extract class names from dataset for metrics display."""
         from yolo.data.class_names import load_class_names
+
+        # In cache-only mode with COCO format, try to get categories from cache
+        cache_only = self.hparams.cache_only
+        if cache_only and not is_yolo_format:
+            # Try to get class names from val_dataset (which has cached categories)
+            if hasattr(self, 'val_dataset') and hasattr(self.val_dataset, '_cached_categories'):
+                categories = self.val_dataset._cached_categories
+                if categories:
+                    sorted_cats = sorted(categories, key=lambda x: x["id"])
+                    self.class_names = {i: cat["name"] for i, cat in enumerate(sorted_cats)}
+                    return
 
         data_format = "yolo" if is_yolo_format else "coco"
         ann_file = None if is_yolo_format else self.hparams.val_ann
@@ -681,6 +696,8 @@ class CocoDetectionWrapper(CocoDetection):
         data_fraction: float = 1.0,
         cache_workers: Optional[int] = None,
         cache_only: bool = False,
+        skip_finalize: bool = False,
+        split_type: Optional[str] = None,
     ):
         self._cache_only = cache_only
         self._image_cache = image_cache
@@ -688,6 +705,8 @@ class CocoDetectionWrapper(CocoDetection):
         self._transforms = transforms
         self.image_size = image_size
         self.root = root  # Store root for cache-only mode
+        self._skip_finalize = skip_finalize
+        self._split_type = split_type  # "train" or "val" for cache-only mode
 
         # In cache-only mode, load image paths and annotations from cache metadata
         if cache_only:
@@ -886,8 +905,9 @@ class CocoDetectionWrapper(CocoDetection):
 
         executor.shutdown(wait=False)
 
-        # Finalize cache
-        self._image_cache.finalize()
+        # Finalize cache (skip if caller will handle finalization)
+        if not self._skip_finalize:
+            self._image_cache.finalize()
         cached_count = self._image_cache.size
         console.print(f"[green]✓[/green] Cached {cached_count} images to {cache_mode.upper()} (LMDB)")
 
@@ -924,8 +944,27 @@ class CocoDetectionWrapper(CocoDetection):
             cache_dir = self._image_cache._build_cache_dir(dataset_root)
             if not cache_dir.exists():
                 raise ValueError(
-                    f"Cache directory not found: {cache_dir}. "
-                    f"Create the cache first with: yolo cache-create"
+                    "\n"
+                    "╔══════════════════════════════════════════════════════════════════════╗\n"
+                    "║  CACHE DIRECTORY NOT FOUND                                           ║\n"
+                    "╠══════════════════════════════════════════════════════════════════════╣\n"
+                    f"║  Expected: {str(cache_dir):<58}║\n"
+                    "║                                                                      ║\n"
+                    "║  You have cache_only=True but the cache does not exist yet.         ║\n"
+                    "║                                                                      ║\n"
+                    "║  Solutions:                                                          ║\n"
+                    "║                                                                      ║\n"
+                    "║  1. CREATE THE CACHE (recommended for faster training):              ║\n"
+                    "║       cd yolo-mit                                                    ║\n"
+                    "║       python -m yolo cache-create --config your_config.yaml          ║\n"
+                    "║                                                                      ║\n"
+                    "║  2. DISABLE CACHE MODE (use original images):                        ║\n"
+                    "║       data:                                                          ║\n"
+                    "║         cache_images: false                                          ║\n"
+                    "║         cache_only: false                                            ║\n"
+                    "║                                                                      ║\n"
+                    "║  Note: If using encryption, remember to set YOLO_ENCRYPTION_KEY      ║\n"
+                    "╚══════════════════════════════════════════════════════════════════════╝"
                 )
 
             # Open cache in read-only mode
@@ -1008,8 +1047,22 @@ class CocoDetectionWrapper(CocoDetection):
                 "╚══════════════════════════════════════════════════════════════════════╝"
             )
 
-        # Build the ids list (image indices)
-        self.ids = list(range(len(image_paths)))
+        # Get split indices from cache if available
+        split_indices = self._image_cache.get_split_indices()
+
+        # Build the ids list based on split type
+        if self._split_type and split_indices:
+            # Use split-specific indices
+            indices_key = self._split_type  # "train" or "val"
+            if indices_key in split_indices:
+                self.ids = split_indices[indices_key]
+            else:
+                # Fallback to all indices if split not found
+                self.ids = list(range(len(image_paths)))
+        else:
+            # No split filtering - use all indices
+            self.ids = list(range(len(image_paths)))
+
         self._image_paths = [Path(p) for p in image_paths]
         self._cached_annotations = coco_annotations.get("annotations", {})
         self._cached_categories = coco_annotations.get("categories", [])
@@ -1048,16 +1101,24 @@ class CocoDetectionWrapper(CocoDetection):
                 "╚══════════════════════════════════════════════════════════════════════╝"
             )
 
-        console.print(f"[green]✓[/green] Cache-only mode (COCO): {num_images:,} images from cache")
+        split_name = self._split_type.upper() if self._split_type else "ALL"
+        console.print(f"[green]✓[/green] Cache-only mode (COCO {split_name}): {num_images:,} images from cache")
+        console.print(f"   [dim]Annotations: loaded from cache metadata[/dim]")
+        if self._split_type and split_indices:
+            console.print(f"   [dim]Split indices: loaded from cache metadata[/dim]")
         if encrypted:
             console.print(f"   [dim]Encrypted cache - decryption in memory only[/dim]")
 
-        # Verify cache is complete
-        if cached_images < num_images:
-            logger.warning(
-                f"Cache is incomplete: {cached_images:,}/{num_images:,} images cached. "
-                f"Some images may fail to load."
+        # Run sanity check
+        check_result = self._image_cache.sanity_check()
+        if not check_result["valid"]:
+            errors = "\n".join(f"  - {e}" for e in check_result["errors"])
+            raise ValueError(
+                f"Cache sanity check failed:\n{errors}\n"
+                "Delete the cache and recreate it with: yolo cache-create"
             )
+        for warning in check_result.get("warnings", []):
+            logger.warning(f"Cache warning: {warning}")
 
         self._image_cache._initialized = True
 
@@ -1236,6 +1297,9 @@ class YOLOFormatDataset(Dataset):
         cache_workers: Number of parallel workers for caching (None = all CPU threads)
         cache_only: Load images only from cache, without requiring original files.
             Requires a complete cache with stored image paths.
+        split_type: Split type for cache_only mode ('train' or 'val'). When specified
+            and cache_only=True, uses split indices from cache metadata instead of
+            split_file. This makes the cache completely self-contained.
     """
 
     def __init__(
@@ -1252,6 +1316,8 @@ class YOLOFormatDataset(Dataset):
         cache_workers: Optional[int] = None,
         cache_only: bool = False,
         split_file: Optional[str] = None,
+        split_type: Optional[Literal["train", "val"]] = None,
+        skip_finalize: bool = False,
     ):
         self.images_dir = Path(images_dir)
         self.labels_dir = Path(labels_dir)
@@ -1263,6 +1329,8 @@ class YOLOFormatDataset(Dataset):
         self._cache_workers = cache_workers
         self._cache_only = cache_only
         self._split_file = split_file
+        self._split_type = split_type
+        self._skip_finalize = skip_finalize
 
         # In cache-only mode, load image paths from cache metadata
         if cache_only:
@@ -1452,6 +1520,71 @@ class YOLOFormatDataset(Dataset):
             f"(from {split_path.name})"
         )
 
+    def _apply_split_indices_filter(self, metadata: Dict[str, Any]) -> None:
+        """
+        Filter image_files and labels_cache using split indices from cache metadata.
+
+        In cache-only mode with split_type set, we use the train/val indices
+        stored in the cache during cache-create to filter the dataset.
+        This makes the cache completely self-contained (no train.txt/val.txt needed).
+
+        Args:
+            metadata: Cache metadata containing train_indices and val_indices.
+
+        Raises:
+            ValueError: If split indices are not found in cache metadata.
+        """
+        train_indices = metadata.get("train_indices")
+        val_indices = metadata.get("val_indices")
+
+        if train_indices is None or val_indices is None:
+            raise ValueError(
+                "\n"
+                "╔══════════════════════════════════════════════════════════════════════╗\n"
+                "║  SPLIT INDICES NOT FOUND IN CACHE                                    ║\n"
+                "╠══════════════════════════════════════════════════════════════════════╣\n"
+                "║  cache_only=True with split_type but cache lacks split indices.      ║\n"
+                "║                                                                      ║\n"
+                "║  This cache was created before split indices were saved to metadata. ║\n"
+                "║                                                                      ║\n"
+                "║  Solutions:                                                          ║\n"
+                "║  1. Recreate the cache with the latest version:                      ║\n"
+                "║       python -m yolo cache-create --format yolo ...                  ║\n"
+                "║                                                                      ║\n"
+                "║  2. Or provide split files in your config:                           ║\n"
+                "║       data:                                                          ║\n"
+                "║         train_split: train.txt                                       ║\n"
+                "║         val_split: val.txt                                           ║\n"
+                "╚══════════════════════════════════════════════════════════════════════╝"
+            )
+
+        # Select indices based on split_type
+        if self._split_type == "train":
+            split_indices = train_indices
+            split_name = "train"
+        elif self._split_type == "val":
+            split_indices = val_indices
+            split_name = "val"
+        else:
+            raise ValueError(f"Invalid split_type: {self._split_type}. Must be 'train' or 'val'.")
+
+        original_count = len(self.image_files)
+
+        # Filter image_files and labels_cache by split indices
+        self.image_files = [self.image_files[i] for i in split_indices]
+        if self._labels_cache is not None:
+            self._labels_cache = [self._labels_cache[i] for i in split_indices]
+
+        # Create index mapping for cache lookups
+        # The cache stores images by their original index (0, 1, 2, ...),
+        # but after filtering we need to map our new indices to cache indices
+        self._cache_index_map = split_indices
+
+        logger.info(
+            f"Split indices filter (cache-only): {original_count} -> {len(self.image_files)} images "
+            f"({split_name} split from cache metadata)"
+        )
+
     def _precache_images(self) -> None:
         """Pre-load all images into cache (RAM or disk, parallelized)."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1530,8 +1663,9 @@ class YOLOFormatDataset(Dataset):
 
         executor.shutdown(wait=False)
 
-        # Finalize cache
-        self._image_cache.finalize()
+        # Finalize cache (skip if caller will handle finalization)
+        if not self._skip_finalize:
+            self._image_cache.finalize()
         cached_count = self._image_cache.size
         console.print(f"[green]✓[/green] Cached {cached_count} images to {cache_mode.upper()} (LMDB)")
 
@@ -1569,8 +1703,27 @@ class YOLOFormatDataset(Dataset):
             cache_dir = self._image_cache._build_cache_dir(dataset_root)
             if not cache_dir.exists():
                 raise ValueError(
-                    f"Cache directory not found: {cache_dir}. "
-                    f"Create the cache first with: yolo cache-create"
+                    "\n"
+                    "╔══════════════════════════════════════════════════════════════════════╗\n"
+                    "║  CACHE DIRECTORY NOT FOUND                                           ║\n"
+                    "╠══════════════════════════════════════════════════════════════════════╣\n"
+                    f"║  Expected: {str(cache_dir):<58}║\n"
+                    "║                                                                      ║\n"
+                    "║  You have cache_only=True but the cache does not exist yet.         ║\n"
+                    "║                                                                      ║\n"
+                    "║  Solutions:                                                          ║\n"
+                    "║                                                                      ║\n"
+                    "║  1. CREATE THE CACHE (recommended for faster training):              ║\n"
+                    "║       cd yolo-mit                                                    ║\n"
+                    "║       python -m yolo cache-create --config your_config.yaml          ║\n"
+                    "║                                                                      ║\n"
+                    "║  2. DISABLE CACHE MODE (use original images):                        ║\n"
+                    "║       data:                                                          ║\n"
+                    "║         cache_images: false                                          ║\n"
+                    "║         cache_only: false                                            ║\n"
+                    "║                                                                      ║\n"
+                    "║  Note: If using encryption, remember to set YOLO_ENCRYPTION_KEY      ║\n"
+                    "╚══════════════════════════════════════════════════════════════════════╝"
                 )
 
             # Open cache in read-only mode
@@ -1635,14 +1788,34 @@ class YOLOFormatDataset(Dataset):
         # Convert paths back to Path objects
         self.image_files = [Path(p) for p in image_paths]
 
-        # Get labels from metadata (if available)
+        # Get labels from metadata (required for cache-only mode)
         labels = metadata.get("labels")
-        if labels is not None:
-            self._labels_cache = labels
+        if labels is None:
+            raise ValueError(
+                "\n"
+                "╔══════════════════════════════════════════════════════════════════════╗\n"
+                "║  LABELS NOT FOUND IN CACHE                                           ║\n"
+                "╠══════════════════════════════════════════════════════════════════════╣\n"
+                "║  cache_only=True but cache does not contain labels.                  ║\n"
+                "║                                                                      ║\n"
+                "║  This cache was created before YOLO labels were saved to metadata.  ║\n"
+                "║                                                                      ║\n"
+                "║  Solution: Recreate the cache with the latest version:              ║\n"
+                "║                                                                      ║\n"
+                "║    python -m yolo cache-create --format yolo ...                     ║\n"
+                "║                                                                      ║\n"
+                "║  The new cache will include labels and split indices.               ║\n"
+                "╚══════════════════════════════════════════════════════════════════════╝"
+            )
+        self._labels_cache = labels
 
-        # Apply split file filter if provided (cache-only mode)
+        # Apply split filtering: prefer split_file, then split_type from cache indices
         if self._split_file is not None:
+            # Use external split file (legacy mode)
             self._apply_split_file_filter_cached(self._split_file, image_paths)
+        elif self._split_type is not None:
+            # Use split indices from cache metadata (self-contained mode)
+            self._apply_split_indices_filter(metadata)
 
         num_images = len(self.image_files)
         cached_images = len(self._image_cache._cached_indices)
@@ -1670,16 +1843,23 @@ class YOLOFormatDataset(Dataset):
                 "╚══════════════════════════════════════════════════════════════════════╝"
             )
 
-        console.print(f"[green]✓[/green] Cache-only mode (YOLO): {num_images:,} images from cache")
+        split_name = self._split_type.upper() if self._split_type else "ALL"
+        console.print(f"[green]✓[/green] Cache-only mode (YOLO {split_name}): {num_images:,} images from cache")
+        console.print(f"   [dim]Labels: loaded from cache metadata[/dim]")
+        console.print(f"   [dim]Split indices: loaded from cache metadata[/dim]")
         if encrypted:
             console.print(f"   [dim]Encrypted cache - decryption in memory only[/dim]")
 
-        # Verify cache is complete
-        if cached_images < num_images:
-            logger.warning(
-                f"Cache is incomplete: {cached_images:,}/{num_images:,} images cached. "
-                f"Some images may fail to load."
+        # Run sanity check
+        check_result = self._image_cache.sanity_check()
+        if not check_result["valid"]:
+            errors = "\n".join(f"  - {e}" for e in check_result["errors"])
+            raise ValueError(
+                f"Cache sanity check failed:\n{errors}\n"
+                "Delete the cache and recreate it with: yolo cache-create"
             )
+        for warning in check_result.get("warnings", []):
+            logger.warning(f"Cache warning: {warning}")
 
         self._image_cache._initialized = True
 

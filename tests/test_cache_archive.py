@@ -30,6 +30,7 @@ from yolo.tools.cache_archive import (
     import_cache,
     print_cache_info,
     _extract_coco_annotations,
+    _extract_yolo_labels,
 )
 
 
@@ -921,3 +922,533 @@ class TestErrorHandling:
 
         with pytest.raises(ValueError, match="Failed to read cache metadata"):
             get_cache_info(cache_dir)
+
+
+# =============================================================================
+# Test _extract_yolo_labels function
+# =============================================================================
+
+
+class TestExtractYoloLabels:
+    """Tests for YOLO label extraction."""
+
+    @pytest.mark.integration
+    def test_extract_yolo_labels_basic(self, mock_yolo_dataset):
+        """Test extracting labels from YOLOFormatDataset."""
+        from yolo.data.datamodule import YOLOFormatDataset
+
+        dataset = YOLOFormatDataset(
+            images_dir=str(mock_yolo_dataset / "train" / "images"),
+            labels_dir=str(mock_yolo_dataset / "train" / "labels"),
+            image_size=(64, 64),
+            cache_labels=True,
+        )
+
+        labels = _extract_yolo_labels(dataset)
+
+        assert len(labels) == 10
+        assert "boxes_norm" in labels[0]
+        assert "labels" in labels[0]
+
+    @pytest.mark.integration
+    def test_extract_yolo_labels_content(self, mock_yolo_dataset):
+        """Test that extracted labels have correct content."""
+        from yolo.data.datamodule import YOLOFormatDataset
+
+        dataset = YOLOFormatDataset(
+            images_dir=str(mock_yolo_dataset / "train" / "images"),
+            labels_dir=str(mock_yolo_dataset / "train" / "labels"),
+            image_size=(64, 64),
+            cache_labels=True,
+        )
+
+        labels = _extract_yolo_labels(dataset)
+
+        # First image (even index) has 2 boxes
+        assert len(labels[0]["boxes_norm"]) == 2
+        # Second image (odd index) has 1 box
+        assert len(labels[1]["boxes_norm"]) == 1
+
+    @pytest.mark.integration
+    def test_extract_yolo_labels_uses_cache(self, mock_yolo_dataset):
+        """Test that extraction uses internal label cache when available."""
+        from yolo.data.datamodule import YOLOFormatDataset
+
+        dataset = YOLOFormatDataset(
+            images_dir=str(mock_yolo_dataset / "train" / "images"),
+            labels_dir=str(mock_yolo_dataset / "train" / "labels"),
+            image_size=(64, 64),
+            cache_labels=True,
+        )
+
+        # Ensure label cache is populated
+        assert dataset._labels_cache is not None
+
+        labels = _extract_yolo_labels(dataset)
+
+        # Should return the cached labels directly
+        assert labels is dataset._labels_cache
+
+
+# =============================================================================
+# Test YOLO labels and split indices in cache
+# =============================================================================
+
+
+class TestYoloLabelsSaving:
+    """Tests for YOLO labels saving to cache metadata."""
+
+    @pytest.mark.integration
+    def test_create_cache_yolo_saves_labels(self, mock_yolo_dataset):
+        """Test that YOLO cache creation saves labels to metadata."""
+        result = create_cache(
+            data_root=mock_yolo_dataset,
+            data_format="yolo",
+            image_size=(64, 64),
+            train_images="train/images",
+            train_labels="train/labels",
+            split="train",
+        )
+
+        env = lmdb.open(str(result / "cache.lmdb"), readonly=True, lock=False)
+        with env.begin() as txn:
+            meta = pickle.loads(txn.get(b"__metadata__"))
+        env.close()
+
+        assert "labels" in meta, "Labels not saved in cache metadata"
+        assert len(meta["labels"]) == 10
+        assert "boxes_norm" in meta["labels"][0]
+        assert "labels" in meta["labels"][0]
+
+    @pytest.mark.integration
+    def test_create_cache_yolo_both_splits_labels(self, mock_yolo_dataset):
+        """Test that labels from both splits are saved."""
+        result = create_cache(
+            data_root=mock_yolo_dataset,
+            data_format="yolo",
+            image_size=(64, 64),
+            train_images="train/images",
+            train_labels="train/labels",
+            val_images="val/images",
+            val_labels="val/labels",
+            split="both",
+        )
+
+        env = lmdb.open(str(result / "cache.lmdb"), readonly=True, lock=False)
+        with env.begin() as txn:
+            meta = pickle.loads(txn.get(b"__metadata__"))
+        env.close()
+
+        # 10 train + 5 val = 15 total
+        assert len(meta["labels"]) == 15
+
+    @pytest.mark.integration
+    def test_create_cache_yolo_saves_split_indices(self, mock_yolo_dataset):
+        """Test that YOLO cache creation saves split indices."""
+        result = create_cache(
+            data_root=mock_yolo_dataset,
+            data_format="yolo",
+            image_size=(64, 64),
+            train_images="train/images",
+            train_labels="train/labels",
+            val_images="val/images",
+            val_labels="val/labels",
+            split="both",
+        )
+
+        env = lmdb.open(str(result / "cache.lmdb"), readonly=True, lock=False)
+        with env.begin() as txn:
+            meta = pickle.loads(txn.get(b"__metadata__"))
+        env.close()
+
+        assert "train_indices" in meta
+        assert "val_indices" in meta
+        assert len(meta["train_indices"]) == 10  # 10 train images
+        assert len(meta["val_indices"]) == 5     # 5 val images
+        assert meta["train_indices"] == list(range(0, 10))
+        assert meta["val_indices"] == list(range(10, 15))
+
+    @pytest.mark.integration
+    def test_create_cache_yolo_train_only_split_indices(self, mock_yolo_dataset):
+        """Test split indices when only train is cached."""
+        result = create_cache(
+            data_root=mock_yolo_dataset,
+            data_format="yolo",
+            image_size=(64, 64),
+            train_images="train/images",
+            train_labels="train/labels",
+            split="train",
+        )
+
+        env = lmdb.open(str(result / "cache.lmdb"), readonly=True, lock=False)
+        with env.begin() as txn:
+            meta = pickle.loads(txn.get(b"__metadata__"))
+        env.close()
+
+        assert "train_indices" in meta
+        assert "val_indices" in meta
+        assert len(meta["train_indices"]) == 10
+        assert len(meta["val_indices"]) == 0  # Empty val
+
+
+# =============================================================================
+# Test ImageCache split indices methods
+# =============================================================================
+
+
+class TestImageCacheSplitIndices:
+    """Tests for ImageCache split indices methods."""
+
+    def test_save_split_indices(self, tmp_path):
+        """Test saving split indices to cache metadata."""
+        from yolo.data.cache import ImageCache
+
+        # Create a fresh cache
+        cache_dir = tmp_path / ".yolo_cache_test"
+        cache_dir.mkdir()
+        db_path = cache_dir / "cache.lmdb"
+
+        cache = ImageCache(mode="disk")
+        cache._db_path = db_path
+        cache._cache_dir_path = cache_dir
+        cache._open_db(readonly=False, map_size=10 * 1024 * 1024)
+
+        # Save initial metadata
+        cache._save_metadata([Path(f"/test/img_{i}.jpg") for i in range(15)])
+
+        # Save split indices
+        train_indices = list(range(0, 10))
+        val_indices = list(range(10, 15))
+        cache.save_split_indices(train_indices, val_indices)
+
+        # Verify
+        retrieved = cache.get_split_indices()
+        assert retrieved is not None
+        assert "train" in retrieved
+        assert "val" in retrieved
+        assert retrieved["train"] == train_indices
+        assert retrieved["val"] == val_indices
+
+        cache._env.close()
+
+    def test_get_split_indices_not_present(self, tmp_path):
+        """Test get_split_indices returns None when not saved."""
+        from yolo.data.cache import ImageCache
+
+        # Create a fresh cache without split indices
+        cache_dir = tmp_path / ".yolo_cache_test"
+        cache_dir.mkdir()
+        db_path = cache_dir / "cache.lmdb"
+
+        cache = ImageCache(mode="disk")
+        cache._db_path = db_path
+        cache._cache_dir_path = cache_dir
+        cache._open_db(readonly=False, map_size=10 * 1024 * 1024)
+
+        # Save initial metadata (without split indices)
+        cache._save_metadata([Path("/test/img.jpg")])
+
+        # Verify
+        retrieved = cache.get_split_indices()
+        assert retrieved is None
+
+        cache._env.close()
+
+
+# =============================================================================
+# Test cache_only mode with split_type
+# =============================================================================
+
+
+class TestCacheOnlySplitType:
+    """Tests for cache_only mode using split_type from cache metadata."""
+
+    @pytest.mark.integration
+    def test_cache_only_uses_split_indices(self, mock_yolo_dataset):
+        """Test that cache_only with split_type uses cached split indices."""
+        from yolo.data.datamodule import YOLOFormatDataset
+        from yolo.data.cache import ImageCache
+
+        # First create cache with both splits
+        cache_path = create_cache(
+            data_root=mock_yolo_dataset,
+            data_format="yolo",
+            image_size=(64, 64),
+            train_images="train/images",
+            train_labels="train/labels",
+            val_images="val/images",
+            val_labels="val/labels",
+            split="both",
+        )
+
+        # Create cache object pointing to existing cache
+        cache = ImageCache(
+            mode="disk",
+            cache_dir=mock_yolo_dataset,
+            target_size=(64, 64),
+            cache_suffix="64x64_f1.0",
+        )
+
+        # Create dataset with cache_only=True and split_type="train"
+        dataset = YOLOFormatDataset(
+            images_dir=str(mock_yolo_dataset / "train" / "images"),
+            labels_dir=str(mock_yolo_dataset / "train" / "labels"),
+            image_size=(64, 64),
+            image_cache=cache,
+            cache_only=True,
+            split_type="train",
+        )
+
+        # Should only have train images
+        assert len(dataset) == 10
+
+        # Verify labels are available
+        assert dataset._labels_cache is not None
+        assert len(dataset._labels_cache) == 10
+
+        cache._env.close()
+
+    @pytest.mark.integration
+    def test_cache_only_val_split(self, mock_yolo_dataset):
+        """Test that cache_only with split_type='val' uses val indices."""
+        from yolo.data.datamodule import YOLOFormatDataset
+        from yolo.data.cache import ImageCache
+
+        # First create cache with both splits
+        cache_path = create_cache(
+            data_root=mock_yolo_dataset,
+            data_format="yolo",
+            image_size=(64, 64),
+            train_images="train/images",
+            train_labels="train/labels",
+            val_images="val/images",
+            val_labels="val/labels",
+            split="both",
+        )
+
+        # Create cache object
+        cache = ImageCache(
+            mode="disk",
+            cache_dir=mock_yolo_dataset,
+            target_size=(64, 64),
+            cache_suffix="64x64_f1.0",
+        )
+
+        # Create dataset with cache_only=True and split_type="val"
+        dataset = YOLOFormatDataset(
+            images_dir=str(mock_yolo_dataset / "val" / "images"),
+            labels_dir=str(mock_yolo_dataset / "val" / "labels"),
+            image_size=(64, 64),
+            image_cache=cache,
+            cache_only=True,
+            split_type="val",
+        )
+
+        # Should only have val images
+        assert len(dataset) == 5
+
+        # Verify labels are available
+        assert dataset._labels_cache is not None
+        assert len(dataset._labels_cache) == 5
+
+        cache._env.close()
+
+
+# =============================================================================
+# Test cache_only=false still works (regression tests)
+# =============================================================================
+
+
+class TestCacheOnlyFalseRegression:
+    """Regression tests to ensure cache_only=False behavior is unchanged."""
+
+    @pytest.mark.integration
+    def test_cache_only_false_uses_disk_files(self, mock_yolo_dataset):
+        """Test that cache_only=False still reads labels from disk files."""
+        from yolo.data.datamodule import YOLOFormatDataset
+        from yolo.data.cache import ImageCache
+
+        # Create cache first
+        cache = ImageCache(
+            mode="disk",
+            cache_dir=mock_yolo_dataset,
+            target_size=(64, 64),
+            cache_suffix="64x64_f1.0",
+        )
+
+        # Create dataset with cache_only=False (normal mode)
+        dataset = YOLOFormatDataset(
+            images_dir=str(mock_yolo_dataset / "train" / "images"),
+            labels_dir=str(mock_yolo_dataset / "train" / "labels"),
+            image_size=(64, 64),
+            cache_labels=True,
+            image_cache=cache,
+            cache_only=False,  # Normal mode - uses disk files
+        )
+
+        # Should have loaded images from disk
+        assert len(dataset) == 10
+
+        # Get an item - should work with labels from .txt files
+        img, target = dataset[0]
+        assert img is not None
+        assert "boxes" in target
+        assert len(target["boxes"]) > 0  # Should have boxes from label file
+
+        if cache._env is not None:
+            cache._env.close()
+
+    @pytest.mark.integration
+    def test_cache_only_false_works_without_cache(self, mock_yolo_dataset):
+        """Test that cache_only=False works without image cache."""
+        from yolo.data.datamodule import YOLOFormatDataset
+
+        # Create dataset with no image cache
+        dataset = YOLOFormatDataset(
+            images_dir=str(mock_yolo_dataset / "train" / "images"),
+            labels_dir=str(mock_yolo_dataset / "train" / "labels"),
+            image_size=(64, 64),
+            cache_labels=True,
+            image_cache=None,  # No cache
+            cache_only=False,
+        )
+
+        # Should have loaded images from disk
+        assert len(dataset) == 10
+
+        # Get an item
+        img, target = dataset[0]
+        assert img is not None
+        assert "boxes" in target
+
+    @pytest.mark.integration
+    def test_cache_only_false_requires_label_files(self, mock_yolo_dataset, tmp_path):
+        """Test that cache_only=False fails gracefully if label files are missing."""
+        from yolo.data.datamodule import YOLOFormatDataset
+
+        # Create a directory with images but no labels
+        images_dir = tmp_path / "images"
+        labels_dir = tmp_path / "labels"
+        images_dir.mkdir()
+        labels_dir.mkdir()
+
+        # Copy images only
+        for img in (mock_yolo_dataset / "train" / "images").glob("*.jpg"):
+            shutil.copy(img, images_dir / img.name)
+
+        # Don't copy label files - labels_dir is empty
+
+        # Create dataset with cache_only=False
+        dataset = YOLOFormatDataset(
+            images_dir=str(images_dir),
+            labels_dir=str(labels_dir),
+            image_size=(64, 64),
+            cache_labels=True,
+            cache_only=False,
+        )
+
+        # Should find images
+        assert len(dataset) == 10
+
+        # Get item - should have empty labels (no label file found)
+        _, target = dataset[0]
+        assert len(target["boxes"]) == 0  # No boxes because no label file
+
+
+# =============================================================================
+# Test cache_only=true requires labels in cache
+# =============================================================================
+
+
+class TestCacheOnlyRequiresLabels:
+    """Tests for cache_only=True validation of labels in cache."""
+
+    @pytest.mark.integration
+    def test_cache_only_true_fails_without_labels(self, tmp_path):
+        """Test that cache_only=True fails if cache has no labels."""
+        from yolo.data.datamodule import YOLOFormatDataset
+        from yolo.data.cache import ImageCache
+
+        # Create a cache WITHOUT labels (simulating old cache format)
+        cache_dir = tmp_path / ".yolo_cache_64x64_f1.0"
+        cache_dir.mkdir()
+        db_path = cache_dir / "cache.lmdb"
+
+        env = lmdb.open(str(db_path), map_size=100 * 1024 * 1024)
+        with env.begin(write=True) as txn:
+            # Store metadata WITHOUT labels
+            meta = {
+                "version": "3.2.0",
+                "num_images": 10,
+                "image_paths": [f"/path/img_{i}.jpg" for i in range(10)],
+                "target_size": (64, 64),
+                "format": "yolo",
+                # NO "labels" key!
+            }
+            txn.put(b"__metadata__", pickle.dumps(meta))
+            # Store some mock images
+            for i in range(10):
+                img_data = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+                txn.put(str(i).encode(), img_data.tobytes())
+        env.close()
+
+        # Create cache object
+        cache = ImageCache(mode="disk")
+        cache._cache_dir_path = cache_dir
+        cache._db_path = db_path
+        cache.cache_suffix = "64x64_f1.0"
+
+        # Should raise error because no labels in cache
+        with pytest.raises(ValueError, match="LABELS NOT FOUND IN CACHE"):
+            YOLOFormatDataset(
+                images_dir=str(tmp_path / "images"),
+                labels_dir=str(tmp_path / "labels"),
+                image_size=(64, 64),
+                image_cache=cache,
+                cache_only=True,
+            )
+
+    @pytest.mark.integration
+    def test_cache_only_true_fails_without_split_indices(self, tmp_path):
+        """Test that cache_only=True with split_type fails if no split indices."""
+        from yolo.data.datamodule import YOLOFormatDataset
+        from yolo.data.cache import ImageCache
+
+        # Create a cache with labels but WITHOUT split indices
+        cache_dir = tmp_path / ".yolo_cache_64x64_f1.0"
+        cache_dir.mkdir()
+        db_path = cache_dir / "cache.lmdb"
+
+        env = lmdb.open(str(db_path), map_size=100 * 1024 * 1024)
+        with env.begin(write=True) as txn:
+            meta = {
+                "version": "3.2.0",
+                "num_images": 10,
+                "image_paths": [f"/path/img_{i}.jpg" for i in range(10)],
+                "target_size": (64, 64),
+                "format": "yolo",
+                "labels": [{"boxes_norm": [], "labels": []} for _ in range(10)],
+                # NO "train_indices" or "val_indices"!
+            }
+            txn.put(b"__metadata__", pickle.dumps(meta))
+            for i in range(10):
+                img_data = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+                txn.put(str(i).encode(), img_data.tobytes())
+        env.close()
+
+        # Create cache object
+        cache = ImageCache(mode="disk")
+        cache._cache_dir_path = cache_dir
+        cache._db_path = db_path
+        cache.cache_suffix = "64x64_f1.0"
+
+        # Should raise error because no split indices
+        with pytest.raises(ValueError, match="SPLIT INDICES NOT FOUND"):
+            YOLOFormatDataset(
+                images_dir=str(tmp_path / "images"),
+                labels_dir=str(tmp_path / "labels"),
+                image_size=(64, 64),
+                image_cache=cache,
+                cache_only=True,
+                split_type="train",  # Requires split indices
+            )
