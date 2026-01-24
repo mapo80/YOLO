@@ -210,6 +210,9 @@ class YOLODataModule(L.LightningDataModule):
         # YOLO format paths
         train_labels: str = "train/labels",
         val_labels: str = "valid/labels",
+        # Split files (optional, for filtering images by filename list)
+        train_split: Optional[str] = None,
+        val_split: Optional[str] = None,
         # DataLoader settings
         batch_size: int = 16,
         num_workers: int = 8,
@@ -379,6 +382,7 @@ class YOLODataModule(L.LightningDataModule):
                     data_fraction=data_fraction,
                     cache_workers=self.hparams.cache_workers,
                     cache_only=cache_only,
+                    split_file=self.hparams.train_split,
                 )
             else:
                 base_train_dataset = CocoDetectionWrapper(
@@ -437,6 +441,7 @@ class YOLODataModule(L.LightningDataModule):
                     data_fraction=data_fraction,
                     cache_workers=self.hparams.cache_workers,
                     cache_only=cache_only,
+                    split_file=self.hparams.val_split,
                 )
             else:
                 self.val_dataset = CocoDetectionWrapper(
@@ -1246,6 +1251,7 @@ class YOLOFormatDataset(Dataset):
         data_fraction: float = 1.0,
         cache_workers: Optional[int] = None,
         cache_only: bool = False,
+        split_file: Optional[str] = None,
     ):
         self.images_dir = Path(images_dir)
         self.labels_dir = Path(labels_dir)
@@ -1256,6 +1262,7 @@ class YOLOFormatDataset(Dataset):
         self._image_cache = image_cache
         self._cache_workers = cache_workers
         self._cache_only = cache_only
+        self._split_file = split_file
 
         # In cache-only mode, load image paths from cache metadata
         if cache_only:
@@ -1269,6 +1276,10 @@ class YOLOFormatDataset(Dataset):
         for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.JPG", "*.JPEG", "*.PNG"]:
             self.image_files.extend(self.images_dir.glob(ext))
         self.image_files = sorted(self.image_files)
+
+        # Apply split file filter if provided
+        if split_file is not None:
+            self._apply_split_file_filter(split_file)
 
         if len(self.image_files) == 0:
             raise ValueError(f"No images found in {images_dir}")
@@ -1320,6 +1331,126 @@ class YOLOFormatDataset(Dataset):
         except Exception:
             # Fallback to default loader
             self._image_loader = DefaultImageLoader()
+
+    def _apply_split_file_filter(self, split_file: str) -> None:
+        """
+        Filter image_files to only include images listed in split_file.
+
+        Args:
+            split_file: Path to text file with one image filename per line.
+                       Can be absolute or relative to images_dir.parent (dataset root).
+
+        Raises:
+            FileNotFoundError: If split_file doesn't exist.
+            ValueError: If no images match the split file.
+        """
+        split_path = Path(split_file)
+
+        # If relative path, try relative to dataset root (images_dir.parent)
+        if not split_path.is_absolute():
+            split_path = self.images_dir.parent / split_path
+
+        if not split_path.exists():
+            raise FileNotFoundError(
+                f"Split file not found: {split_path}. "
+                f"Provide an absolute path or a path relative to {self.images_dir.parent}"
+            )
+
+        # Read split file (one filename per line)
+        with open(split_path, "r") as f:
+            split_filenames = set(
+                line.strip() for line in f
+                if line.strip() and not line.startswith("#")
+            )
+
+        if not split_filenames:
+            raise ValueError(f"Split file is empty: {split_path}")
+
+        # Filter image_files to only those in split file
+        original_count = len(self.image_files)
+        self.image_files = [
+            p for p in self.image_files
+            if p.name in split_filenames
+        ]
+
+        if len(self.image_files) == 0:
+            raise ValueError(
+                f"No images matched split file {split_path}. "
+                f"Split file contains {len(split_filenames)} entries. "
+                f"Check that filenames match (case-sensitive)."
+            )
+
+        logger.info(
+            f"Split file filter: {original_count} -> {len(self.image_files)} images "
+            f"(from {split_path.name})"
+        )
+
+    def _apply_split_file_filter_cached(self, split_file: str, original_paths: List[str]) -> None:
+        """
+        Filter image_files and labels_cache in cache-only mode.
+
+        In cache-only mode, we need to also filter the labels_cache to match
+        the filtered image_files, maintaining index alignment.
+
+        Args:
+            split_file: Path to text file with one image filename per line.
+            original_paths: Original list of paths from cache metadata (for index mapping).
+        """
+        split_path = Path(split_file)
+
+        # If relative path, try relative to dataset root (images_dir.parent)
+        if not split_path.is_absolute():
+            split_path = self.images_dir.parent / split_path
+
+        if not split_path.exists():
+            raise FileNotFoundError(
+                f"Split file not found: {split_path}. "
+                f"Provide an absolute path or a path relative to {self.images_dir.parent}"
+            )
+
+        # Read split file (one filename per line)
+        with open(split_path, "r") as f:
+            split_filenames = set(
+                line.strip() for line in f
+                if line.strip() and not line.startswith("#")
+            )
+
+        if not split_filenames:
+            raise ValueError(f"Split file is empty: {split_path}")
+
+        # Build index mapping: find which original indices match the split
+        original_count = len(self.image_files)
+        filtered_indices = []
+        filtered_files = []
+
+        for idx, path in enumerate(self.image_files):
+            if path.name in split_filenames:
+                filtered_indices.append(idx)
+                filtered_files.append(path)
+
+        if len(filtered_files) == 0:
+            raise ValueError(
+                f"No images matched split file {split_path}. "
+                f"Split file contains {len(split_filenames)} entries. "
+                f"Check that filenames match (case-sensitive)."
+            )
+
+        # Update image_files
+        self.image_files = filtered_files
+
+        # Update labels_cache to match filtered indices
+        if self._labels_cache is not None:
+            self._labels_cache = [self._labels_cache[i] for i in filtered_indices]
+
+        # Update image cache index mapping for filtered subset
+        # The cache stores images by their original index, but we need to map
+        # our new indices (0, 1, 2, ...) to the original cache indices
+        self._cache_index_map = filtered_indices
+
+        logger.info(
+            f"Split file filter (cache-only): {original_count} -> {len(self.image_files)} images "
+            f"(from {split_path.name})"
+        )
 
     def _precache_images(self) -> None:
         """Pre-load all images into cache (RAM or disk, parallelized)."""
@@ -1508,6 +1639,10 @@ class YOLOFormatDataset(Dataset):
         labels = metadata.get("labels")
         if labels is not None:
             self._labels_cache = labels
+
+        # Apply split file filter if provided (cache-only mode)
+        if self._split_file is not None:
+            self._apply_split_file_filter_cached(self._split_file, image_paths)
 
         num_images = len(self.image_files)
         cached_images = len(self._image_cache._cached_indices)
@@ -1716,7 +1851,12 @@ class YOLOFormatDataset(Dataset):
 
         # Try cache first
         if self._image_cache is not None:
-            cached = self._image_cache.get(index)
+            # Map index to original cache index if using split file filter
+            cache_index = index
+            if hasattr(self, '_cache_index_map') and self._cache_index_map is not None:
+                cache_index = self._cache_index_map[index]
+
+            cached = self._image_cache.get(cache_index)
             if cached is not None:
                 img_arr, orig_size = cached
                 return Image.fromarray(img_arr), orig_size

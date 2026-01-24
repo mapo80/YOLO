@@ -298,6 +298,8 @@ python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml \
 | `--data.format` | coco | Dataset format (coco or yolo) |
 | `--data.val_images` | - | Path to validation images |
 | `--data.val_labels` | - | Path to validation labels (YOLO format) |
+| `--data.train_split` | - | Path to train split file (YOLO format) |
+| `--data.val_split` | - | Path to validation split file (YOLO format) |
 | `--data.val_ann` | - | Path to validation annotations (COCO format) |
 | `--batch-size` | 16 | Batch size for validation |
 | `--conf` | 0.001 | Confidence threshold |
@@ -2853,6 +2855,51 @@ data:
   batch_size: 16
   image_size: [640, 640]
 ```
+
+#### YOLO Format with Split Files
+
+For datasets with a **single images/labels folder** and separate split files (e.g., `train.txt`, `val.txt`), you can use the `train_split` and `val_split` parameters.
+
+**Directory structure:**
+```
+dataset/
+├── images/           # All images in one folder
+│   └── *.jpg
+├── labels/           # All labels in one folder
+│   └── *.txt
+├── train.txt         # List of training image filenames
+└── val.txt           # List of validation image filenames
+```
+
+**Split file format** (one filename per line):
+```
+img_001.jpg
+img_002.jpg
+img_003.jpg
+...
+```
+
+**Configuration:**
+```yaml
+data:
+  format: yolo
+  root: path/to/dataset
+  train_images: images      # Single images folder
+  val_images: images        # Same folder
+  train_labels: labels      # Single labels folder
+  val_labels: labels        # Same folder
+  train_split: train.txt    # Filter for training
+  val_split: val.txt        # Filter for validation
+  batch_size: 16
+  image_size: [640, 640]
+```
+
+This is useful when:
+- You have a pre-existing dataset with split files
+- You want to use the same images/labels folders for both train and val
+- You're using a cached dataset where all images are in a single cache
+
+**Note:** Split files work with both regular and cache-only modes. When using `cache_only: true`, the split files filter the cached images.
 
 #### Example Configurations
 
