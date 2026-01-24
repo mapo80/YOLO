@@ -177,8 +177,14 @@ class YOLOLightningCLI:
 
 def train_main(argv: Optional[List[str]] = None) -> int:
     """Run training/validation/test using LightningCLI."""
+    import torch
     from yolo.data.datamodule import YOLODataModule
     from yolo.training.module import YOLOModule
+
+    # Enable Tensor Cores on NVIDIA GPUs (A100, A40, RTX 30xx/40xx, etc.)
+    # This trades off some precision for significantly faster matmul operations
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
 
     try:
         if argv is None:

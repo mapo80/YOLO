@@ -433,7 +433,10 @@ class YOLODataModule(L.LightningDataModule):
                     image_loader=self._image_loader,
                     cache_labels=self.hparams.cache_labels,
                     cache_refresh=self.hparams.cache_refresh,
+                    image_cache=image_cache,
                     data_fraction=data_fraction,
+                    cache_workers=self.hparams.cache_workers,
+                    cache_only=cache_only,
                 )
             else:
                 self.val_dataset = CocoDetectionWrapper(
@@ -442,7 +445,10 @@ class YOLODataModule(L.LightningDataModule):
                     transforms=val_transforms,
                     image_size=image_size,
                     image_loader=self._image_loader,
+                    image_cache=image_cache,
                     data_fraction=data_fraction,
+                    cache_workers=self.hparams.cache_workers,
+                    cache_only=cache_only,
                 )
 
             # Extract class names from dataset
