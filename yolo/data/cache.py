@@ -703,6 +703,8 @@ class ImageCache:
         # Don't serialize LMDB env - workers will re-open it
         state["_env"] = None
         state["_crypto"] = None  # Will be re-initialized if needed
+        # Don't serialize cached_indices - will be reloaded from LMDB in worker
+        state["_cached_indices"] = set()
         return state
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
@@ -714,6 +716,8 @@ class ImageCache:
         if self._initialized and self._db_path is not None and self._db_path.exists():
             try:
                 self._open_db(readonly=True)
+                # Reload cached indices from LMDB
+                self._load_cached_indices()
             except Exception as e:
                 logger.warning(f"Failed to open cache in worker: {e}")
                 self._env = None

@@ -86,6 +86,21 @@ class MosaicMixupDataset(Dataset):
     def __len__(self) -> int:
         return len(self.dataset)
 
+    def __getstate__(self) -> dict:
+        """Prepare state for pickling (spawn multiprocessing compatibility)."""
+        state = self.__dict__.copy()
+        # The LRU buffer doesn't need to be pickled - it will be recreated per worker
+        state["_buffer"] = None
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore state after unpickling."""
+        self.__dict__.update(state)
+        # Recreate the buffer if it was configured
+        if self._buffer_size > 0:
+            from yolo.data.cache import LRUImageBuffer
+            self._buffer = LRUImageBuffer(self._buffer_size)
+
     def __getitem__(self, index: int) -> Tuple[Tensor, Dict[str, Tensor]]:
         """Get item with optional mosaic/mixup/cutmix augmentation."""
         if self._mosaic_enabled and random.random() < self.mosaic_prob:

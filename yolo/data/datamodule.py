@@ -456,7 +456,9 @@ class YOLODataModule(L.LightningDataModule):
 
         # Pre-warm DataLoader workers (only for fit stage with num_workers > 0)
         if stage == "fit" or stage is None:
+            logger.info("Starting DataLoader worker initialization...")
             self._prewarm_dataloader_workers()
+            logger.info("DataLoader workers ready.")
 
     def _prewarm_dataloader_workers(self) -> None:
         """Pre-warm DataLoader workers to avoid delay at first training step.
@@ -464,39 +466,77 @@ class YOLODataModule(L.LightningDataModule):
         With 'spawn' multiprocessing, worker creation is slow. By fetching one batch
         here, we force worker initialization during setup() instead of during training.
         """
-        from yolo.utils.progress import spinner, console
+        import sys
+        import time
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         num_workers = _get_safe_num_workers(self.hparams.num_workers)
         if num_workers == 0:
             return
 
-        with spinner(f"Initializing {num_workers * 2} DataLoader workers (train + val)..."):
-            # Pre-warm TRAIN dataloader
-            train_loader = DataLoader(
-                self.train_dataset,
-                batch_size=self.hparams.batch_size,
-                shuffle=False,  # No shuffle for faster first batch
-                drop_last=True,
-                **self._get_dataloader_kwargs(),
-            )
-            # Fetch first batch to initialize workers
-            _ = next(iter(train_loader))
-            # Store for reuse
-            self._train_dataloader = train_loader
+        def spinning_loader(message: str, stop_event: threading.Event):
+            """Show a spinning loader while waiting."""
+            spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            idx = 0
+            start = time.time()
+            while not stop_event.is_set():
+                elapsed = time.time() - start
+                char = spinner_chars[idx % len(spinner_chars)]
+                print(f"\r{char} {message} ({elapsed:.0f}s)", end="", flush=True)
+                idx += 1
+                stop_event.wait(0.1)
+            # Clear the line
+            print(f"\r{' ' * 80}\r", end="", flush=True)
 
-            # Pre-warm VALIDATION dataloader (needed for sanity check)
-            val_loader = DataLoader(
-                self.val_dataset,
-                batch_size=self.hparams.batch_size,
-                shuffle=False,
-                **self._get_dataloader_kwargs(),
-            )
-            # Fetch first batch to initialize workers
-            _ = next(iter(val_loader))
-            # Store for reuse
-            self._val_dataloader = val_loader
+        def fetch_with_loader(loader, message: str):
+            """Fetch first batch while showing a loader."""
+            stop_event = threading.Event()
+            loader_thread = threading.Thread(target=spinning_loader, args=(message, stop_event))
+            loader_thread.start()
+            start = time.time()
+            try:
+                result = next(iter(loader))
+            finally:
+                stop_event.set()
+                loader_thread.join()
+            return result, time.time() - start
 
-        console.print(f"[green]✓[/green] DataLoader workers initialized ({num_workers} train + {num_workers} val)")
+        start_time = time.time()
+
+        # Step 1: Create train DataLoader
+        print(f"[1/4] Creating train DataLoader ({num_workers} workers)...", flush=True)
+        train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=self.hparams.batch_size,
+            shuffle=False,
+            drop_last=True,
+            **self._get_dataloader_kwargs(),
+        )
+        print(f"      ✓ Done", flush=True)
+
+        # Step 2: Spawn and initialize train workers (this is the slow part)
+        _, elapsed = fetch_with_loader(train_loader, f"[2/4] Spawning {num_workers} train workers")
+        print(f"[2/4] ✓ Train workers ready ({elapsed:.1f}s)", flush=True)
+        self._train_dataloader = train_loader
+
+        # Step 3: Create val DataLoader
+        print(f"[3/4] Creating val DataLoader ({num_workers} workers)...", flush=True)
+        val_loader = DataLoader(
+            self.val_dataset,
+            batch_size=self.hparams.batch_size,
+            shuffle=False,
+            **self._get_dataloader_kwargs(),
+        )
+        print(f"      ✓ Done", flush=True)
+
+        # Step 4: Spawn and initialize val workers
+        _, elapsed = fetch_with_loader(val_loader, f"[4/4] Spawning {num_workers} val workers")
+        print(f"[4/4] ✓ Val workers ready ({elapsed:.1f}s)", flush=True)
+        self._val_dataloader = val_loader
+
+        total_time = time.time() - start_time
+        print(f"✓ All DataLoader workers ready ({num_workers} train + {num_workers} val) in {total_time:.1f}s", flush=True)
 
     def _extract_class_names(self, is_yolo_format: bool) -> None:
         """Extract class names from dataset for metrics display."""
