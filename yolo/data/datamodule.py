@@ -190,6 +190,9 @@ class YOLODataModule(L.LightningDataModule):
         cache_max_memory_gb: Maximum RAM for image caching in GB (default: 8.0)
         cache_workers: Number of parallel workers for caching (default: None = all CPU threads)
         cache_refresh: Force cache regeneration (default: False)
+        cache_only: Load images only from cache, without requiring original images on disk.
+            Useful for training on remote machines where only the encrypted cache is available.
+            Requires a complete cache created by cache-create command.
         image_size: DO NOT SPECIFY - automatically linked from model.image_size via CLI.
     """
 
@@ -244,6 +247,8 @@ class YOLODataModule(L.LightningDataModule):
         cache_workers: Optional[int] = None,  # None = auto (all CPU threads)
         cache_refresh: bool = False,
         cache_encrypt: bool = False,
+        cache_only: bool = False,
+        cache_sync: bool = False,  # Enable LMDB fsync for crash safety (disable for external volumes on macOS)
         # Encryption key for encrypted images (.enc) and/or encrypted cache
         # Can also be set via YOLO_ENCRYPTION_KEY environment variable
         encryption_key: Optional[str] = None,
@@ -294,8 +299,28 @@ class YOLODataModule(L.LightningDataModule):
             if self.hparams.cache_encrypt:
                 if self._encryption_key is None:
                     raise ValueError(
-                        "cache_encrypt=True requires encryption_key to be set. "
-                        "Either set data.encryption_key in YAML or YOLO_ENCRYPTION_KEY env var."
+                        "\n"
+                        "╔══════════════════════════════════════════════════════════════════════╗\n"
+                        "║  ENCRYPTION KEY REQUIRED                                             ║\n"
+                        "╠══════════════════════════════════════════════════════════════════════╣\n"
+                        "║  cache_encrypt=True but no encryption key found.                     ║\n"
+                        "║                                                                      ║\n"
+                        "║  Set the key using ONE of these methods:                             ║\n"
+                        "║                                                                      ║\n"
+                        "║  1. Environment variable (recommended):                              ║\n"
+                        "║     export YOLO_ENCRYPTION_KEY='your-64-char-hex-key'                ║\n"
+                        "║                                                                      ║\n"
+                        "║  2. YAML configuration:                                              ║\n"
+                        "║     data:                                                            ║\n"
+                        "║       encryption_key: 'your-64-char-hex-key'                         ║\n"
+                        "║                                                                      ║\n"
+                        "║  Generate a new key with:                                            ║\n"
+                        "║     python -c \"import os; print(os.urandom(32).hex())\"               ║\n"
+                        "║                                                                      ║\n"
+                        "║  Or disable encryption:                                              ║\n"
+                        "║     data:                                                            ║\n"
+                        "║       cache_encrypt: false                                           ║\n"
+                        "╚══════════════════════════════════════════════════════════════════════╝"
                     )
                 cache_encryption_key = self._encryption_key
                 logger.info(f"🔒 {self.hparams.cache_images.upper()} cache encryption enabled")
@@ -323,12 +348,21 @@ class YOLODataModule(L.LightningDataModule):
                 encryption_key=cache_encryption_key,
                 cache_suffix=cache_suffix,
                 refresh=self.hparams.cache_refresh,
+                sync=self.hparams.cache_sync,
             )
 
         # Get data fraction for sampling
         data_fraction = self.hparams.data_fraction
         if data_fraction < 1.0:
             logger.info(f"Using {data_fraction*100:.1f}% of data (stratified by class)")
+
+        # Cache-only mode check
+        cache_only = self.hparams.cache_only
+        if cache_only and image_cache is None:
+            raise ValueError(
+                "cache_only=True requires cache_images to be 'ram' or 'disk'. "
+                "Set --data.cache_images=disk --data.cache_only=true"
+            )
 
         if stage == "fit" or stage is None:
             # Create base dataset based on format
@@ -344,6 +378,7 @@ class YOLODataModule(L.LightningDataModule):
                     image_cache=image_cache,
                     data_fraction=data_fraction,
                     cache_workers=self.hparams.cache_workers,
+                    cache_only=cache_only,
                 )
             else:
                 base_train_dataset = CocoDetectionWrapper(
@@ -355,6 +390,7 @@ class YOLODataModule(L.LightningDataModule):
                     image_cache=image_cache,
                     data_fraction=data_fraction,
                     cache_workers=self.hparams.cache_workers,
+                    cache_only=cache_only,
                 )
 
             # Create post-mosaic transforms (applied after multi-image augmentation)
@@ -593,12 +629,24 @@ class CocoDetectionWrapper(CocoDetection):
         image_cache: Optional[Any] = None,
         data_fraction: float = 1.0,
         cache_workers: Optional[int] = None,
+        cache_only: bool = False,
     ):
-        super().__init__(root, annFile)
-        self._transforms = transforms
-        self.image_size = image_size
+        self._cache_only = cache_only
         self._image_cache = image_cache
         self._cache_workers = cache_workers
+        self._transforms = transforms
+        self.image_size = image_size
+        self.root = root  # Store root for cache-only mode
+
+        # In cache-only mode, load image paths and annotations from cache metadata
+        if cache_only:
+            if image_cache is None:
+                raise ValueError("cache_only=True requires image_cache to be provided")
+            self._setup_from_cache()
+            return
+
+        # Normal mode: initialize from COCO annotations
+        super().__init__(root, annFile)
 
         # Build category_id to 0-indexed class mapping from COCO categories
         # This handles both standard COCO (1-indexed) and custom datasets
@@ -804,6 +852,168 @@ class CocoDetectionWrapper(CocoDetection):
         img_np = np.asarray(img).copy()
         self._image_cache.put(idx, img_np, orig_size=orig_size)
 
+    def _setup_from_cache(self) -> None:
+        """
+        Setup dataset from cache metadata (cache-only mode).
+
+        In cache-only mode, image paths and annotations are loaded from the cache
+        metadata instead of scanning the filesystem. This enables training
+        on machines where only the cache is available, not the original images.
+
+        Raises:
+            ValueError: If cache metadata doesn't contain required information.
+        """
+        from yolo.utils.progress import spinner, console
+
+        # Initialize cache in read-only mode
+        dataset_root = Path(self.root)
+
+        with spinner("Loading cache metadata (COCO format)..."):
+            # Try to find existing cache
+            cache_dir = self._image_cache._build_cache_dir(dataset_root)
+            if not cache_dir.exists():
+                raise ValueError(
+                    f"Cache directory not found: {cache_dir}. "
+                    f"Create the cache first with: yolo cache-create"
+                )
+
+            # Open cache in read-only mode
+            self._image_cache._cache_dir_path = cache_dir
+            self._image_cache._db_path = cache_dir / "cache.lmdb"
+            self._image_cache._open_db(readonly=True)
+            self._image_cache._load_cached_indices()
+
+        # Get metadata
+        metadata = self._image_cache.get_metadata()
+        if metadata is None:
+            raise ValueError(
+                "\n"
+                "╔══════════════════════════════════════════════════════════════════════╗\n"
+                "║  CACHE METADATA NOT FOUND                                            ║\n"
+                "╠══════════════════════════════════════════════════════════════════════╣\n"
+                "║  Could not read cache metadata. Possible causes:                     ║\n"
+                "║                                                                      ║\n"
+                "║  1. ENCRYPTED CACHE with cache_encrypt: false                        ║\n"
+                "║     If the cache was created with encryption, you must set:          ║\n"
+                "║       data:                                                          ║\n"
+                "║         cache_encrypt: true                                          ║\n"
+                "║     AND provide the encryption key via:                              ║\n"
+                "║       export YOLO_ENCRYPTION_KEY='your-64-char-hex-key'              ║\n"
+                "║                                                                      ║\n"
+                "║  2. CORRUPTED CACHE                                                  ║\n"
+                "║     Delete the cache directory and recreate it                       ║\n"
+                "║                                                                      ║\n"
+                "║  3. OLD CACHE FORMAT (pre cache-only support)                        ║\n"
+                "║     Recreate the cache with: yolo cache-create                       ║\n"
+                "╚══════════════════════════════════════════════════════════════════════╝"
+            )
+
+        # Verify format matches
+        cache_format = metadata.get("format")
+        if cache_format is not None and cache_format != "coco":
+            raise ValueError(
+                "\n"
+                "╔══════════════════════════════════════════════════════════════════════╗\n"
+                "║  FORMAT MISMATCH                                                     ║\n"
+                "╠══════════════════════════════════════════════════════════════════════╣\n"
+                f"║  YAML config:  format: coco                                          ║\n"
+                f"║  Cache format: {cache_format:<54}║\n"
+                "║                                                                      ║\n"
+                "║  The cache was created with a different format than your config.     ║\n"
+                "║                                                                      ║\n"
+                "║  Solutions:                                                          ║\n"
+                f"║  1. Change YAML to: format: {cache_format:<42}║\n"
+                "║  2. Recreate cache with: yolo cache-create --data.format coco        ║\n"
+                "╚══════════════════════════════════════════════════════════════════════╝"
+            )
+
+        # Get image paths from metadata
+        image_paths = metadata.get("image_paths")
+        if image_paths is None:
+            raise ValueError(
+                "Cache does not contain image paths. "
+                "This cache was created before cache-only mode was supported. "
+                "Recreate the cache with: yolo cache-create"
+            )
+
+        # In cache-only mode for COCO format, we need annotations from metadata
+        # Create a minimal COCO-like structure from cached data
+        coco_annotations = metadata.get("coco_annotations")
+        if coco_annotations is None:
+            raise ValueError(
+                "\n"
+                "╔══════════════════════════════════════════════════════════════════════╗\n"
+                "║  CACHE MISSING COCO ANNOTATIONS                                      ║\n"
+                "╠══════════════════════════════════════════════════════════════════════╣\n"
+                "║  The cache does not contain COCO annotations required for            ║\n"
+                "║  cache-only mode with format: coco                                   ║\n"
+                "║                                                                      ║\n"
+                "║  Possible causes:                                                    ║\n"
+                "║  1. Cache created with format: yolo (change YAML to format: yolo)    ║\n"
+                "║  2. Cache created before cache-only mode was supported               ║\n"
+                "║                                                                      ║\n"
+                "║  Solution: Recreate cache with:                                      ║\n"
+                "║    yolo cache-create --data.format coco ...                          ║\n"
+                "╚══════════════════════════════════════════════════════════════════════╝"
+            )
+
+        # Build the ids list (image indices)
+        self.ids = list(range(len(image_paths)))
+        self._image_paths = [Path(p) for p in image_paths]
+        self._cached_annotations = coco_annotations.get("annotations", {})
+        self._cached_categories = coco_annotations.get("categories", [])
+
+        # Build category_id to 0-indexed class mapping
+        sorted_cats = sorted(self._cached_categories, key=lambda x: x["id"])
+        self._category_id_to_idx = {cat["id"]: idx for idx, cat in enumerate(sorted_cats)}
+        self.target_transform = YOLOTargetTransform(self._category_id_to_idx)
+
+        # Use default image loader (not used in cache-only mode, but needed for interface)
+        self._image_loader = DefaultImageLoader()
+
+        num_images = len(self.ids)
+        cached_images = len(self._image_cache._cached_indices)
+        encrypted = metadata.get("encrypted", False)
+
+        # Verify encryption setting matches
+        if encrypted and not self._image_cache._encrypt_cache:
+            raise ValueError(
+                "\n"
+                "╔══════════════════════════════════════════════════════════════════════╗\n"
+                "║  ENCRYPTION MISMATCH                                                 ║\n"
+                "╠══════════════════════════════════════════════════════════════════════╣\n"
+                "║  The cache is ENCRYPTED but cache_encrypt: false in your config.    ║\n"
+                "║                                                                      ║\n"
+                "║  To use this cache, you must:                                        ║\n"
+                "║                                                                      ║\n"
+                "║  1. Set in YAML config:                                              ║\n"
+                "║       data:                                                          ║\n"
+                "║         cache_encrypt: true                                          ║\n"
+                "║                                                                      ║\n"
+                "║  2. Provide the encryption key used during cache creation:           ║\n"
+                "║       export YOLO_ENCRYPTION_KEY='your-64-char-hex-key'              ║\n"
+                "║                                                                      ║\n"
+                "║  Without the correct key, encrypted images cannot be read.          ║\n"
+                "╚══════════════════════════════════════════════════════════════════════╝"
+            )
+
+        console.print(f"[green]✓[/green] Cache-only mode (COCO): {num_images:,} images from cache")
+        if encrypted:
+            console.print(f"   [dim]Encrypted cache - decryption in memory only[/dim]")
+
+        # Verify cache is complete
+        if cached_images < num_images:
+            logger.warning(
+                f"Cache is incomplete: {cached_images:,}/{num_images:,} images cached. "
+                f"Some images may fail to load."
+            )
+
+        self._image_cache._initialized = True
+
+    def __len__(self) -> int:
+        """Return number of images in dataset."""
+        return len(self.ids)
+
     @staticmethod
     def _resize_for_cache(img: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
         """Resize image for caching using letterbox (preserves aspect ratio)."""
@@ -833,9 +1043,16 @@ class CocoDetectionWrapper(CocoDetection):
         Returns:
             Tuple of (image, orig_size) where orig_size is the original image size
             before cache resize (width, height), or None if not resized.
+
+        Raises:
+            RuntimeError: If cache_only=True and image is not in cache.
         """
-        path = self.coco.loadImgs(id)[0]["file_name"]
-        full_path = Path(os.path.join(self.root, path))
+        # Get image path - handle cache-only mode
+        if self._cache_only:
+            image_path = self._image_paths[index]
+        else:
+            path = self.coco.loadImgs(id)[0]["file_name"]
+            image_path = Path(os.path.join(self.root, path))
 
         # Try cache first
         if self._image_cache is not None:
@@ -844,8 +1061,15 @@ class CocoDetectionWrapper(CocoDetection):
                 img_arr, orig_size = cached
                 return Image.fromarray(img_arr), orig_size
 
+        # In cache-only mode, raise error if image not in cache
+        if self._cache_only:
+            raise RuntimeError(
+                f"Cache-only mode: Image not found in cache (index={index}, path={image_path}). "
+                f"The cache may be incomplete. Recreate with: yolo cache-create"
+            )
+
         # Load from disk
-        img = self._image_loader(str(full_path))
+        img = self._image_loader(str(image_path))
 
         # Store in cache for next time (no resize when loading from disk directly)
         if self._image_cache is not None:
@@ -862,8 +1086,12 @@ class CocoDetectionWrapper(CocoDetection):
         # Load image using custom loader (with cache)
         image, orig_size = self._load_image(id, index)
 
-        # Get annotations
-        target = self._load_target(id)
+        # Get annotations - handle cache-only mode
+        if self._cache_only:
+            # In cache-only mode, load from cached annotations
+            target = self._cached_annotations.get(str(index), [])
+        else:
+            target = self._load_target(id)
 
         # Convert COCO annotations to YOLO format
         # Use orig_size for bbox transform if image was resized in cache
@@ -955,6 +1183,8 @@ class YOLOFormatDataset(Dataset):
         data_fraction: Fraction of data to use (default: 1.0). Uses stratified
             sampling by primary class to maintain class distribution.
         cache_workers: Number of parallel workers for caching (None = all CPU threads)
+        cache_only: Load images only from cache, without requiring original files.
+            Requires a complete cache with stored image paths.
     """
 
     def __init__(
@@ -969,6 +1199,7 @@ class YOLOFormatDataset(Dataset):
         image_cache: Optional[Any] = None,
         data_fraction: float = 1.0,
         cache_workers: Optional[int] = None,
+        cache_only: bool = False,
     ):
         self.images_dir = Path(images_dir)
         self.labels_dir = Path(labels_dir)
@@ -978,6 +1209,14 @@ class YOLOFormatDataset(Dataset):
         self._labels_cache: Optional[List[Dict[str, Any]]] = None
         self._image_cache = image_cache
         self._cache_workers = cache_workers
+        self._cache_only = cache_only
+
+        # In cache-only mode, load image paths from cache metadata
+        if cache_only:
+            if image_cache is None:
+                raise ValueError("cache_only=True requires image_cache to be provided")
+            self._setup_from_cache()
+            return
 
         # Find all images
         self.image_files = []
@@ -1130,6 +1369,138 @@ class YOLOFormatDataset(Dataset):
             img = self._resize_for_cache(img, target_size)
         img_np = np.asarray(img).copy()
         self._image_cache.put(idx, img_np, orig_size=orig_size)
+
+    def _setup_from_cache(self) -> None:
+        """
+        Setup dataset from cache metadata (cache-only mode).
+
+        In cache-only mode, image paths and labels are loaded from the cache
+        metadata instead of scanning the filesystem. This enables training
+        on machines where only the cache is available, not the original images.
+
+        Raises:
+            ValueError: If cache metadata doesn't contain required information.
+        """
+        from yolo.utils.progress import spinner, console
+
+        # Initialize cache in read-only mode
+        dataset_root = self.images_dir.parent
+        cache_suffix = f"{self.image_size[0]}x{self.image_size[1]}_f1.0"  # Default suffix
+
+        with spinner("Loading cache metadata (YOLO format)..."):
+            # Try to find existing cache
+            cache_dir = self._image_cache._build_cache_dir(dataset_root)
+            if not cache_dir.exists():
+                raise ValueError(
+                    f"Cache directory not found: {cache_dir}. "
+                    f"Create the cache first with: yolo cache-create"
+                )
+
+            # Open cache in read-only mode
+            self._image_cache._cache_dir_path = cache_dir
+            self._image_cache._db_path = cache_dir / "cache.lmdb"
+            self._image_cache._open_db(readonly=True)
+            self._image_cache._load_cached_indices()
+
+        # Get metadata
+        metadata = self._image_cache.get_metadata()
+        if metadata is None:
+            raise ValueError(
+                "\n"
+                "╔══════════════════════════════════════════════════════════════════════╗\n"
+                "║  CACHE METADATA NOT FOUND                                            ║\n"
+                "╠══════════════════════════════════════════════════════════════════════╣\n"
+                "║  Could not read cache metadata. Possible causes:                     ║\n"
+                "║                                                                      ║\n"
+                "║  1. ENCRYPTED CACHE with cache_encrypt: false                        ║\n"
+                "║     If the cache was created with encryption, you must set:          ║\n"
+                "║       data:                                                          ║\n"
+                "║         cache_encrypt: true                                          ║\n"
+                "║     AND provide the encryption key via:                              ║\n"
+                "║       export YOLO_ENCRYPTION_KEY='your-64-char-hex-key'              ║\n"
+                "║                                                                      ║\n"
+                "║  2. CORRUPTED CACHE                                                  ║\n"
+                "║     Delete the cache directory and recreate it                       ║\n"
+                "║                                                                      ║\n"
+                "║  3. OLD CACHE FORMAT (pre cache-only support)                        ║\n"
+                "║     Recreate the cache with: yolo cache-create                       ║\n"
+                "╚══════════════════════════════════════════════════════════════════════╝"
+            )
+
+        # Verify format matches
+        cache_format = metadata.get("format")
+        if cache_format is not None and cache_format != "yolo":
+            raise ValueError(
+                "\n"
+                "╔══════════════════════════════════════════════════════════════════════╗\n"
+                "║  FORMAT MISMATCH                                                     ║\n"
+                "╠══════════════════════════════════════════════════════════════════════╣\n"
+                f"║  YAML config:  format: yolo                                          ║\n"
+                f"║  Cache format: {cache_format:<54}║\n"
+                "║                                                                      ║\n"
+                "║  The cache was created with a different format than your config.     ║\n"
+                "║                                                                      ║\n"
+                "║  Solutions:                                                          ║\n"
+                f"║  1. Change YAML to: format: {cache_format:<42}║\n"
+                "║  2. Recreate cache with: yolo cache-create --data.format yolo        ║\n"
+                "╚══════════════════════════════════════════════════════════════════════╝"
+            )
+
+        # Get image paths from metadata
+        image_paths = metadata.get("image_paths")
+        if image_paths is None:
+            raise ValueError(
+                "Cache does not contain image paths. "
+                "This cache was created before cache-only mode was supported. "
+                "Recreate the cache with: yolo cache-create"
+            )
+
+        # Convert paths back to Path objects
+        self.image_files = [Path(p) for p in image_paths]
+
+        # Get labels from metadata (if available)
+        labels = metadata.get("labels")
+        if labels is not None:
+            self._labels_cache = labels
+
+        num_images = len(self.image_files)
+        cached_images = len(self._image_cache._cached_indices)
+        encrypted = metadata.get("encrypted", False)
+
+        # Verify encryption setting matches
+        if encrypted and not self._image_cache._encrypt_cache:
+            raise ValueError(
+                "\n"
+                "╔══════════════════════════════════════════════════════════════════════╗\n"
+                "║  ENCRYPTION MISMATCH                                                 ║\n"
+                "╠══════════════════════════════════════════════════════════════════════╣\n"
+                "║  The cache is ENCRYPTED but cache_encrypt: false in your config.    ║\n"
+                "║                                                                      ║\n"
+                "║  To use this cache, you must:                                        ║\n"
+                "║                                                                      ║\n"
+                "║  1. Set in YAML config:                                              ║\n"
+                "║       data:                                                          ║\n"
+                "║         cache_encrypt: true                                          ║\n"
+                "║                                                                      ║\n"
+                "║  2. Provide the encryption key used during cache creation:           ║\n"
+                "║       export YOLO_ENCRYPTION_KEY='your-64-char-hex-key'              ║\n"
+                "║                                                                      ║\n"
+                "║  Without the correct key, encrypted images cannot be read.          ║\n"
+                "╚══════════════════════════════════════════════════════════════════════╝"
+            )
+
+        console.print(f"[green]✓[/green] Cache-only mode (YOLO): {num_images:,} images from cache")
+        if encrypted:
+            console.print(f"   [dim]Encrypted cache - decryption in memory only[/dim]")
+
+        # Verify cache is complete
+        if cached_images < num_images:
+            logger.warning(
+                f"Cache is incomplete: {cached_images:,}/{num_images:,} images cached. "
+                f"Some images may fail to load."
+            )
+
+        self._image_cache._initialized = True
 
     @staticmethod
     def _resize_for_cache(img: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
@@ -1291,6 +1662,9 @@ class YOLOFormatDataset(Dataset):
         Returns:
             Tuple of (image, orig_size) where orig_size is the original image size
             before cache resize (width, height), or None if not resized.
+
+        Raises:
+            RuntimeError: If cache_only=True and image is not in cache.
         """
         image_path = self.image_files[index]
 
@@ -1300,6 +1674,13 @@ class YOLOFormatDataset(Dataset):
             if cached is not None:
                 img_arr, orig_size = cached
                 return Image.fromarray(img_arr), orig_size
+
+        # In cache-only mode, raise error if image not in cache
+        if self._cache_only:
+            raise RuntimeError(
+                f"Cache-only mode: Image not found in cache (index={index}, path={image_path}). "
+                f"The cache may be incomplete. Recreate with: yolo cache-create"
+            )
 
         # Load from disk
         img = self._image_loader(str(image_path))

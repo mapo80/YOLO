@@ -29,6 +29,10 @@ This repository extends the official YOLOv7[^1], YOLOv9[^2], and YOLO-RD[^3] imp
 - [Advanced Training Techniques](#advanced-training-techniques)
   - [Data Augmentation](#data-augmentation)
   - [Dataset Caching](#dataset-caching)
+    - [Cache Management CLI](#cache-management-cli)
+    - [Use Cases and Scenarios](#use-cases-and-scenarios)
+    - [Encrypted Images vs Encrypted Cache](#encrypted-images-vs-encrypted-cache)
+    - [Common Errors and Troubleshooting](#common-errors-and-troubleshooting)
   - [Data Fraction](#data-fraction-quick-testing)
   - [EMA](#exponential-moving-average-ema)
   - [Optimizer Selection](#optimizer-selection)
@@ -1915,6 +1919,7 @@ data:
   cache_workers: null          # Parallel workers for caching (null = all CPU threads)
   cache_refresh: false         # Force cache regeneration
   cache_encrypt: false         # Encrypt cached values (requires encryption_key)
+  cache_sync: false            # Enable LMDB fsync (disable for external volumes on macOS)
   encryption_key: null         # AES-256 key for encrypted images/cache
 ```
 
@@ -2099,6 +2104,489 @@ Settings that do **not** invalidate the cache:
 - `batch_size` - only affects DataLoader batching
 - `num_workers` - only affects parallel loading
 - `cache_max_memory_gb` - only affects RAM mode limits
+
+#### Cache Management CLI
+
+The CLI provides commands to create, export, import, and inspect dataset caches. This enables secure transfer of preprocessed datasets to remote machines without exposing original images.
+
+**Commands Overview:**
+
+| Command | Description |
+|---------|-------------|
+| `cache-create` | Create LMDB cache from dataset (without training) |
+| `cache-export` | Export cache directory to compressed archive |
+| `cache-import` | Import cache from archive to target directory |
+| `cache-info` | Display cache statistics and metadata |
+
+##### Creating Cache Without Training
+
+Create a cache independently from training, useful for preparing datasets before deployment:
+
+```shell
+# Create cache from config file
+yolo cache-create --config config.yaml --size 640
+
+# Create encrypted cache
+export YOLO_ENCRYPTION_KEY=$(python -c "import os; print(os.urandom(32).hex())")
+yolo cache-create --config config.yaml --size 640 --encrypt
+
+# Create cache with direct parameters
+yolo cache-create \
+    --data.root /path/to/dataset \
+    --data.format yolo \
+    --data.train_images train/images \
+    --data.train_labels train/labels \
+    --size 640 \
+    --encrypt
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--config` | str | - | Path to YAML config file |
+| `--data.root` | str | required | Dataset root directory |
+| `--data.format` | str | coco | Dataset format (coco/yolo) |
+| `--size` | int | 640 | Image size for cache |
+| `--encrypt` | flag | false | Encrypt cache with AES-256 |
+| `--workers` | int | auto | Parallel workers for caching |
+| `--split` | str | both | Which split to cache (train/val/both) |
+| `--sync` | flag | false | Enable fsync for crash safety (disable for external volumes) |
+
+##### Exporting Cache to Archive
+
+Create a compressed archive of the cache for transfer:
+
+```shell
+# Export cache to tar.gz
+yolo cache-export \
+    --cache-dir dataset/.yolo_cache_640x640_f1.0 \
+    --output cache_archive.tar.gz
+
+# Export without compression (faster, larger file)
+yolo cache-export \
+    --cache-dir dataset/.yolo_cache_640x640_f1.0 \
+    --output cache_archive.tar \
+    --compression none
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--cache-dir` | str | required | Path to cache directory |
+| `--output`, `-o` | str | auto | Output archive path |
+| `--compression` | str | gzip | Compression type (gzip/none) |
+
+##### Importing Cache from Archive
+
+Extract cache archive to target directory:
+
+```shell
+# Import cache
+yolo cache-import \
+    --archive cache_archive.tar.gz \
+    --output /data/dataset/
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--archive` | str | required | Path to cache archive |
+| `--output`, `-o` | str | . | Target directory |
+
+##### Inspecting Cache
+
+Display cache statistics and metadata:
+
+```shell
+yolo cache-info --cache-dir dataset/.yolo_cache_640x640_f1.0
+```
+
+**Example output:**
+
+```
+Cache Information
+─────────────────────────────────────
+  Path:        dataset/.yolo_cache_640x640_f1.0
+  Version:     3.2.0
+  Images:      117,266
+  Size:        24.3 GB
+  Encrypted:   Yes
+  Target Size: 640x640
+  Created:     2024-01-15 10:30:00
+─────────────────────────────────────
+```
+
+##### Cache-Only Training Mode
+
+Train using only the cache without requiring original images on disk. This is essential when deploying to remote machines where you only transfer the encrypted cache.
+
+```shell
+# Training with cache-only mode (no original images needed)
+export YOLO_ENCRYPTION_KEY="your-64-char-hex-key"
+yolo fit --config config.yaml \
+    --data.cache_images disk \
+    --data.cache_only true
+```
+
+**When to use `cache_only`:**
+- Training on remote VM where only the cache was transferred
+- Protecting original images from exposure
+- Reducing storage requirements on training machines
+
+**Requirements for cache-only mode:**
+- Cache must be complete (all images cached)
+- Cache must contain label metadata
+- Error raised if any image is not found in cache
+
+##### Complete Workflow: Secure Remote Training
+
+This workflow demonstrates how to train on a remote VM without ever exposing original images:
+
+```shell
+# ============================================
+# LOCAL MACHINE (has original images)
+# ============================================
+
+# 1. Generate encryption key (save this securely!)
+export YOLO_ENCRYPTION_KEY=$(python -c "import os; print(os.urandom(32).hex())")
+echo "Save this key: $YOLO_ENCRYPTION_KEY"
+
+# 2. Create encrypted cache
+yolo cache-create --config config.yaml --size 640 --encrypt
+# Creates: dataset/.yolo_cache_640x640_f1.0/ (encrypted LMDB)
+
+# 3. Export to archive
+yolo cache-export \
+    --cache-dir dataset/.yolo_cache_640x640_f1.0 \
+    --output cache_640_encrypted.tar.gz
+
+# 4. Transfer to remote (cache is encrypted, safe to transfer)
+scp cache_640_encrypted.tar.gz user@remote:/data/
+
+# ============================================
+# REMOTE VM (no original images)
+# ============================================
+
+# 5. Import cache
+yolo cache-import \
+    --archive cache_640_encrypted.tar.gz \
+    --output /data/dataset/
+
+# 6. Train using only cache (decryption happens only in memory)
+export YOLO_ENCRYPTION_KEY="your-64-char-hex-key"
+yolo fit --config config.yaml \
+    --data.cache_images disk \
+    --data.cache_only true
+
+# Original images are NEVER on the remote VM
+# Encrypted data on disk is NEVER decrypted to files
+# Decryption happens ONLY in memory during training
+```
+
+##### Security Model
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     SECURITY ARCHITECTURE                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  LOCAL MACHINE                    REMOTE VM                     │
+│  ─────────────                    ─────────                     │
+│  ┌─────────────┐                  ┌─────────────┐              │
+│  │  Original   │                  │  Encrypted  │              │
+│  │   Images    │ ──(encrypt)──►  │   Cache     │              │
+│  └─────────────┘                  │  (on disk)  │              │
+│                                   └──────┬──────┘              │
+│                                          │                      │
+│                                          ▼                      │
+│                                   ┌─────────────┐              │
+│                                   │  Decrypted  │              │
+│                                   │   Images    │              │
+│                                   │ (in memory) │              │
+│                                   └──────┬──────┘              │
+│                                          │                      │
+│                                          ▼                      │
+│                                   ┌─────────────┐              │
+│                                   │   Training  │              │
+│                                   │   Process   │              │
+│                                   └─────────────┘              │
+│                                                                 │
+│  ✓ Original images never leave local machine                   │
+│  ✓ Cache on remote is always encrypted on disk                 │
+│  ✓ Decryption only in RAM during data loading                  │
+│  ✓ Key required only at training time                          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+##### Encryption Key Management
+
+The encryption key is a 256-bit (32 bytes) AES key encoded as 64 hexadecimal characters.
+
+**Setting the key:**
+
+```shell
+# Option 1: Environment variable (recommended)
+export YOLO_ENCRYPTION_KEY="your-64-char-hex-key"
+
+# Option 2: YAML configuration (less secure - key in file)
+data:
+  encryption_key: "your-64-char-hex-key"
+```
+
+**Generating a secure key:**
+
+```python
+import os
+key = os.urandom(32).hex()
+print(f"YOLO_ENCRYPTION_KEY={key}")
+```
+
+**Security best practices:**
+- Never commit keys to version control
+- Use environment variables or secret management systems
+- Rotate keys periodically for long-running projects
+- Keep a secure backup of keys (loss = data loss)
+
+##### Use Cases and Scenarios
+
+###### Scenario 1: Training on Sensitive Data (Medical, Financial, Personal)
+
+When working with sensitive datasets that cannot be stored unencrypted:
+
+```shell
+# Setup: Generate and save key securely
+export YOLO_ENCRYPTION_KEY=$(python -c "import os; print(os.urandom(32).hex())")
+echo "$YOLO_ENCRYPTION_KEY" > ~/.yolo_key  # Save securely!
+chmod 600 ~/.yolo_key
+
+# Create encrypted cache (images remain safe on disk)
+yolo cache-create --config config.yaml --size 640 --encrypt
+
+# Train (decryption happens only in RAM)
+yolo fit --config config.yaml \
+    --data.cache_images disk \
+    --data.cache_encrypt true
+```
+
+**Benefits:**
+- Original images can be deleted after cache creation
+- Disk never contains unencrypted image data
+- Safe for shared/cloud storage
+
+###### Scenario 2: Pre-Encrypted Dataset (Images Already Encrypted)
+
+When your source images are already encrypted (e.g., from a secure data provider):
+
+```yaml
+# config.yaml
+data:
+  root: /data/encrypted-images  # Contains .enc files
+  image_loader:
+    class_path: yolo.data.encrypted_loader.EncryptedImageLoader
+  cache_images: ram              # Cache decrypted images in RAM
+  cache_resize_images: true      # Reduce memory footprint
+```
+
+```shell
+export YOLO_ENCRYPTION_KEY="key-from-data-provider"
+yolo fit --config config.yaml
+```
+
+**Flow:**
+1. Encrypted images (.enc) loaded from disk
+2. Decrypted in memory by EncryptedImageLoader
+3. Cached in RAM (no encryption needed - RAM is volatile)
+
+###### Scenario 3: Secure Remote Training (Cloud/VM)
+
+Train on AWS/GCP/Azure without exposing original images:
+
+```shell
+# === LOCAL (trusted machine with original images) ===
+export YOLO_ENCRYPTION_KEY=$(python -c "import os; print(os.urandom(32).hex())")
+
+# Create and export encrypted cache
+yolo cache-create --config config.yaml --size 640 --encrypt
+yolo cache-export --cache-dir dataset/.yolo_cache_640x640_f1.0 -o cache.tar.gz
+
+# Upload to cloud storage
+aws s3 cp cache.tar.gz s3://my-bucket/
+
+# === REMOTE VM ===
+# Download and import
+aws s3 cp s3://my-bucket/cache.tar.gz .
+yolo cache-import --archive cache.tar.gz --output /data/
+
+# Train with cache-only (no original images needed!)
+export YOLO_ENCRYPTION_KEY="same-key-from-local"
+yolo fit --config config.yaml \
+    --data.cache_images disk \
+    --data.cache_only true \
+    --data.cache_encrypt true
+```
+
+###### Scenario 4: Multi-User Shared Dataset
+
+Multiple users training on the same encrypted dataset:
+
+```shell
+# Admin creates encrypted cache once
+yolo cache-create --config config.yaml --size 640 --encrypt
+
+# Share the encryption key securely (e.g., via secret manager)
+# Each user sets their environment variable
+export YOLO_ENCRYPTION_KEY="shared-team-key"
+
+# All users can train using the same cache
+yolo fit --config config.yaml \
+    --data.cache_images disk \
+    --data.cache_encrypt true
+```
+
+##### Encrypted Images vs Encrypted Cache
+
+| Feature | Encrypted Images (.enc) | Encrypted Cache |
+|---------|------------------------|-----------------|
+| **What's encrypted** | Source image files | LMDB cache values |
+| **File extension** | `.enc` | Standard LMDB |
+| **Encryption point** | Before training | During cache creation |
+| **Requires** | `EncryptedImageLoader` | `cache_encrypt: true` |
+| **Use case** | Data provider encrypts | You encrypt for security |
+| **Key setting** | `YOLO_ENCRYPTION_KEY` | `YOLO_ENCRYPTION_KEY` |
+| **Decryption** | On load | On cache read |
+
+**Can be combined:** Use `EncryptedImageLoader` with encrypted source images, then cache them with `cache_encrypt: true` for double protection.
+
+##### Common Errors and Troubleshooting
+
+###### Error: "ENCRYPTION MISMATCH"
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║  ENCRYPTION MISMATCH                                                 ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  The cache is ENCRYPTED but cache_encrypt: false in your config.    ║
+╚══════════════════════════════════════════════════════════════════════╝
+```
+
+**Cause:** Cache was created with `--encrypt` but YAML has `cache_encrypt: false`.
+
+**Solution:**
+```yaml
+data:
+  cache_encrypt: true  # Must match how cache was created
+```
+```shell
+export YOLO_ENCRYPTION_KEY="your-key"
+```
+
+###### Error: "Image not found in cache"
+
+When using encrypted cache without the key:
+
+**Cause:** Key not set or incorrect key.
+
+**Solution:**
+```shell
+# Verify key is set
+echo $YOLO_ENCRYPTION_KEY
+
+# Set correct key
+export YOLO_ENCRYPTION_KEY="correct-64-char-hex-key"
+```
+
+###### Error: "FORMAT MISMATCH"
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║  FORMAT MISMATCH                                                     ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  YAML config:  format: coco                                          ║
+║  Cache format: yolo                                                  ║
+╚══════════════════════════════════════════════════════════════════════╝
+```
+
+**Cause:** Cache was created with different format than YAML config.
+
+**Solution:** Match YAML format to how cache was created:
+```yaml
+data:
+  format: yolo  # or coco - must match cache creation
+```
+
+###### Error: "Encryption key must be 64 hex characters"
+
+**Cause:** Invalid key format.
+
+**Solution:** Generate proper key:
+```python
+import os
+print(os.urandom(32).hex())  # Produces exactly 64 hex chars
+```
+
+##### Quick Reference: YAML Parameters
+
+```yaml
+data:
+  # === Source Image Encryption ===
+  image_loader:
+    class_path: yolo.data.encrypted_loader.EncryptedImageLoader
+    init_args:
+      use_opencv: true
+
+  # === Cache Encryption ===
+  cache_images: disk        # Must be 'disk' for encryption
+  cache_encrypt: true       # Encrypt cache values
+  cache_only: true          # Use cache without original images
+
+  # === Key (prefer env var) ===
+  # encryption_key: "64-char-hex"  # Only if env var not used
+```
+
+```shell
+# Preferred: Set key via environment variable
+export YOLO_ENCRYPTION_KEY="your-64-char-hex-key"
+```
+
+##### LMDB Sync Option
+
+By default, LMDB filesystem sync (`fsync`) is **disabled** for cache creation. This ensures compatibility with external volumes on macOS which may return `mdb_env_sync: Permission denied`.
+
+**Default behavior (sync disabled):**
+- Works on all volumes including external drives (USB, network mounts)
+- Faster cache creation
+- If system crashes during creation, cache may be incomplete (just delete and recreate)
+
+**Enable sync for crash safety:**
+
+```shell
+# Enable fsync for internal drives where crash safety is important
+yolo cache-create --data.root dataset/ --data.format yolo --size 640 --sync
+```
+
+| Flag | Behavior | Use Case |
+|------|----------|----------|
+| (default) | `sync=False` | External volumes, faster creation |
+| `--sync` | `sync=True` | Internal drives, crash safety important |
+
+**Via YAML (for training):**
+
+```yaml
+data:
+  cache_images: disk
+  cache_sync: true  # Enable fsync during training cache creation
+```
+
+```shell
+# Or via CLI during training
+yolo fit --config config.yaml --data.cache_sync=true
+```
+
+**Note:** Disabling sync is safe for cache data because it's derived from original images and can always be regenerated.
 
 ### Data Fraction (Quick Testing)
 

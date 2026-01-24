@@ -208,6 +208,7 @@ class ImageCache:
         encryption_key: Optional[str] = None,
         cache_suffix: Optional[str] = None,
         refresh: bool = False,
+        sync: bool = False,
     ):
         """
         Initialize image cache.
@@ -220,6 +221,7 @@ class ImageCache:
             encryption_key: Hex-encoded AES-256 key for encrypting cached values.
             cache_suffix: Optional suffix for cache folder (e.g., "640x640_f0.1").
             refresh: Force cache regeneration (delete existing cache).
+            sync: Enable LMDB fsync for crash safety. Default False for external volume compatibility.
         """
         self.mode = mode
         self.cache_dir = Path(cache_dir) if cache_dir else None
@@ -227,6 +229,7 @@ class ImageCache:
         self.target_size = target_size
         self.cache_suffix = cache_suffix
         self._refresh = refresh
+        self._sync = sync
         self._enabled = mode != "none"
 
         # LMDB environment
@@ -453,6 +456,8 @@ class ImageCache:
             readahead=self.mode == "disk",  # Disk mode benefits from readahead
             meminit=False,  # Don't zero-init for performance
             max_dbs=0,
+            sync=self._sync,  # Disable with sync=False for external volumes (macOS)
+            metasync=self._sync,  # Disable with sync=False for external volumes
         )
 
         # RAM mode: pre-fault pages into memory
@@ -474,10 +479,27 @@ class ImageCache:
         except Exception as e:
             logger.debug(f"Failed to pre-fault pages: {e}")
 
-    def _save_metadata(self, paths: List[Path]) -> None:
-        """Save cache metadata."""
+    def _save_metadata(
+        self,
+        paths: List[Path],
+        labels: Optional[List[Dict]] = None,
+        coco_annotations: Optional[Dict] = None,
+    ) -> None:
+        """
+        Save cache metadata including image paths for cache-only mode.
+
+        Args:
+            paths: List of image paths.
+            labels: Optional list of label dictionaries for YOLO format cache-only mode.
+            coco_annotations: Optional COCO annotations dict for COCO format cache-only mode.
+                Should contain 'annotations' (dict mapping index to annotation list)
+                and 'categories' (list of category dicts).
+        """
         if self._env is None:
             return
+
+        # Store paths as strings for portability
+        paths_list = [str(p) for p in paths]
 
         meta = {
             "version": self.CACHE_VERSION,
@@ -486,7 +508,16 @@ class ImageCache:
             "paths_hash": self._compute_paths_hash(paths),
             "target_size": self.target_size,
             "encrypted": self._encrypt_cache,
+            "image_paths": paths_list,  # Store paths for cache-only mode
         }
+
+        # Store labels if provided (for YOLO format cache-only mode)
+        if labels is not None:
+            meta["labels"] = labels
+
+        # Store COCO annotations if provided (for COCO format cache-only mode)
+        if coco_annotations is not None:
+            meta["coco_annotations"] = coco_annotations
 
         with self._env.begin(write=True) as txn:
             txn.put(b"__metadata__", pickle.dumps(meta))
@@ -510,7 +541,13 @@ class ImageCache:
     def finalize(self) -> None:
         """Finalize cache after all images have been written."""
         if self._env is not None:
-            self._env.sync()
+            # Attempt sync for data consistency if enabled
+            # Ignore errors on external volumes (macOS) - cache is derived data
+            if self._sync:
+                try:
+                    self._env.sync()
+                except Exception as e:
+                    logger.debug(f"LMDB sync skipped (safe for cache data): {e}")
 
             # Re-open as readonly for all modes (safer for concurrent reads)
             self._env.close()
@@ -525,6 +562,140 @@ class ImageCache:
     def cache_path(self) -> Optional[Path]:
         """Get the cache directory path."""
         return self._cache_dir_path
+
+    def get_metadata(self) -> Optional[Dict[str, Any]]:
+        """
+        Get cache metadata including image paths and labels.
+
+        This is useful for cache-only mode where the original images
+        are not available and all data must come from the cache.
+
+        Returns:
+            Dictionary containing:
+            - version: Cache format version
+            - num_images: Number of cached images
+            - image_paths: List of original image paths (strings)
+            - labels: List of label dictionaries (if stored)
+            - target_size: Image size tuple or None
+            - encrypted: Whether cache is encrypted
+            Or None if cache is not initialized.
+        """
+        if self._env is None:
+            return None
+
+        try:
+            with self._env.begin() as txn:
+                meta_data = txn.get(b"__metadata__")
+                if meta_data is None:
+                    return None
+                return pickle.loads(meta_data)
+        except Exception as e:
+            logger.debug(f"Failed to read cache metadata: {e}")
+            return None
+
+    def get_image_paths(self) -> Optional[List[str]]:
+        """
+        Get list of image paths stored in cache metadata.
+
+        This enables cache-only mode where images are loaded
+        from cache without needing the original files.
+
+        Returns:
+            List of image path strings, or None if not available.
+        """
+        meta = self.get_metadata()
+        if meta is None:
+            return None
+        return meta.get("image_paths")
+
+    def get_labels(self) -> Optional[List[Dict]]:
+        """
+        Get list of labels stored in cache metadata.
+
+        This enables cache-only mode where labels are loaded
+        from cache without needing the original label files.
+
+        Returns:
+            List of label dictionaries, or None if not available.
+        """
+        meta = self.get_metadata()
+        if meta is None:
+            return None
+        return meta.get("labels")
+
+    def save_labels(self, labels: List[Dict]) -> None:
+        """
+        Save labels to cache metadata for YOLO format cache-only mode.
+
+        Args:
+            labels: List of label dictionaries to store.
+        """
+        if self._env is None:
+            return
+
+        meta = self.get_metadata() or {}
+        meta["labels"] = labels
+
+        with self._env.begin(write=True) as txn:
+            txn.put(b"__metadata__", pickle.dumps(meta))
+
+    def save_coco_annotations(self, coco_annotations: Dict) -> None:
+        """
+        Save COCO annotations to cache metadata for COCO format cache-only mode.
+
+        Args:
+            coco_annotations: Dictionary containing:
+                - 'annotations': Dict mapping image index to annotation list
+                - 'categories': List of category dictionaries
+        """
+        if self._env is None:
+            return
+
+        meta = self.get_metadata() or {}
+        meta["coco_annotations"] = coco_annotations
+
+        with self._env.begin(write=True) as txn:
+            txn.put(b"__metadata__", pickle.dumps(meta))
+
+    def save_format(self, data_format: str) -> None:
+        """
+        Save dataset format to cache metadata.
+
+        Args:
+            data_format: Dataset format ('coco' or 'yolo').
+        """
+        if self._env is None:
+            return
+
+        meta = self.get_metadata() or {}
+        meta["format"] = data_format
+
+        with self._env.begin(write=True) as txn:
+            txn.put(b"__metadata__", pickle.dumps(meta))
+
+    def get_format(self) -> Optional[str]:
+        """
+        Get dataset format stored in cache metadata.
+
+        Returns:
+            Format string ('coco' or 'yolo'), or None if not available.
+        """
+        meta = self.get_metadata()
+        if meta is None:
+            return None
+        return meta.get("format")
+
+    def get_coco_annotations(self) -> Optional[Dict]:
+        """
+        Get COCO annotations stored in cache metadata.
+
+        Returns:
+            Dictionary with 'annotations' and 'categories', or None if not available.
+        """
+        meta = self.get_metadata()
+        if meta is None:
+            return None
+        return meta.get("coco_annotations")
 
     def __getstate__(self) -> Dict[str, Any]:
         """Prepare state for pickling (spawn multiprocessing)."""

@@ -24,6 +24,12 @@ Usage:
     # Export
     python -m yolo.cli export --checkpoint best.ckpt --format onnx
     python -m yolo.cli export --checkpoint best.ckpt --format onnx --half --simplify
+
+    # Cache Management
+    python -m yolo.cli cache-create --config config.yaml --size 640 --encrypt
+    python -m yolo.cli cache-export --cache-dir dataset/.yolo_cache_640x640_f1.0 -o cache.tar.gz
+    python -m yolo.cli cache-import --archive cache.tar.gz --output /data/dataset/
+    python -m yolo.cli cache-info --cache-dir dataset/.yolo_cache_640x640_f1.0
 """
 
 import argparse
@@ -68,6 +74,12 @@ Examples:
 
   # QAT fine-tuning for INT8 quantization
   yolo qat-finetune --checkpoint best.ckpt --config config.yaml --epochs 20
+
+  # Cache management
+  yolo cache-create --config config.yaml --size 640 --encrypt
+  yolo cache-export --cache-dir dataset/.yolo_cache_640x640_f1.0 -o cache.tar.gz
+  yolo cache-import --archive cache.tar.gz --output /data/dataset/
+  yolo cache-info --cache-dir dataset/.yolo_cache_640x640_f1.0
         """,
     )
     subparsers = parser.add_subparsers(title="commands", metavar="<command>")
@@ -78,6 +90,12 @@ Examples:
     subparsers.add_parser("export", help="Export a checkpoint to ONNX/TFLite/SavedModel.")
     subparsers.add_parser("validate", help="Standalone validation with detection metrics and optional benchmark.")
     subparsers.add_parser("qat-finetune", help="Quantization-Aware Training fine-tuning for INT8 deployment.")
+
+    # Cache management commands
+    subparsers.add_parser("cache-create", help="Create dataset cache without training.")
+    subparsers.add_parser("cache-export", help="Export cache to compressed archive.")
+    subparsers.add_parser("cache-import", help="Import cache from archive.")
+    subparsers.add_parser("cache-info", help="Show cache statistics and metadata.")
 
     return parser
 
@@ -1097,6 +1115,341 @@ Examples:
     return 0
 
 
+# =============================================================================
+# Cache Management Commands
+# =============================================================================
+
+
+def cache_create_main(argv: Optional[List[str]] = None) -> int:
+    """Create dataset cache without running training."""
+    parser = argparse.ArgumentParser(
+        description="Create LMDB cache from dataset without training",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Create cache from config file
+  yolo cache-create --config config.yaml --size 640
+
+  # Create encrypted cache
+  export YOLO_ENCRYPTION_KEY=$(python -c "import os; print(os.urandom(32).hex())")
+  yolo cache-create --config config.yaml --size 640 --encrypt
+
+  # Create cache with direct parameters (YOLO format)
+  yolo cache-create --data.root /path/to/dataset --data.format yolo \\
+      --data.train_images train/images --data.train_labels train/labels \\
+      --size 640 --encrypt
+
+  # Create cache with direct parameters (COCO format)
+  yolo cache-create --data.root /path/to/dataset --data.format coco \\
+      --data.train_images train --data.train_ann annotations/train.json \\
+      --size 640
+        """,
+    )
+    parser.add_argument(
+        "--config", "-c",
+        type=str,
+        default=None,
+        help="Path to YAML config file with data settings",
+    )
+    parser.add_argument(
+        "--data.root",
+        type=str,
+        dest="data_root",
+        default=None,
+        help="Dataset root directory",
+    )
+    parser.add_argument(
+        "--data.format",
+        type=str,
+        dest="data_format",
+        default="coco",
+        choices=["coco", "yolo"],
+        help="Dataset format (default: coco)",
+    )
+    parser.add_argument(
+        "--data.train_images",
+        type=str,
+        dest="train_images",
+        default=None,
+        help="Path to training images (relative to data.root)",
+    )
+    parser.add_argument(
+        "--data.val_images",
+        type=str,
+        dest="val_images",
+        default=None,
+        help="Path to validation images (relative to data.root)",
+    )
+    parser.add_argument(
+        "--data.train_labels",
+        type=str,
+        dest="train_labels",
+        default=None,
+        help="Path to training labels for YOLO format",
+    )
+    parser.add_argument(
+        "--data.val_labels",
+        type=str,
+        dest="val_labels",
+        default=None,
+        help="Path to validation labels for YOLO format",
+    )
+    parser.add_argument(
+        "--data.train_ann",
+        type=str,
+        dest="train_ann",
+        default=None,
+        help="Path to training annotations for COCO format",
+    )
+    parser.add_argument(
+        "--data.val_ann",
+        type=str,
+        dest="val_ann",
+        default=None,
+        help="Path to validation annotations for COCO format",
+    )
+    parser.add_argument(
+        "--size",
+        type=int,
+        default=640,
+        help="Image size for cache (default: 640)",
+    )
+    parser.add_argument(
+        "--encrypt",
+        action="store_true",
+        help="Encrypt cache with AES-256 (requires YOLO_ENCRYPTION_KEY env var)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers (default: auto)",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="both",
+        choices=["train", "val", "both"],
+        help="Which split to cache (default: both)",
+    )
+    parser.add_argument(
+        "--data.fraction",
+        type=float,
+        dest="data_fraction",
+        default=1.0,
+        help="Fraction of data to cache (default: 1.0)",
+    )
+    parser.add_argument(
+        "--output-dir", "-o",
+        type=str,
+        default=None,
+        help="Directory where cache will be created (default: data.root). "
+             "Useful when dataset is on a slow/external volume.",
+    )
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        help="Enable LMDB fsync for crash safety. Default: disabled for external volume compatibility.",
+    )
+
+    try:
+        args = parser.parse_args(sys.argv[2:] if argv is None else argv)
+    except SystemExit as exc:
+        return _coerce_system_exit_code(exc)
+
+    # Load config if provided
+    data_root = args.data_root
+    data_format = args.data_format
+    train_images = args.train_images
+    val_images = args.val_images
+    train_labels = args.train_labels
+    val_labels = args.val_labels
+    train_ann = args.train_ann
+    val_ann = args.val_ann
+    data_fraction = args.data_fraction
+
+    if args.config:
+        from omegaconf import OmegaConf
+        config = OmegaConf.load(args.config)
+        if hasattr(config, "data"):
+            data_cfg = config.data
+            data_root = data_root or getattr(data_cfg, "root", None)
+            data_format = getattr(data_cfg, "format", data_format)
+            train_images = train_images or getattr(data_cfg, "train_images", None)
+            val_images = val_images or getattr(data_cfg, "val_images", None)
+            train_labels = train_labels or getattr(data_cfg, "train_labels", None)
+            val_labels = val_labels or getattr(data_cfg, "val_labels", None)
+            train_ann = train_ann or getattr(data_cfg, "train_ann", None)
+            val_ann = val_ann or getattr(data_cfg, "val_ann", None)
+            data_fraction = getattr(data_cfg, "data_fraction", data_fraction)
+
+    # Validate required parameters
+    if data_root is None:
+        print("Error: --data.root is required (or provide --config with data.root)", file=sys.stderr)
+        return 1
+
+    # Import and create cache
+    from yolo.tools.cache_archive import create_cache
+
+    try:
+        cache_path = create_cache(
+            data_root=Path(data_root),
+            data_format=data_format,
+            image_size=(args.size, args.size),
+            train_images=train_images,
+            val_images=val_images,
+            train_labels=train_labels,
+            val_labels=val_labels,
+            train_ann=train_ann,
+            val_ann=val_ann,
+            encrypt=args.encrypt,
+            workers=args.workers,
+            split=args.split,
+            data_fraction=data_fraction,
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+            sync=args.sync,
+        )
+        print(f"\nCache created successfully: {cache_path}")
+        return 0
+    except Exception as e:
+        print(f"Error creating cache: {e}", file=sys.stderr)
+        return 1
+
+
+def cache_export_main(argv: Optional[List[str]] = None) -> int:
+    """Export cache directory to compressed archive."""
+    parser = argparse.ArgumentParser(
+        description="Export cache to compressed archive for transfer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Export cache to tar.gz
+  yolo cache-export --cache-dir dataset/.yolo_cache_640x640_f1.0 --output cache.tar.gz
+
+  # Export without compression (faster, larger file)
+  yolo cache-export --cache-dir dataset/.yolo_cache_640x640_f1.0 \\
+      --output cache.tar --compression none
+        """,
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        required=True,
+        help="Path to cache directory (.yolo_cache_*)",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default=None,
+        help="Output archive path (default: {cache_dir}.tar.gz)",
+    )
+    parser.add_argument(
+        "--compression",
+        type=str,
+        default="gzip",
+        choices=["gzip", "none"],
+        help="Compression type (default: gzip)",
+    )
+
+    try:
+        args = parser.parse_args(sys.argv[2:] if argv is None else argv)
+    except SystemExit as exc:
+        return _coerce_system_exit_code(exc)
+
+    from yolo.tools.cache_archive import export_cache
+
+    try:
+        output_path = export_cache(
+            cache_dir=Path(args.cache_dir),
+            output_path=Path(args.output) if args.output else None,
+            compression=args.compression,
+        )
+        print(f"\nCache exported to: {output_path}")
+        return 0
+    except Exception as e:
+        print(f"Error exporting cache: {e}", file=sys.stderr)
+        return 1
+
+
+def cache_import_main(argv: Optional[List[str]] = None) -> int:
+    """Import cache from archive to target directory."""
+    parser = argparse.ArgumentParser(
+        description="Import cache from archive",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Import cache to current directory
+  yolo cache-import --archive cache.tar.gz
+
+  # Import cache to specific directory
+  yolo cache-import --archive cache.tar.gz --output /data/dataset/
+        """,
+    )
+    parser.add_argument(
+        "--archive",
+        type=str,
+        required=True,
+        help="Path to cache archive (.tar.gz or .tar)",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default=None,
+        help="Target directory for extraction (default: current directory)",
+    )
+
+    try:
+        args = parser.parse_args(sys.argv[2:] if argv is None else argv)
+    except SystemExit as exc:
+        return _coerce_system_exit_code(exc)
+
+    from yolo.tools.cache_archive import import_cache
+
+    try:
+        cache_path = import_cache(
+            archive_path=Path(args.archive),
+            output_dir=Path(args.output) if args.output else None,
+        )
+        print(f"\nCache imported to: {cache_path}")
+        return 0
+    except Exception as e:
+        print(f"Error importing cache: {e}", file=sys.stderr)
+        return 1
+
+
+def cache_info_main(argv: Optional[List[str]] = None) -> int:
+    """Display cache statistics and metadata."""
+    parser = argparse.ArgumentParser(
+        description="Show cache statistics and metadata",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Show cache info
+  yolo cache-info --cache-dir dataset/.yolo_cache_640x640_f1.0
+        """,
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        required=True,
+        help="Path to cache directory (.yolo_cache_*)",
+    )
+
+    try:
+        args = parser.parse_args(sys.argv[2:] if argv is None else argv)
+    except SystemExit as exc:
+        return _coerce_system_exit_code(exc)
+
+    from yolo.tools.cache_archive import print_cache_info
+
+    try:
+        print_cache_info(Path(args.cache_dir))
+        return 0
+    except Exception as e:
+        print(f"Error reading cache info: {e}", file=sys.stderr)
+        return 1
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """Main entry point - dispatch to training (LightningCLI) or utility subcommands."""
     args = sys.argv[1:] if argv is None else argv
@@ -1116,12 +1469,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     if cmd == "qat-finetune":
         return qat_finetune_main(args[1:])
 
+    # Cache management commands
+    if cmd == "cache-create":
+        return cache_create_main(args[1:])
+    if cmd == "cache-export":
+        return cache_export_main(args[1:])
+    if cmd == "cache-import":
+        return cache_import_main(args[1:])
+    if cmd == "cache-info":
+        return cache_info_main(args[1:])
+
     # Fall back to training CLI (supports global options before the subcommand).
     if cmd.startswith("-"):
         return train_main(args)
 
     # If it's not a known command, provide a clearer error than LightningCLI.
-    known = {"fit", "test", "predict", "export", "validate", "qat-finetune"}
+    known = {"fit", "test", "predict", "export", "validate", "qat-finetune",
+             "cache-create", "cache-export", "cache-import", "cache-info"}
     if cmd not in known:
         print(f"Error: Unknown command: {cmd}\n", file=sys.stderr)
         _root_parser().print_help()
