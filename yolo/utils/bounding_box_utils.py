@@ -151,26 +151,33 @@ class BoxMatcher:
 
     def get_valid_matrix(self, target_bbox: Tensor):
         """
-        Get a boolean mask that indicates whether each target bounding box overlaps with each anchor
-        and is able to correctly predict it with the available reg_max value.
+        Get a boolean mask that indicates whether each anchor center is inside
+        the target bounding box.
+
+        This determines which anchors are valid candidates for matching with each target.
+        The reg_max constraint is intentionally NOT applied here - it should only be used
+        in the DFL loss computation, not for anchor-target matching. This allows the matcher
+        to correctly handle boxes of any size, including full-image boxes.
 
         Args:
-            target_bbox [batch x targets x 4]: The bounding box of each target.
+            target_bbox [batch x targets x 4]: The bounding box of each target in xyxy format.
+
         Returns:
-            [batch x targets x anchors]: A boolean tensor indicates if target bounding box overlaps
-            with the anchors, and the anchor is able to predict the target.
+            [batch x targets x anchors]: A boolean tensor where True indicates the anchor
+            center is inside the target bounding box.
         """
+        # Extract bbox coordinates: [batch, targets, 1, coord]
         x_min, y_min, x_max, y_max = target_bbox[:, :, None].unbind(3)
-        anchors = self.vec2box.anchor_grid[None, None]  # add a axis at first, second dimension
+
+        # Get anchor grid coordinates: [1, 1, anchors, 2]
+        anchors = self.vec2box.anchor_grid[None, None]
         anchors_x, anchors_y = anchors.unbind(dim=3)
-        x_min_dist, x_max_dist = anchors_x - x_min, x_max - anchors_x
-        y_min_dist, y_max_dist = anchors_y - y_min, y_max - anchors_y
-        targets_dist = torch.stack((x_min_dist, y_min_dist, x_max_dist, y_max_dist), dim=-1)
-        targets_dist /= self.vec2box.scaler[None, None, :, None]  # (1, 1, anchors, 1)
-        min_reg_dist, max_reg_dist = targets_dist.amin(dim=-1), targets_dist.amax(dim=-1)
-        target_on_anchor = min_reg_dist >= 0
-        target_in_reg_max = max_reg_dist <= self.reg_max - 1.01
-        return target_on_anchor & target_in_reg_max
+
+        # Check if anchor center is inside the target bbox
+        inside_x = (anchors_x >= x_min) & (anchors_x <= x_max)
+        inside_y = (anchors_y >= y_min) & (anchors_y <= y_max)
+
+        return inside_x & inside_y
 
     def get_cls_matrix(self, predict_cls: Tensor, target_cls: Tensor) -> Tensor:
         """

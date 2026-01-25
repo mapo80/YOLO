@@ -97,6 +97,9 @@ Examples:
     subparsers.add_parser("cache-import", help="Import cache from archive.")
     subparsers.add_parser("cache-info", help="Show cache statistics and metadata.")
 
+    # Debug/visualization commands
+    subparsers.add_parser("visualize-aug", help="Visualize augmentations with bounding boxes for debugging.")
+
     return parser
 
 
@@ -1555,6 +1558,84 @@ Examples:
         return 1
 
 
+def visualize_aug_main(argv: Optional[List[str]] = None) -> int:
+    """Visualize augmentations on dataset samples with bounding boxes."""
+    parser = argparse.ArgumentParser(
+        description="Visualize augmentations with bounding boxes for debugging",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Visualize 10 random samples
+  python -m yolo visualize-aug --config config.yaml --num-samples 10
+
+  # Visualize specific indices with original comparison
+  python -m yolo visualize-aug --config config.yaml --indices 0,5,10 --show-original
+
+  # Create grid visualization
+  python -m yolo visualize-aug --config config.yaml --grid --num-samples 16
+
+  # Reproducible output with seed
+  python -m yolo visualize-aug --config config.yaml --num-samples 10 --seed 42
+        """,
+    )
+    parser.add_argument(
+        "--config", "-c",
+        type=str,
+        required=True,
+        help="Path to training config YAML",
+    )
+    parser.add_argument(
+        "--num-samples", "-n",
+        type=int,
+        default=10,
+        help="Number of random samples to visualize (default: 10)",
+    )
+    parser.add_argument(
+        "--indices",
+        type=str,
+        default=None,
+        help="Specific indices to visualize (comma-separated, e.g., '0,5,10')",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default=None,
+        help="Output directory for images (default: <dataset_root>/aug_viz/)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility",
+    )
+    parser.add_argument(
+        "--show-original",
+        action="store_true",
+        help="Also save original (non-augmented) images for comparison",
+    )
+    parser.add_argument(
+        "--grid",
+        action="store_true",
+        help="Create grid image instead of separate files",
+    )
+
+    try:
+        args = parser.parse_args(sys.argv[2:] if argv is None else argv)
+    except SystemExit as exc:
+        return _coerce_system_exit_code(exc)
+
+    from yolo.tools.augmentation_viz import visualize_augmentations
+    return visualize_augmentations(
+        config_path=args.config,
+        num_samples=args.num_samples,
+        indices=args.indices,
+        output_dir=args.output,
+        seed=args.seed,
+        show_original=args.show_original,
+        create_grid=args.grid,
+    )
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """Main entry point - dispatch to training (LightningCLI) or utility subcommands."""
     args = sys.argv[1:] if argv is None else argv
@@ -1584,13 +1665,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     if cmd == "cache-info":
         return cache_info_main(args[1:])
 
+    # Debug/visualization commands
+    if cmd == "visualize-aug":
+        return visualize_aug_main(args[1:])
+
     # Fall back to training CLI (supports global options before the subcommand).
     if cmd.startswith("-"):
         return train_main(args)
 
     # If it's not a known command, provide a clearer error than LightningCLI.
     known = {"fit", "test", "predict", "export", "validate", "qat-finetune",
-             "cache-create", "cache-export", "cache-import", "cache-info"}
+             "cache-create", "cache-export", "cache-import", "cache-info", "visualize-aug"}
     if cmd not in known:
         print(f"Error: Unknown command: {cmd}\n", file=sys.stderr)
         _root_parser().print_help()

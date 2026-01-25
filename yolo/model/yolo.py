@@ -21,9 +21,10 @@ class YOLO(nn.Module):
                    parameters, and any other relevant configuration details.
     """
 
-    def __init__(self, model_cfg: ModelConfig, class_num: int = 80):
+    def __init__(self, model_cfg: ModelConfig, class_num: int = 80, img_size: int = 640):
         super(YOLO, self).__init__()
         self.num_classes = class_num
+        self.img_size = img_size
         self.layer_map = get_layer_map()  # Get the map Dict[str: Module]
         self.model: List[YOLOLayer] = nn.ModuleList()
         self.reg_max = getattr(model_cfg.anchor, "reg_max", 16)
@@ -53,6 +54,7 @@ class YOLO(nn.Module):
                         layer_args["in_channel"] = output_dim[source]
                     layer_args["num_classes"] = self.num_classes
                     layer_args["reg_max"] = self.reg_max
+                    layer_args["img_size"] = self.img_size  # For bias init per stride
 
                 # create layers
                 layer = self.create_layer(layer_type, source, layer_info, **layer_args)
@@ -163,8 +165,48 @@ class YOLO(nn.Module):
 
         self.model.load_state_dict(model_state_dict)
 
+        # Re-initialize classification head bias AFTER loading pretrained weights
+        # This is critical because pretrained weights may have different class count
+        # and the intermediate conv layers affect the output distribution
+        self._reinit_cls_head_bias()
 
-def create_model(model_cfg: ModelConfig, weight_path: Union[bool, Path] = True, class_num: int = 80) -> YOLO:
+    def _reinit_cls_head_bias(self):
+        """
+        Re-initialize classification head final layer after pretrained weight loading.
+
+        With class_neck = max(first_neck, min(num_classes*2, 128)), the intermediate
+        Conv layers have same shape as pretrained and load correctly.
+
+        Only the final Conv2d layer has shape mismatch (num_classes differs).
+        We initialize it with small weights so bias dominates initial predictions.
+
+        The Ultralytics formula: bias = log(5 / num_classes / grid_cells)
+        ensures ~5 objects per image are predicted initially.
+        """
+        import math
+        import torch.nn as nn
+        from yolo.model.module import Detection, MultiheadDetection
+
+        strides = [8, 16, 32]
+
+        for module in self.model.modules():
+            if isinstance(module, MultiheadDetection):
+                for i, head in enumerate(module.heads):
+                    if isinstance(head, Detection):
+                        stride = strides[i] if i < len(strides) else 32
+                        grid_cells = (self.img_size / stride) ** 2
+                        bias_cls = math.log(5 / self.num_classes / grid_cells)
+
+                        # Only final Conv2d layer needs init (intermediate layers load pretrained)
+                        final_conv = head.class_conv[-1]
+                        if isinstance(final_conv, nn.Conv2d):
+                            nn.init.normal_(final_conv.weight, mean=0.0, std=0.01)
+                            final_conv.bias.data.fill_(bias_cls)
+
+                        logger.info(f"  📊 Detection head {i}: bias={bias_cls:.3f} (stride={stride}, sigmoid≈{1/(1+math.exp(-bias_cls))*100:.2f}%)")
+
+
+def create_model(model_cfg: ModelConfig, weight_path: Union[bool, Path] = True, class_num: int = 80, img_size: int = 640) -> YOLO:
     """Constructs and returns a model from a Dictionary configuration file.
 
     Args:
@@ -174,7 +216,7 @@ def create_model(model_cfg: ModelConfig, weight_path: Union[bool, Path] = True, 
         YOLO: An instance of the model defined by the given configuration.
     """
     OmegaConf.set_struct(model_cfg, False)
-    model = YOLO(model_cfg, class_num)
+    model = YOLO(model_cfg, class_num, img_size=img_size)
     if weight_path:
         if weight_path == True:
             weight_path = Path("weights") / f"{model_cfg.name}.pt"

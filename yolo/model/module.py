@@ -59,7 +59,8 @@ class Concat(nn.Module):
 class Detection(nn.Module):
     """A single YOLO Detection head for detection models"""
 
-    def __init__(self, in_channels: Tuple[int], num_classes: int, *, reg_max: int = 16, use_group: bool = True):
+    def __init__(self, in_channels: Tuple[int], num_classes: int, *, reg_max: int = 16, use_group: bool = True,
+                 stride: int = 32, img_size: int = 640):
         super().__init__()
 
         groups = 4 if use_group else 1
@@ -67,8 +68,9 @@ class Detection(nn.Module):
 
         first_neck, in_channels = in_channels
         anchor_neck = max(round_up(first_neck // 4, groups), anchor_channels, reg_max)
-        # Use num_classes as intermediate channels to match official pretrained weights
-        class_neck = num_classes
+        # Use larger intermediate channels for better feature representation
+        # Original formula: max(first_neck, min(num_classes * 2, 128))
+        class_neck = max(first_neck, min(num_classes * 2, 128))
 
         self.anchor_conv = nn.Sequential(
             Conv(in_channels, anchor_neck, 3),
@@ -82,7 +84,17 @@ class Detection(nn.Module):
         self.anc2vec = Anchor2Vec(reg_max=reg_max)
 
         self.anchor_conv[-1].bias.data.fill_(1.0)
-        self.class_conv[-1].bias.data.fill_(-10)  # TODO: math.log(5 * 4 ** idx / 80 ** 3)
+
+        # Classification bias initialization - Ultralytics formula
+        # bias = log(5 / num_classes / (img_size / stride)²)
+        # This assumes ~5 objects per image, distributed across all grid cells
+        # For 13 classes, img=320, stride=8:  log(5/13/1600) = -7.6 → sigmoid ≈ 0.05%
+        # For 13 classes, img=320, stride=16: log(5/13/400)  = -6.2 → sigmoid ≈ 0.2%
+        # For 13 classes, img=320, stride=32: log(5/13/100)  = -4.9 → sigmoid ≈ 0.7%
+        import math
+        grid_cells = (img_size / stride) ** 2
+        bias_cls = math.log(5 / num_classes / grid_cells)
+        self.class_conv[-1].bias.data.fill_(bias_cls)
 
     def forward(self, x: Tensor) -> Tuple[Tensor]:
         anchor_x = self.anchor_conv(x)
@@ -116,16 +128,28 @@ class IDetection(nn.Module):
 class MultiheadDetection(nn.Module):
     """Mutlihead Detection module for Dual detect or Triple detect"""
 
-    def __init__(self, in_channels: List[int], num_classes: int, **head_kwargs):
+    # Standard strides for 3-head detection (P3, P4, P5)
+    STRIDES = [8, 16, 32]
+
+    def __init__(self, in_channels: List[int], num_classes: int, img_size: int = 640, **head_kwargs):
         super().__init__()
         DetectionHead = Detection
 
         if head_kwargs.pop("version", None) == "v7":
             DetectionHead = IDetection
 
-        self.heads = nn.ModuleList(
-            [DetectionHead((in_channels[0], in_channel), num_classes, **head_kwargs) for in_channel in in_channels]
-        )
+        # Create heads with per-stride bias initialization
+        self.heads = nn.ModuleList()
+        for i, in_channel in enumerate(in_channels):
+            stride = self.STRIDES[i] if i < len(self.STRIDES) else 32
+            head = DetectionHead(
+                (in_channels[0], in_channel),
+                num_classes,
+                stride=stride,
+                img_size=img_size,
+                **head_kwargs
+            )
+            self.heads.append(head)
 
     def forward(self, x_list: List[torch.Tensor]) -> List[torch.Tensor]:
         return [head(x) for x, head in zip(x_list, self.heads)]

@@ -38,7 +38,8 @@ class YOLOModule(L.LightningModule):
         cls_loss_weight: Weight for classification loss
         dfl_loss_weight: Weight for distribution focal loss
         weight_path: Path to pretrained weights, or True to auto-download based on model_config
-        nms_conf_threshold: NMS confidence threshold
+        nms_conf_threshold: NMS confidence threshold for inference
+        nms_val_conf_threshold: NMS confidence threshold for validation (default 0.001)
         nms_iou_threshold: NMS IoU threshold
         nms_max_detections: Maximum detections per image
     """
@@ -67,6 +68,7 @@ class YOLOModule(L.LightningModule):
         weight_path: Optional[Union[str, bool]] = None,
         # NMS
         nms_conf_threshold: float = 0.25,
+        nms_val_conf_threshold: float = 0.001,  # Lower threshold for validation to capture all predictions for mAP
         nms_iou_threshold: float = 0.65,
         nms_max_detections: int = 300,
         # Class names for metrics (None = use indices)
@@ -107,7 +109,9 @@ class YOLOModule(L.LightningModule):
 
         # Build model
         logger.info(f"🏗️  Building model: {model_config} ({num_classes} classes)")
-        self.model = YOLO(model_cfg, class_num=num_classes)
+        # Pass img_size for proper per-stride bias initialization
+        img_size_val = image_size[0] if isinstance(image_size, (list, tuple)) else image_size
+        self.model = YOLO(model_cfg, class_num=num_classes, img_size=img_size_val)
 
         # Load pretrained weights if provided
         if weight_path:
@@ -233,6 +237,14 @@ class YOLOModule(L.LightningModule):
 
         # Convert predictions to boxes
         pred_cls, pred_anc, pred_box = self._vec2box(outputs["Main"])
+
+        # DEBUG: Check raw logits and sigmoid values
+        if batch_idx == 0:
+            logits = pred_cls  # Raw logits before sigmoid
+            probs = logits.sigmoid()
+            print(f"\n[DEBUG] Logits stats: min={logits.min().item():.3f}, max={logits.max().item():.3f}, mean={logits.mean().item():.3f}")
+            print(f"[DEBUG] Probs stats:  min={probs.min().item():.6f}, max={probs.max().item():.6f}, mean={probs.mean().item():.6f}")
+            print(f"[DEBUG] Probs > 0.1: {(probs > 0.1).sum().item()}, > 0.5: {(probs > 0.5).sum().item()}")
 
         # Apply NMS
         predictions = bbox_nms(
@@ -521,7 +533,7 @@ class YOLOModule(L.LightningModule):
             max_bbox: int
 
         return NMSConfig(
-            min_confidence=self.hparams.nms_conf_threshold,
+            min_confidence=self.hparams.nms_val_conf_threshold,
             min_iou=self.hparams.nms_iou_threshold,
             max_bbox=self.hparams.nms_max_detections,
         )
