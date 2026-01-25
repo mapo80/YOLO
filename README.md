@@ -56,7 +56,7 @@ This repository extends the official YOLOv7[^1], YOLOv9[^2], and YOLO-RD[^3] imp
 The original repository focuses on model architecture and research contributions. This fork adds:
 
 - **Complete training CLI** with YAML configuration and command-line overrides
-- **Data augmentation suite** - Mosaic 4/9, MixUp, CutMix, RandomPerspective, HSV
+- **Data augmentation suite** - Mosaic 4/9, BBox Mosaic (document-optimized), MixUp, CutMix, RandomPerspective, HSV
 - **Multiple dataset formats** - COCO JSON and YOLO TXT with caching
 - **Comprehensive metrics** - Full COCO evaluation, confusion matrix, PR curves
 - **Rich monitoring** - Progress bars, eval dashboard, TensorBoard integration
@@ -83,6 +83,7 @@ All additions are built on **PyTorch Lightning** for clean, scalable training.
 | Feature | Description |
 |---------|-------------|
 | **Mosaic 4/9** | Combine 4 or 9 images into one training sample. Improves small object detection and increases effective batch diversity |
+| **BBox Mosaic** | Document-optimized mosaic: crops to bounding box, applies per-document transforms, places in 2x2 grid without clipping. Ideal for ID documents, logos, products |
 | **MixUp** | Blend two mosaic images with random weights. Regularizes the model and improves generalization |
 | **CutMix** | Cut a patch from one image and paste onto another. Combines benefits of cutout and mixup augmentation |
 | **RandomPerspective** | Apply geometric transforms: rotation, translation, scaling, shear, and perspective distortion with box adjustment |
@@ -106,6 +107,7 @@ All additions are built on **PyTorch Lightning** for clean, scalable training.
 | Feature | Description |
 |---------|-------------|
 | **Configurable NMS** | Tune confidence threshold, IoU threshold, and max detections per image to balance precision vs recall |
+| **Separate Val Threshold** | Use lower confidence threshold during validation (`nms_val_conf_threshold: 0.001`) to capture all predictions for accurate mAP calculation, while keeping higher threshold for inference |
 | **Batch Inference** | Process entire directories of images with automatic output organization and optional JSON export |
 | **Class Names** | Automatically load class names from dataset (data.yaml or COCO JSON) for human-readable predictions |
 
@@ -1756,6 +1758,162 @@ python -m yolo.cli fit --config config.yaml \
     --data.mosaic_9_prob=0.3
 ```
 
+#### BBox Mosaic (Document-Optimized)
+
+BBox Mosaic is a specialized mosaic augmentation designed for **documents, logos, products, and objects that must always appear complete** (never partially cropped).
+
+Unlike standard mosaic which can crop images at quadrant boundaries, bbox_mosaic:
+
+1. **Crops each image to its bounding box** - Extracts only the object/document
+2. **Applies individual transforms per crop** - Each document gets its own rotation, scale, HSV
+3. **Scales to fit in quadrants** - Documents are sized to fit without overlapping
+4. **Places in a 2x2 grid** - With optional position jitter for variety
+5. **Tracks bounding boxes through transforms** - Accurate labels even after rotation
+
+**When to use BBox Mosaic:**
+
+| Use Case | Why BBox Mosaic |
+|----------|-----------------|
+| **ID Documents** | Documents must be fully visible, flipped documents are invalid |
+| **Logos/Icons** | Brand assets should never be cropped |
+| **Product Images** | E-commerce products need complete visibility |
+| **Medical Images** | Complete specimen visibility is critical |
+| **Single-object datasets** | When each image contains one main object |
+
+**Configuration:**
+
+```yaml
+data:
+  # Disable standard mosaic when using bbox_mosaic
+  mosaic_prob: 0.0
+
+  # BBox Mosaic configuration (nested structure)
+  bbox_mosaic:
+    prob:        0.6      # Probability of applying (0.0 = disable, 1.0 = always)
+    degrees:     20.0     # Max rotation per document (±degrees)
+    translate:   0.05     # Translation in affine transform (fraction)
+    scale:       0.15     # Scale variation (0.85x to 1.15x)
+    shear:       2.0      # Max shear per document (±degrees)
+    perspective: 0.0      # Perspective distortion (0.0 = disable)
+    hsv_h:       0.015    # Hue variation per document
+    hsv_s:       0.4      # Saturation variation per document
+    hsv_v:       0.3      # Value/brightness variation per document
+    jitter:      0.3      # Position jitter in quadrant (0=centered, 1=full range)
+```
+
+**Parameter Details:**
+
+| Parameter | Range | Description |
+|-----------|-------|-------------|
+| `prob` | 0.0-1.0 | Probability of applying bbox_mosaic. Set to 0.0 to disable. |
+| `degrees` | 0.0-360.0 | Maximum rotation angle (±degrees). The canvas auto-expands to fit rotated images without clipping. |
+| `translate` | 0.0-1.0 | Translation as fraction of canvas size in the affine transform. |
+| `scale` | 0.0-1.0 | Scale variation range. `scale=0.15` means documents can be 0.85x to 1.15x their original size. |
+| `shear` | 0.0-90.0 | Maximum shear angle (±degrees). Adds perspective-like distortion. |
+| `perspective` | 0.0-0.01 | Perspective distortion factor. Keep at 0.0 for documents. |
+| `hsv_h` | 0.0-1.0 | Hue shift gain. Applied individually to each document. |
+| `hsv_s` | 0.0-1.0 | Saturation shift gain. Applied individually to each document. |
+| `hsv_v` | 0.0-1.0 | Value/brightness shift gain. Applied individually to each document. |
+| `jitter` | 0.0-1.0 | Position variability within quadrant. `0.0`=always centered, `0.5`=up to 50% offset, `1.0`=can touch quadrant edges. |
+
+**How Rotation Works:**
+
+Standard mosaic clips images when rotated. BBox Mosaic uses an **expanded canvas** approach:
+
+```
+Original 100x100 image rotated 20°:
+┌─────────────────────┐
+│   ┌─────────────┐   │  ← Expanded canvas (calculated from rotation formula)
+│  /│             │\  │     new_W = W·|cos(θ)| + H·|sin(θ)|
+│ / │  Original   │ \ │     new_H = W·|sin(θ)| + H·|cos(θ)|
+│/  │   Image     │  \│
+│\  │  (rotated)  │  /│  ← Document is fully visible, no clipping
+│ \ │             │ / │
+│  \│_____________│/  │
+│                     │
+└─────────────────────┘
+        ↓
+Scaled to fit quadrant (with 15% margin)
+```
+
+**Bounding Box Tracking:**
+
+BBox Mosaic tracks the 4 corners of each document through all transforms:
+
+1. Original corners: `[(0,0), (W,0), (W,H), (0,H)]`
+2. Apply transformation matrix M to corners
+3. Find min/max of transformed corners → new bounding box
+4. Scale and offset to final canvas position
+
+This ensures **tight, accurate bounding boxes** even after rotation and shear.
+
+**Example Output:**
+
+```
+┌──────────────┬──────────────┐
+│              │              │
+│   ┌────┐     │     ┌──────┐ │
+│   │Doc1│     │     │ Doc2 │ │  ← Each document is:
+│   │ 15°│     │     │ -10° │ │    - Cropped to bbox
+│   └────┘     │     └──────┘ │    - Individually rotated
+│              │              │    - HSV adjusted
+├──────────────┼──────────────┤    - Scaled to fit
+│    ┌───────┐ │ ┌────┐       │    - Positioned with jitter
+│    │ Doc3  │ │ │Doc4│       │
+│    │  5°   │ │ │-20°│       │
+│    └───────┘ │ └────┘       │
+│              │              │
+└──────────────┴──────────────┘
+        320x320 output canvas
+```
+
+**Comparison: Standard Mosaic vs BBox Mosaic:**
+
+| Feature | Standard Mosaic | BBox Mosaic |
+|---------|-----------------|-------------|
+| **Object visibility** | May be cropped at boundaries | Always fully visible |
+| **Per-image transforms** | No (global only) | Yes (individual) |
+| **Canvas size** | 2x image_size (then cropped) | 1x image_size (final) |
+| **Best for** | General detection | Documents, single objects |
+| **Rotation handling** | Can clip objects | Expanded canvas, no clipping |
+| **Background** | Original image backgrounds | Gray fill (114) |
+
+**CLI Override:**
+
+```shell
+# Enable bbox_mosaic with custom parameters
+python -m yolo fit --config config.yaml \
+    --data.mosaic_prob=0.0 \
+    --data.bbox_mosaic.prob=0.8 \
+    --data.bbox_mosaic.degrees=15.0 \
+    --data.bbox_mosaic.jitter=0.5
+
+# Disable bbox_mosaic
+python -m yolo fit --config config.yaml --data.bbox_mosaic.prob=0.0
+```
+
+**Visualization:**
+
+```shell
+# Visualize bbox_mosaic augmentations
+python -m yolo visualize-aug --config config.yaml --num-samples 10
+
+# Test with high rotation to verify no clipping
+python -m yolo visualize-aug --config config.yaml --num-samples 5 \
+    --data.bbox_mosaic.degrees=30.0
+```
+
+**Integration with close_mosaic_epochs:**
+
+BBox Mosaic respects `close_mosaic_epochs`. When enabled, bbox_mosaic is disabled for the final N epochs along with standard mosaic, mixup, and cutmix.
+
+```yaml
+data:
+  bbox_mosaic:
+    prob: 0.6
+  close_mosaic_epochs: 5  # Disable bbox_mosaic for last 5 epochs
+```
+
 #### MixUp Augmentation
 
 MixUp blends two images together with a random weight; for detection, boxes/labels from both images are kept. In this implementation, MixUp is applied only when Mosaic is selected for the sample (it blends two mosaic images).
@@ -1886,6 +2044,53 @@ python -m yolo.cli fit --config config.yaml --data.close_mosaic_epochs=0
 # Use close_mosaic for last 20 epochs
 python -m yolo.cli fit --config config.yaml --data.close_mosaic_epochs=20
 ```
+
+### Augmentation Visualization
+
+Debug augmentations visually by generating images with bounding boxes. This command uses **exactly the same data pipeline as training**, ensuring what you see matches training behavior.
+
+**Command:**
+
+```shell
+# Visualize 10 random augmented samples
+python -m yolo visualize-aug --config config.yaml --num-samples 10
+
+# Visualize specific indices with original comparison
+python -m yolo visualize-aug --config config.yaml --indices 0,5,10 --show-original
+
+# Create grid visualization (4 columns)
+python -m yolo visualize-aug --config config.yaml --grid --num-samples 16
+
+# Reproducible output with seed
+python -m yolo visualize-aug --config config.yaml --num-samples 10 --seed 42
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--config`, `-c` | str | required | Path to training config YAML |
+| `--num-samples`, `-n` | int | 10 | Number of random samples to visualize |
+| `--indices` | str | - | Specific indices (comma-separated, e.g., "0,5,10") |
+| `--output`, `-o` | str | `<dataset_root>/aug_viz/` | Output directory for images |
+| `--seed` | int | - | Random seed for reproducibility |
+| `--show-original` | flag | false | Also save original (non-augmented) images |
+| `--grid` | flag | false | Create grid image instead of separate files |
+
+**Output:**
+
+- Individual images: `<dataset_root>/aug_viz/aug_0001.jpg`, `<dataset_root>/aug_viz/aug_0005.jpg`, ...
+- With `--show-original`: also `<dataset_root>/aug_viz/orig_0001.jpg`, ...
+- With `--grid`: single `<dataset_root>/aug_viz/grid.jpg` file
+
+**Use Cases:**
+
+1. **Debug mosaic**: Verify boxes are correctly transformed after mosaic 4/9
+2. **Verify mixup**: Check that blended images have valid combined boxes
+3. **Test flip**: Confirm box coordinates flip correctly with images
+4. **Inspect augmentation pipeline**: See exactly what the model sees during training
+
+> **Note**: This command supports both YOLO and COCO dataset formats - it automatically uses the format specified in your config.
 
 ### Dataset Caching
 
@@ -2255,6 +2460,7 @@ The CLI provides commands to create, export, import, and inspect dataset caches.
 | `cache-export` | Export cache directory to compressed archive |
 | `cache-import` | Import cache from archive to target directory |
 | `cache-info` | Display cache statistics and metadata |
+| `visualize-aug` | Visualize augmentations with bounding boxes for debugging |
 
 ##### Creating Cache Without Training
 
@@ -2940,6 +3146,12 @@ model:
   model_config: v9-c
   num_classes: 80
   learning_rate: 0.01
+
+  # NMS settings
+  nms_conf_threshold: 0.25       # For inference
+  nms_val_conf_threshold: 0.001  # For validation (low to capture all predictions for mAP)
+  nms_iou_threshold: 0.65
+  nms_max_detections: 300
 
 data:
   root: data/coco

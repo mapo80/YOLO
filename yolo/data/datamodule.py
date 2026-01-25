@@ -108,8 +108,9 @@ def _worker_init_fn(worker_id: int) -> None:
     random.seed(worker_seed + worker_id)
 
 
-from yolo.data.mosaic import MosaicMixupDataset
+from yolo.data.mosaic import CenterCropWithBoxes, MosaicMixupDataset
 from yolo.data.transforms import (
+    Compose,
     LetterBox,
     YOLOTargetTransform,
     create_train_transforms,
@@ -228,6 +229,11 @@ class YOLODataModule(L.LightningDataModule):
         mixup_prob: float = 0.15,
         mixup_alpha: float = 32.0,
         cutmix_prob: float = 0.0,
+        # bbox_mosaic: specialized mosaic that crops to bounding box (ideal for documents)
+        # Each image is cropped to its bbox, transformed individually, then placed in 2x2 grid
+        # All objects remain fully visible (never cropped at quadrant boundaries)
+        # Config as nested dict: {prob, degrees, translate, scale, shear, perspective, hsv_h, hsv_s, hsv_v}
+        bbox_mosaic: Optional[Dict[str, float]] = None,
         # Single-image augmentation parameters
         hsv_h: float = 0.015,
         hsv_s: float = 0.7,
@@ -406,7 +412,8 @@ class YOLODataModule(L.LightningDataModule):
                 )
 
             # Create post-mosaic transforms (applied after multi-image augmentation)
-            post_transforms = create_train_transforms(
+            # First crop the mosaic canvas (2x or 3x) to target size, then apply other transforms
+            base_transforms = create_train_transforms(
                 image_size=image_size,
                 hsv_h=self.hparams.hsv_h,
                 hsv_s=self.hparams.hsv_s,
@@ -419,6 +426,11 @@ class YOLODataModule(L.LightningDataModule):
                 flip_lr=self.hparams.flip_lr,
                 flip_ud=self.hparams.flip_ud,
             )
+            # Prepend CenterCropWithBoxes to handle mosaic canvas cropping
+            post_transforms = Compose([
+                CenterCropWithBoxes(size=image_size),
+                base_transforms,
+            ])
 
             # Wrap with MosaicMixupDataset for multi-image augmentation
             self.train_dataset = MosaicMixupDataset(
@@ -430,6 +442,8 @@ class YOLODataModule(L.LightningDataModule):
                 mixup_alpha=self.hparams.mixup_alpha,
                 cutmix_prob=self.hparams.cutmix_prob,
                 transforms=post_transforms,
+                # bbox_mosaic: pass dict config (or None if disabled)
+                bbox_mosaic=self.hparams.bbox_mosaic,
             )
 
         if stage == "fit" or stage == "validate" or stage is None:
@@ -2078,15 +2092,27 @@ class YOLOFormatDataset(Dataset):
         Loads labels from cache if valid, otherwise parses all label files
         and saves to cache.
 
+        When a split file is used (train.txt, val.txt), creates separate cache files
+        (labels_train.cache, labels_val.cache) to avoid conflicts when train and val
+        share the same labels directory.
+
         Args:
             refresh: Force cache regeneration even if valid cache exists.
         """
         from yolo.data.cache import DatasetCache
 
-        cache = DatasetCache(self.labels_dir.parent, self.labels_dir.name)
+        # Use split-specific cache name when split file is used
+        # This fixes a bug where train and val would share the same cache
+        cache_name = self.labels_dir.name  # e.g., "labels"
+        if self._split_file:
+            split_name = Path(self._split_file).stem  # "train" or "val"
+            cache_name = f"{cache_name}_{split_name}"  # "labels_train" or "labels_val"
 
-        # Get all label files for hash computation
-        label_files = list(self.labels_dir.glob("*.txt"))
+        cache = DatasetCache(self.labels_dir.parent, cache_name)
+
+        # Get label files for THIS split (based on filtered image_files)
+        # This ensures the hash is computed only for the current split's files
+        label_files = [self.labels_dir / (p.stem + ".txt") for p in self.image_files]
 
         # Force refresh: delete existing cache
         if refresh:

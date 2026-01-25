@@ -17,6 +17,151 @@ from torchvision.transforms import v2
 from torchvision.tv_tensors import BoundingBoxes
 
 
+# =============================================================================
+# Shared Transform Helpers (used by both RandomPerspective and bbox_mosaic)
+# =============================================================================
+
+
+def apply_hsv_numpy(
+    img: np.ndarray,
+    h_gain: float = 0.0,
+    s_gain: float = 0.0,
+    v_gain: float = 0.0,
+) -> np.ndarray:
+    """
+    Apply HSV augmentation to a numpy image.
+
+    This is a shared helper used by both RandomHSV (via tensor conversion)
+    and bbox_mosaic (directly on numpy crops).
+
+    Args:
+        img: BGR or RGB numpy array (H, W, 3) in uint8
+        h_gain: Hue gain factor (0.0 to disable)
+        s_gain: Saturation gain factor (0.0 to disable)
+        v_gain: Value/brightness gain factor (0.0 to disable)
+
+    Returns:
+        Augmented image as numpy array
+    """
+    if h_gain == 0 and s_gain == 0 and v_gain == 0:
+        return img
+
+    # Random multipliers in range [1-gain, 1+gain]
+    r = np.random.uniform(-1, 1, 3) * [h_gain, s_gain, v_gain] + 1
+
+    # Convert to HSV
+    hue, sat, val = cv2.split(cv2.cvtColor(img, cv2.COLOR_RGB2HSV))
+    dtype = img.dtype
+
+    # Apply gains
+    x = np.arange(0, 256, dtype=r.dtype)
+    lut_hue = ((x * r[0]) % 180).astype(dtype)
+    lut_sat = np.clip(x * r[1], 0, 255).astype(dtype)
+    lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
+
+    im_hsv = cv2.merge(
+        (cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val))
+    )
+    return cv2.cvtColor(im_hsv, cv2.COLOR_HSV2RGB)
+
+
+def build_affine_matrix(
+    w: int,
+    h: int,
+    new_w: int,
+    new_h: int,
+    degrees: float = 0.0,
+    translate: float = 0.0,
+    scale: float = 0.0,
+    shear: float = 0.0,
+    perspective: float = 0.0,
+) -> np.ndarray:
+    """
+    Build a 3x3 homography matrix for affine/perspective augmentation.
+
+    This is a shared helper used by both RandomPerspective and bbox_mosaic.
+    All transformations are centered on the image center.
+
+    Args:
+        w, h: Original image dimensions
+        new_w, new_h: Output image dimensions
+        degrees: Max rotation degrees (+/-), 0 to disable
+        translate: Max translation as fraction of output size, 0 to disable
+        scale: Scale range (1-scale to 1+scale), 0 to disable
+        shear: Max shear degrees (+/-), 0 to disable
+        perspective: Perspective distortion factor, 0 to disable
+
+    Returns:
+        3x3 transformation matrix (np.float32)
+    """
+    # Shift origin to image center (so rotations/scales are around the center)
+    shift_to_center = np.eye(3, dtype=np.float32)
+    shift_to_center[0, 2] = -w / 2
+    shift_to_center[1, 2] = -h / 2
+
+    # Perspective (optional)
+    persp_x = 0.0
+    persp_y = 0.0
+    if perspective != 0:
+        persp_x = random.uniform(-perspective, perspective)
+        persp_y = random.uniform(-perspective, perspective)
+    persp_mat = np.eye(3, dtype=np.float32)
+    persp_mat[2, 0] = persp_x
+    persp_mat[2, 1] = persp_y
+
+    # Rotation + scale
+    angle = random.uniform(-degrees, degrees) if degrees != 0 else 0.0
+    scale_factor = random.uniform(1 - scale, 1 + scale) if scale != 0 else 1.0
+    rot_scale = np.eye(3, dtype=np.float32)
+    rot_scale[:2] = cv2.getRotationMatrix2D(angle=angle, center=(0, 0), scale=scale_factor)
+
+    # Shear (optional)
+    shear_mat = np.eye(3, dtype=np.float32)
+    if shear != 0:
+        shear_mat[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)
+        shear_mat[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)
+
+    # Translate back into output canvas coordinates
+    translate_mat = np.eye(3, dtype=np.float32)
+    translate_mat[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * new_w
+    translate_mat[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * new_h
+
+    return translate_mat @ shear_mat @ rot_scale @ persp_mat @ shift_to_center
+
+
+def apply_affine_to_image(
+    img: np.ndarray,
+    M: np.ndarray,
+    new_w: int,
+    new_h: int,
+    fill_value: int = 114,
+    use_perspective: bool = False,
+) -> np.ndarray:
+    """
+    Apply affine/perspective transformation to numpy image.
+
+    Args:
+        img: Input image (H, W, 3) numpy array
+        M: 3x3 transformation matrix
+        new_w, new_h: Output dimensions
+        fill_value: Border fill value (default: 114 gray)
+        use_perspective: If True, use warpPerspective; else warpAffine
+
+    Returns:
+        Transformed image as numpy array
+    """
+    border_value = (fill_value, fill_value, fill_value)
+
+    if use_perspective:
+        return cv2.warpPerspective(
+            img, M, dsize=(new_w, new_h), borderValue=border_value
+        )
+    else:
+        return cv2.warpAffine(
+            img, M[:2], dsize=(new_w, new_h), borderValue=border_value
+        )
+
+
 class YOLOTargetTransform:
     """
     Transform COCO annotations to YOLO format.
@@ -323,25 +468,22 @@ class RandomPerspective:
         new_h = h + self.border[1] * 2
         new_w = w + self.border[0] * 2
 
-        # Build transformation matrix
-        M = self._build_transform_matrix(w, h, new_w, new_h)
+        # Build transformation matrix using shared helper
+        M = build_affine_matrix(
+            w, h, new_w, new_h,
+            degrees=self.degrees,
+            translate=self.translate,
+            scale=self.scale,
+            shear=self.shear,
+            perspective=self.perspective,
+        )
 
-        # Apply perspective warp
-        if self.perspective != 0:
-            img_warped = cv2.warpPerspective(
-                img_np,
-                M,
-                dsize=(new_w, new_h),
-                borderValue=(self.fill_value, self.fill_value, self.fill_value),
-            )
-        else:
-            # Use affine for speed when no perspective
-            img_warped = cv2.warpAffine(
-                img_np,
-                M[:2],
-                dsize=(new_w, new_h),
-                borderValue=(self.fill_value, self.fill_value, self.fill_value),
-            )
+        # Apply transformation using shared helper
+        img_warped = apply_affine_to_image(
+            img_np, M, new_w, new_h,
+            fill_value=self.fill_value,
+            use_perspective=(self.perspective != 0),
+        )
 
         # Convert back to tensor
         image_out = torch.from_numpy(img_warped).permute(2, 0, 1).float() / 255.0
@@ -354,44 +496,6 @@ class RandomPerspective:
             target = {"boxes": boxes, "labels": labels}
 
         return image_out, target
-
-    def _build_transform_matrix(
-        self, w: int, h: int, new_w: int, new_h: int
-    ) -> np.ndarray:
-        """Build a 3x3 homography for random perspective/affine augmentation."""
-        # Shift origin to image center (so rotations/scales are around the center).
-        shift_to_center = np.eye(3, dtype=np.float32)
-        shift_to_center[0, 2] = -w / 2
-        shift_to_center[1, 2] = -h / 2
-
-        # Perspective (optional). Keep random-call order stable for reproducibility.
-        persp_x = 0.0
-        persp_y = 0.0
-        if self.perspective != 0:
-            persp_x = random.uniform(-self.perspective, self.perspective)
-            persp_y = random.uniform(-self.perspective, self.perspective)
-        perspective = np.eye(3, dtype=np.float32)
-        perspective[2, 0] = persp_x
-        perspective[2, 1] = persp_y
-
-        # Rotation + scale.
-        angle = random.uniform(-self.degrees, self.degrees)
-        scale_factor = random.uniform(1 - self.scale, 1 + self.scale)
-        rot_scale = np.eye(3, dtype=np.float32)
-        rot_scale[:2] = cv2.getRotationMatrix2D(angle=angle, center=(0, 0), scale=scale_factor)
-
-        # Shear (optional).
-        shear = np.eye(3, dtype=np.float32)
-        if self.shear != 0:
-            shear[0, 1] = math.tan(random.uniform(-self.shear, self.shear) * math.pi / 180)
-            shear[1, 0] = math.tan(random.uniform(-self.shear, self.shear) * math.pi / 180)
-
-        # Translate back into output canvas coordinates.
-        translate = np.eye(3, dtype=np.float32)
-        translate[0, 2] = random.uniform(0.5 - self.translate, 0.5 + self.translate) * new_w
-        translate[1, 2] = random.uniform(0.5 - self.translate, 0.5 + self.translate) * new_h
-
-        return translate @ shear @ rot_scale @ perspective @ shift_to_center
 
     def _transform_boxes(
         self,

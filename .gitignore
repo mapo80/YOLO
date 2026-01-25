@@ -162,7 +162,6 @@ training-experiment/*
 !training-experiment/simpsons-train.yaml
 !training-experiment/simpsons-yolo-train.yaml
 !training-experiment/TRAINING_GUIDE.md
-.ultralytics/
 
 # Lightning logs
 lightning_logs/
