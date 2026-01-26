@@ -29,6 +29,37 @@ class BCELoss(nn.Module):
         return self.bce(predicts_cls, targets_cls).sum() / cls_norm
 
 
+class VarifocalLoss(nn.Module):
+    """
+    Varifocal loss by Zhang et al. https://arxiv.org/abs/2008.13367
+
+    This is the same idea used in YOLOv9 official (utils/loss_tal*.py).
+
+    Notes:
+    - `target_scores` are soft targets (quality scores) in [0, 1].
+    - `target_labels` are hard labels in {0, 1} that indicate positives.
+    - Negatives are down-weighted by `sigmoid(pred)^gamma` to reduce dominance.
+    """
+
+    def __init__(self, alpha: float = 0.75, gamma: float = 2.0) -> None:
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(
+        self,
+        pred_logits: Tensor,
+        target_scores: Tensor,
+        target_labels: Tensor,
+    ) -> Tensor:
+        weight = (
+            self.alpha * pred_logits.sigmoid().pow(self.gamma) * (1 - target_labels)
+            + target_scores * target_labels
+        )
+        loss = F.binary_cross_entropy_with_logits(pred_logits, target_scores, reduction="none")
+        return (loss * weight).sum()
+
+
 class BoxLoss(nn.Module):
     """Box regression loss using CIoU."""
 
@@ -110,6 +141,9 @@ class YOLOLoss(nn.Module):
         cls_weight: float = 0.5,
         dfl_weight: float = 1.5,
         cls_pos_weight: float = 1.0,
+        cls_loss_type: str = "bce",
+        cls_vfl_alpha: float = 0.75,
+        cls_vfl_gamma: float = 2.0,
         matcher_topk: int = 10,
         matcher_iou_weight: float = 6.0,
         matcher_cls_weight: float = 0.5,
@@ -125,9 +159,18 @@ class YOLOLoss(nn.Module):
         self.dfl_weight = dfl_weight
 
         # Loss functions
+        self.cls_loss_type = cls_loss_type.lower()
+        if self.cls_loss_type not in {"bce", "varifocal", "vfl"}:
+            raise ValueError(
+                f"Unknown cls_loss_type={cls_loss_type!r}. Supported: bce, varifocal (vfl)."
+            )
+
         # pos_weight balances gradient between BG (many) and FG (few) samples
         # YOLOv9 official uses cls_pw=1.0 by default
-        self.cls_loss = BCELoss(pos_weight=cls_pos_weight)
+        self._bce_loss = BCELoss(pos_weight=cls_pos_weight)
+
+        # Varifocal loss (optional) is more robust under extreme BG/FG imbalance
+        self._vfl_loss = VarifocalLoss(alpha=cls_vfl_alpha, gamma=cls_vfl_gamma)
         self.dfl_loss = DFLoss(vec2box, reg_max)
         self.box_loss = BoxLoss()
 
@@ -205,7 +248,7 @@ class YOLOLoss(nn.Module):
         predicts_box = predicts_box / self.vec2box.scaler[None, :, None]
 
         # cls_norm = sum of soft target values (original YOLOv9 design)
-        cls_norm = max(targets_cls.sum(), 1)
+        cls_norm = targets_cls.sum().clamp(min=1.0)
         box_norm = targets_cls.sum(-1)[valid_masks]
 
         # DEBUG: Log soft targets stats
@@ -223,7 +266,11 @@ class YOLOLoss(nn.Module):
                   f"[DEBUG SOFT] step={self._debug_step} cls_norm={cls_norm.item():.2f} NO TARGETS")
 
         # Compute losses
-        loss_cls = self.cls_loss(predicts_cls, targets_cls, cls_norm)
+        if self.cls_loss_type in {"varifocal", "vfl"}:
+            target_labels = (targets_cls > 0).to(dtype=targets_cls.dtype)
+            loss_cls = self._vfl_loss(predicts_cls, targets_cls, target_labels) / cls_norm
+        else:
+            loss_cls = self._bce_loss(predicts_cls, targets_cls, cls_norm)
         loss_box = self.box_loss(predicts_box, targets_bbox, valid_masks, box_norm, cls_norm)
         loss_dfl = self.dfl_loss(predicts_anc, targets_bbox, valid_masks, box_norm, cls_norm)
 
@@ -246,10 +293,14 @@ class YOLOLoss(nn.Module):
             aux_targets_cls, aux_targets_bbox = self._separate_anchor(aux_align_targets)
             aux_box = aux_box / self.vec2box.scaler[None, :, None]
 
-            aux_cls_norm = max(aux_targets_cls.sum(), 1)
+            aux_cls_norm = aux_targets_cls.sum().clamp(min=1.0)
             aux_box_norm = aux_targets_cls.sum(-1)[aux_valid_masks]
 
-            aux_loss_cls = self.cls_loss(aux_cls, aux_targets_cls, aux_cls_norm)
+            if self.cls_loss_type in {"varifocal", "vfl"}:
+                aux_target_labels = (aux_targets_cls > 0).to(dtype=aux_targets_cls.dtype)
+                aux_loss_cls = self._vfl_loss(aux_cls, aux_targets_cls, aux_target_labels) / aux_cls_norm
+            else:
+                aux_loss_cls = self._bce_loss(aux_cls, aux_targets_cls, aux_cls_norm)
             aux_loss_box = self.box_loss(aux_box, aux_targets_bbox, aux_valid_masks, aux_box_norm, aux_cls_norm)
             aux_loss_dfl = self.dfl_loss(aux_anc, aux_targets_bbox, aux_valid_masks, aux_box_norm, aux_cls_norm)
 

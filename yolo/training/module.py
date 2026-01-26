@@ -36,6 +36,10 @@ class YOLOModule(L.LightningModule):
         warmup_bias_lr: Starting bias learning rate for warmup
         box_loss_weight: Weight for box regression loss
         cls_loss_weight: Weight for classification loss
+        cls_pos_weight: BCE pos_weight for cls loss (default 1.0)
+        cls_loss_type: Classification loss type ("bce" or "varifocal")
+        cls_vfl_alpha: Varifocal alpha (negatives weight)
+        cls_vfl_gamma: Varifocal gamma (negatives focus)
         dfl_loss_weight: Weight for distribution focal loss
         weight_path: Path to pretrained weights, or True to auto-download based on model_config
         nms_conf_threshold: NMS confidence threshold for inference
@@ -63,6 +67,10 @@ class YOLOModule(L.LightningModule):
         # Loss weights
         box_loss_weight: float = 7.5,
         cls_loss_weight: float = 0.5,
+        cls_pos_weight: float = 1.0,
+        cls_loss_type: str = "bce",
+        cls_vfl_alpha: float = 0.75,
+        cls_vfl_gamma: float = 2.0,
         dfl_loss_weight: float = 1.5,
         # Weights: None = from scratch, True = auto-download, str = path to weights
         weight_path: Optional[Union[str, bool]] = None,
@@ -185,6 +193,10 @@ class YOLOModule(L.LightningModule):
                 box_weight=self.hparams.box_loss_weight,
                 cls_weight=self.hparams.cls_loss_weight,
                 dfl_weight=self.hparams.dfl_loss_weight,
+                cls_pos_weight=getattr(self.hparams, "cls_pos_weight", 1.0),
+                cls_loss_type=getattr(self.hparams, "cls_loss_type", "bce"),
+                cls_vfl_alpha=getattr(self.hparams, "cls_vfl_alpha", 0.75),
+                cls_vfl_gamma=getattr(self.hparams, "cls_vfl_gamma", 2.0),
             )
 
             # Initialize detection metrics
@@ -495,11 +507,29 @@ class YOLOModule(L.LightningModule):
         if self.trainer.global_step < self._warmup_steps:
             warmup_progress = self.trainer.global_step / self._warmup_steps
 
+            # Ultralytics-style sanity clamp:
+            # warmup_bias_lr is typically 10x lr0 (e.g., 0.1 when lr0=0.01).
+            # If configs lower lr0 (e.g., 0.001) but keep warmup_bias_lr=0.1,
+            # bias updates become disproportionately large and can collapse cls logits.
+            warmup_bias_lr = float(self.hparams.warmup_bias_lr)
+            max_bias_lr = float(self.hparams.learning_rate) * 10.0
+            if max_bias_lr > 0 and warmup_bias_lr > max_bias_lr:
+                if not hasattr(self, "_warned_warmup_bias_lr"):
+                    logger.warning(
+                        "warmup_bias_lr (%.6f) is > 10x learning_rate (%.6f). "
+                        "Clamping to %.6f for stability.",
+                        warmup_bias_lr,
+                        float(self.hparams.learning_rate),
+                        max_bias_lr,
+                    )
+                    self._warned_warmup_bias_lr = True
+                warmup_bias_lr = max_bias_lr
+
             # Linear warmup for learning rate
             lr_scale = warmup_progress
             for i, pg in enumerate(optimizer.param_groups):
                 if i == 0:  # bias params
-                    pg["lr"] = self.hparams.warmup_bias_lr * (1 - warmup_progress) + \
+                    pg["lr"] = warmup_bias_lr * (1 - warmup_progress) + \
                                self.hparams.learning_rate * warmup_progress
                 else:
                     pg["lr"] = self.hparams.learning_rate * lr_scale
