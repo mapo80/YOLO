@@ -376,129 +376,120 @@ class MetricsTableCallback(Callback):
         return "\n" + "\n".join(lines)
 
 
+def _ema_lerp(start: torch.Tensor, end: torch.Tensor, weight: float) -> torch.Tensor:
+    """
+    Linear interpolation: start + (end - start) * weight
+    EXACTLY like yolo-original lerp function.
+    """
+    return start + (end - start) * weight
+
+
 class ModelEMA:
     """
-    Exponential Moving Average of model weights.
+    Exponential Moving Average - EXACT COPY of yolo-original/yolo/utils/model_utils.py EMA class.
 
-    Maintains a shadow copy of model weights that is updated with EMA at each
-    training step. The EMA model typically achieves better accuracy than the
-    final training weights.
-
-    The decay rate ramps up during warmup to avoid overwriting initial weights
-    too slowly when the model is learning rapidly.
-
-    Formula:
-        effective_decay = decay * (1 - exp(-updates / tau))
-        ema_weights = effective_decay * ema_weights + (1 - effective_decay) * model_weights
-
-    Args:
-        model: Model to track
-        decay: Base EMA decay rate (higher = slower update, more smoothing)
-        tau: Warmup steps for decay ramping (higher = longer warmup)
-        updates: Initial update count (for checkpoint resume)
-
-    Example decay progression (decay=0.9999, tau=2000):
-        updates=0    -> effective_decay=0.000
-        updates=1000 -> effective_decay=0.393
-        updates=2000 -> effective_decay=0.632
-        updates=5000 -> effective_decay=0.918
-        updates=10000 -> effective_decay=0.993
+    Key differences from previous implementations:
+    1. ema_state_dict initialized in on_validation_start (not on first update)
+    2. Uses lerp formula: model + (ema - model) * decay
+    3. batch_step_counter for gradient accumulation tracking
+    4. NO .clone() calls - yolo-original doesn't use them
     """
 
     def __init__(
         self,
-        model: torch.nn.Module,
         decay: float = 0.9999,
         tau: float = 2000.0,
-        updates: int = 0,
     ):
-        # Create deep copy of model for EMA
-        self.ema = copy.deepcopy(model).eval()
         self.decay = decay
         self.tau = tau
-        self.updates = updates
+        self.step = 0
+        self.batch_step_counter = 0
+        self.ema_state_dict: Optional[Dict[str, Any]] = None
 
-        # Disable gradients for EMA model
-        for param in self.ema.parameters():
-            param.requires_grad_(False)
+    def setup(self, model: torch.nn.Module, ema_model: torch.nn.Module, world_size: int = 1) -> None:
+        """Setup EMA - call this in on_fit_start."""
+        # Store reference to EMA model (created by callback)
+        self.ema_model = ema_model
+        # Adjust tau for world size like yolo-original
+        self.tau = self.tau / world_size
 
-    def update(self, model: torch.nn.Module) -> None:
+    def init_ema_state_dict(self, model: torch.nn.Module) -> None:
+        """Initialize ema_state_dict - called in on_validation_start like yolo-original."""
+        if self.ema_state_dict is None:
+            self.ema_state_dict = copy.deepcopy(model.state_dict())
+
+    def load_to_ema_model(self) -> None:
+        """Load ema_state_dict to ema_model - called in on_validation_start."""
+        if self.ema_state_dict is not None and self.ema_model is not None:
+            self.ema_model.load_state_dict(self.ema_state_dict)
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module, accumulate_grad_batches: int) -> None:
         """
-        Update EMA weights with current model weights.
+        Update EMA weights - EXACTLY like yolo-original on_train_batch_end.
 
-        Should be called after each optimizer step.
+        yolo-original code (line 69-76):
+            self.batch_step_counter += 1
+            if self.batch_step_counter % trainer.accumulate_grad_batches:
+                return
+            self.step += 1
+            decay_factor = self.decay * (1 - exp(-self.step / self.tau))
+            for key, param in pl_module.model.state_dict().items():
+                self.ema_state_dict[key] = lerp(param.detach(), self.ema_state_dict[key], decay_factor)
         """
-        self.updates += 1
+        self.batch_step_counter += 1
 
-        # Calculate effective decay with warmup
-        d = self.decay * (1 - math.exp(-self.updates / self.tau))
+        # Skip if not an optimizer step (gradient accumulation)
+        if self.batch_step_counter % accumulate_grad_batches:
+            return
 
-        # Get model state dict (handle DDP wrapper)
-        model_state = model.state_dict()
+        self.step += 1
+        decay_factor = self.decay * (1 - math.exp(-self.step / self.tau))
 
-        # Update EMA weights
-        with torch.no_grad():
-            for name, ema_param in self.ema.state_dict().items():
-                if name in model_state:
-                    model_param = model_state[name]
-                    # Only update float parameters (skip buffers like running_mean)
-                    if ema_param.dtype.is_floating_point:
-                        ema_param.mul_(d).add_(model_param, alpha=1 - d)
+        # Update EMA state dict - EXACTLY like yolo-original
+        # lerp(model, ema, decay) = model + (ema - model) * decay
+        if self.ema_state_dict is not None:
+            for key, param in model.state_dict().items():
+                self.ema_state_dict[key] = _ema_lerp(param.detach(), self.ema_state_dict[key], decay_factor)
 
     def state_dict(self) -> Dict[str, Any]:
         """Return state dict for checkpointing."""
         return {
-            "ema_state_dict": self.ema.state_dict(),
+            "ema_state_dict": self.ema_state_dict,
             "decay": self.decay,
             "tau": self.tau,
-            "updates": self.updates,
+            "step": self.step,
+            "batch_step_counter": self.batch_step_counter,
         }
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         """Load state from checkpoint."""
-        self.ema.load_state_dict(state_dict["ema_state_dict"])
+        self.ema_state_dict = state_dict["ema_state_dict"]
         self.decay = state_dict["decay"]
         self.tau = state_dict["tau"]
-        self.updates = state_dict["updates"]
+        self.step = state_dict["step"]
+        self.batch_step_counter = state_dict["batch_step_counter"]
+        if self.ema_model is not None and self.ema_state_dict is not None:
+            self.ema_model.load_state_dict(self.ema_state_dict)
 
 
 class EMACallback(Callback):
     """
-    Lightning callback for Exponential Moving Average of model weights.
+    Lightning callback for Exponential Moving Average - EXACT replica of yolo-original.
 
-    Maintains a shadow copy of model weights that is updated with EMA at each
-    training step. Uses EMA weights for validation and saves them to checkpoints.
+    This is a direct port of yolo-original/yolo/utils/model_utils.py EMA class
+    to work with Lightning callbacks.
 
-    Features:
-    - Updates EMA after each training batch
-    - Swaps to EMA weights for validation (typically better metrics)
-    - Automatically saves/loads EMA state with checkpoints
-    - Fully configurable decay and warmup
-    - Can be disabled without code changes
+    Key behaviors (matching yolo-original exactly):
+    1. setup(): Creates pl_module.ema as deepcopy of pl_module.model
+    2. on_validation_start(): Initializes ema_state_dict if None, loads to ema model
+    3. on_train_batch_end(): Updates ema_state_dict using lerp formula
+    4. NO weight swapping for validation - yolo-original doesn't do it either
 
     Args:
-        decay: EMA decay rate. Higher values = more smoothing.
-            Typical values: 0.9999 (default), 0.999 (faster updates)
-        tau: Warmup steps for decay ramping. The effective decay starts at 0
-            and ramps up to `decay` over approximately `tau` steps.
-        enabled: Set to False to completely disable EMA. Useful for quick
-            experimentation or when EMA is not beneficial.
-
-    Example configuration (YAML):
-        trainer:
-          callbacks:
-            - class_path: yolo.training.callbacks.EMACallback
-              init_args:
-                decay: 0.9999
-                tau: 2000
-                enabled: true
-
-    Example CLI override:
-        # Disable EMA
-        --trainer.callbacks.X.init_args.enabled=false
-
-        # Adjust decay
-        --trainer.callbacks.X.init_args.decay=0.999
+        decay: EMA decay rate (default 0.9999)
+        tau: Warmup steps for decay ramping (default 2000)
+        enabled: Set to False to disable EMA
     """
 
     def __init__(
@@ -512,39 +503,71 @@ class EMACallback(Callback):
         self.tau = tau
         self.enabled = enabled
 
-        # Runtime state
+        # Runtime state - exactly like yolo-original
         self._ema: Optional[ModelEMA] = None
-        self._original_state_dict: Optional[Dict[str, Any]] = None
+        self._ema_model: Optional[torch.nn.Module] = None
 
-    def on_fit_start(
+    def setup(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        stage: str,
+    ) -> None:
+        """
+        Setup EMA - EXACTLY like yolo-original setup().
+
+        yolo-original code:
+            pl_module.ema = deepcopy(pl_module.model)
+            self.tau /= trainer.world_size
+            for param in pl_module.ema.parameters():
+                param.requires_grad = False
+        """
+        if not self.enabled or stage != "fit":
+            return
+
+        # Skip if already setup (e.g., from checkpoint restore)
+        if self._ema is not None:
+            return
+
+        # Create EMA model exactly like yolo-original
+        self._ema_model = copy.deepcopy(pl_module.model)
+        for param in self._ema_model.parameters():
+            param.requires_grad = False
+
+        # Store reference on pl_module like yolo-original does
+        pl_module.ema = self._ema_model
+
+        # Initialize EMA tracker
+        self._ema = ModelEMA(decay=self.decay, tau=self.tau)
+        self._ema.setup(pl_module.model, self._ema_model, trainer.world_size)
+
+        logger.info(f"EMA initialized (decay={self.decay}, tau={self._ema.tau})")
+
+    def on_validation_start(
         self,
         trainer: L.Trainer,
         pl_module: L.LightningModule,
     ) -> None:
-        """Initialize EMA model at the start of training."""
-        if not self.enabled:
+        """
+        Initialize ema_state_dict and load to ema model - EXACTLY like yolo-original.
+
+        yolo-original code:
+            self.batch_step_counter = 0
+            if self.ema_state_dict is None:
+                self.ema_state_dict = deepcopy(pl_module.model.state_dict())
+            pl_module.ema.load_state_dict(self.ema_state_dict)
+        """
+        if not self.enabled or self._ema is None:
             return
 
-        # Skip if EMA was already restored from checkpoint
-        if self._ema is not None:
-            # Move EMA weights to the same device as the model
-            device = pl_module.device
-            self._ema.ema.to(device)
-            logger.info(
-                f"EMA restored from checkpoint (updates={self._ema.updates}), moved to {device}"
-            )
-            return
+        # Reset batch counter like yolo-original
+        self._ema.batch_step_counter = 0
 
-        # Initialize EMA with current model weights
-        self._ema = ModelEMA(
-            model=pl_module,
-            decay=self.decay,
-            tau=self.tau,
-            updates=0,
-        )
-        logger.info(
-            f"EMA initialized (decay={self.decay}, tau={self.tau})"
-        )
+        # Initialize ema_state_dict if needed (like yolo-original)
+        self._ema.init_ema_state_dict(pl_module.model)
+
+        # Load ema_state_dict to ema model
+        self._ema.load_to_ema_model()
 
     def on_train_batch_end(
         self,
@@ -554,39 +577,15 @@ class EMACallback(Callback):
         batch: Any,
         batch_idx: int,
     ) -> None:
-        """Update EMA weights after each training step."""
+        """
+        Update EMA weights - EXACTLY like yolo-original on_train_batch_end.
+
+        The gradient accumulation check is handled inside self._ema.update().
+        """
         if not self.enabled or self._ema is None:
             return
 
-        self._ema.update(pl_module)
-
-    def on_validation_start(
-        self,
-        trainer: L.Trainer,
-        pl_module: L.LightningModule,
-    ) -> None:
-        """Swap to EMA weights for validation."""
-        if not self.enabled or self._ema is None:
-            return
-
-        # Save original weights
-        self._original_state_dict = copy.deepcopy(pl_module.state_dict())
-
-        # Load EMA weights into model
-        pl_module.load_state_dict(self._ema.ema.state_dict())
-
-    def on_validation_end(
-        self,
-        trainer: L.Trainer,
-        pl_module: L.LightningModule,
-    ) -> None:
-        """Restore original weights after validation."""
-        if not self.enabled or self._original_state_dict is None:
-            return
-
-        # Restore original training weights
-        pl_module.load_state_dict(self._original_state_dict)
-        self._original_state_dict = None
+        self._ema.update(pl_module.model, trainer.accumulate_grad_batches)
 
     def on_save_checkpoint(
         self,
@@ -598,11 +597,7 @@ class EMACallback(Callback):
         if not self.enabled or self._ema is None:
             return
 
-        checkpoint["ema_callback"] = {
-            "ema_state": self._ema.state_dict(),
-            "decay": self.decay,
-            "tau": self.tau,
-        }
+        checkpoint["ema_callback"] = self._ema.state_dict()
 
     def on_load_checkpoint(
         self,
@@ -614,31 +609,21 @@ class EMACallback(Callback):
         if not self.enabled:
             return
 
-        if "ema_callback" not in checkpoint:
-            return
+        if "ema_callback" in checkpoint:
+            # Create EMA model if not exists
+            if self._ema_model is None:
+                self._ema_model = copy.deepcopy(pl_module.model)
+                for param in self._ema_model.parameters():
+                    param.requires_grad = False
+                pl_module.ema = self._ema_model
 
-        ema_data = checkpoint["ema_callback"]
+            # Create and restore EMA tracker
+            if self._ema is None:
+                self._ema = ModelEMA(decay=self.decay, tau=self.tau)
+                self._ema.ema_model = self._ema_model
 
-        # Initialize EMA if not yet created
-        if self._ema is None:
-            # Extract updates from checkpoint BEFORE initializing
-            saved_updates = 0
-            if "ema_state" in ema_data:
-                saved_updates = ema_data["ema_state"].get("updates", 0)
-
-            self._ema = ModelEMA(
-                model=pl_module,
-                decay=ema_data.get("decay", self.decay),
-                tau=ema_data.get("tau", self.tau),
-                updates=saved_updates,
-            )
-
-        # Load saved EMA state
-        if "ema_state" in ema_data:
-            self._ema.load_state_dict(ema_data["ema_state"])
-            logger.info(
-                f"EMA restored from checkpoint (updates={self._ema.updates})"
-            )
+            self._ema.load_state_dict(checkpoint["ema_callback"])
+            logger.info(f"EMA restored from checkpoint (step={self._ema.step})")
 
 
 class TrainingSummaryCallback(Callback):

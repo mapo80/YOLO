@@ -12,8 +12,8 @@ from torch import Tensor
 
 from yolo.model.yolo import YOLO
 from yolo.tools.dataset_preparation import prepare_weight
-from yolo.training.loss import YOLOLoss
-from yolo.utils.bounding_box_utils import Vec2Box, bbox_nms
+from yolo.mock.integration import get_yolo_loss, get_vec2box
+from yolo.utils.bounding_box_utils import bbox_nms
 from yolo.utils.logger import logger
 from yolo.utils.metrics import DetMetrics
 
@@ -169,16 +169,16 @@ class YOLOModule(L.LightningModule):
             device = self.device
             image_size = self.hparams.image_size
 
-            # Create Vec2Box converter
-            self._vec2box = Vec2Box(
+            # Create Vec2Box converter (mock or real based on env)
+            self._vec2box = get_vec2box(
                 self.model,
                 self._model_cfg.anchor,
                 image_size,
                 device
             )
 
-            # Create loss function
-            self._loss_fn = YOLOLoss(
+            # Create loss function (mock or real based on env)
+            self._loss_fn = get_yolo_loss(
                 vec2box=self._vec2box,
                 class_num=self.hparams.num_classes,
                 reg_max=self._model_cfg.anchor.reg_max,
@@ -226,7 +226,21 @@ class YOLOModule(L.LightningModule):
             lr = opt.param_groups[0]["lr"]
             self.log("lr", lr, prog_bar=True, sync_dist=True)
 
-        return loss
+        # DEBUG: Check cls head weights/gradients
+        if batch_idx == 0 and self.current_epoch % 1 == 0:
+            for name, param in self.model.named_parameters():
+                if 'class_conv.2.weight' in name and '22.heads.0' in name:
+                    grad_norm = param.grad.norm().item() if param.grad is not None else 0
+                    print(f"[DEBUG CLS] epoch={self.current_epoch} {name}: "
+                          f"weight_mean={param.data.mean().item():.6f} "
+                          f"weight_std={param.data.std().item():.6f} "
+                          f"grad_norm={grad_norm:.6f}")
+                    break
+
+        # Multiply by batch_size like yolo-original and ultralytics do.
+        # This is important for proper gradient scaling with the loss normalization.
+        batch_size = images.shape[0]
+        return loss * batch_size
 
     def validation_step(self, batch: Tuple[Tensor, List], batch_idx: int) -> None:
         """Validation step - compute predictions and update metrics."""
@@ -245,6 +259,27 @@ class YOLOModule(L.LightningModule):
             print(f"\n[DEBUG] Logits stats: min={logits.min().item():.3f}, max={logits.max().item():.3f}, mean={logits.mean().item():.3f}")
             print(f"[DEBUG] Probs stats:  min={probs.min().item():.6f}, max={probs.max().item():.6f}, mean={probs.mean().item():.6f}")
             print(f"[DEBUG] Probs > 0.1: {(probs > 0.1).sum().item()}, > 0.5: {(probs > 0.5).sum().item()}")
+
+            # DEBUG: If EMA model exists, compare EMA vs training weights on the same batch.
+            ema_model = getattr(self, "ema", None)
+            if isinstance(ema_model, torch.nn.Module):
+                with torch.no_grad():
+                    ema_outputs = ema_model(images)
+                    ema_pred_cls, _, _ = self._vec2box(ema_outputs["Main"])
+                    ema_logits = ema_pred_cls
+                    ema_probs = ema_logits.sigmoid()
+                    print(
+                        f"[DEBUG EMA] Logits stats: min={ema_logits.min().item():.3f}, "
+                        f"max={ema_logits.max().item():.3f}, mean={ema_logits.mean().item():.3f}"
+                    )
+                    print(
+                        f"[DEBUG EMA] Probs stats:  min={ema_probs.min().item():.6f}, "
+                        f"max={ema_probs.max().item():.6f}, mean={ema_probs.mean().item():.6f}"
+                    )
+                    print(
+                        f"[DEBUG EMA] Probs > 0.1: {(ema_probs > 0.1).sum().item()}, "
+                        f"> 0.5: {(ema_probs > 0.5).sum().item()}"
+                    )
 
         # Apply NMS
         predictions = bbox_nms(

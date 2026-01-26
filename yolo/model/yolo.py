@@ -165,9 +165,9 @@ class YOLO(nn.Module):
 
         self.model.load_state_dict(model_state_dict)
 
-        # Re-initialize classification head bias AFTER loading pretrained weights
-        # This is critical because pretrained weights may have different class count
-        # and the intermediate conv layers affect the output distribution
+        # Re-initialize classification head bias using the ultralytics formula.
+        # This creates very negative biases (≈-10) that make background loss negligible,
+        # allowing foreground gradients to dominate and drive proper learning.
         self._reinit_cls_head_bias()
 
     def _reinit_cls_head_bias(self):
@@ -194,13 +194,17 @@ class YOLO(nn.Module):
                 for i, head in enumerate(module.heads):
                     if isinstance(head, Detection):
                         stride = strides[i] if i < len(strides) else 32
-                        grid_cells = (self.img_size / stride) ** 2
-                        bias_cls = math.log(5 / self.num_classes / grid_cells)
+                        # IMPORTANT: Ultralytics uses 640 HARDCODED, not the actual image size!
+                        # This ensures consistent, very negative biases across different image sizes.
+                        grid_cells_640 = (640 / stride) ** 2
+                        bias_cls = math.log(5 / self.num_classes / grid_cells_640)
 
-                        # Only final Conv2d layer needs init (intermediate layers load pretrained)
+                        # Only set bias - DO NOT reinitialize weights!
+                        # The weights should keep their kaiming initialization so they
+                        # can properly transform the backbone features.
+                        # (yolo-original does the same: only sets bias, not weights)
                         final_conv = head.class_conv[-1]
                         if isinstance(final_conv, nn.Conv2d):
-                            nn.init.normal_(final_conv.weight, mean=0.0, std=0.01)
                             final_conv.bias.data.fill_(bias_cls)
 
                         logger.info(f"  📊 Detection head {i}: bias={bias_cls:.3f} (stride={stride}, sigmoid≈{1/(1+math.exp(-bias_cls))*100:.2f}%)")

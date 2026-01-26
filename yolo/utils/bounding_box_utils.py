@@ -274,7 +274,7 @@ class BoxMatcher:
         """Matches each target to the most suitable anchor.
         1. For each anchor prediction, find the highest suitability targets.
         2. Match target to the best anchor.
-        3. Noramlize the class probilities of targets.
+        3. Normalize the class probabilities of targets (SOFT TARGETS).
 
         Args:
             target: The ground truth class and bounding box information
@@ -286,7 +286,7 @@ class BoxMatcher:
         Returns:
             anchor_matched_targets: Tensor of size [batch x anchors x (class + 4)].
                 A tensor assigning each target/gt to the best fitting anchor.
-                The class probabilities are normalized.
+                The class probabilities are normalized (SOFT labels [0-1]).
             valid_mask: Bool tensor of shape [batch x anchors].
                 True if a anchor has a target/gt assigned to it.
         """
@@ -330,7 +330,7 @@ class BoxMatcher:
         align_cls = torch.zeros_like(align_cls_indices, dtype=torch.bool).repeat(1, 1, self.class_num)
         align_cls.scatter_(-1, index=align_cls_indices, src=~align_cls)
 
-        # normalize class ditribution
+        # normalize class distribution - SOFT TARGETS (original YOLOv9 design)
         iou_mat *= topk_mask
         target_matrix *= topk_mask
         max_target = target_matrix.amax(dim=-1, keepdim=True)

@@ -85,15 +85,13 @@ class Detection(nn.Module):
 
         self.anchor_conv[-1].bias.data.fill_(1.0)
 
-        # Classification bias initialization - Ultralytics formula
-        # bias = log(5 / num_classes / (img_size / stride)²)
-        # This assumes ~5 objects per image, distributed across all grid cells
-        # For 13 classes, img=320, stride=8:  log(5/13/1600) = -7.6 → sigmoid ≈ 0.05%
-        # For 13 classes, img=320, stride=16: log(5/13/400)  = -6.2 → sigmoid ≈ 0.2%
-        # For 13 classes, img=320, stride=32: log(5/13/100)  = -4.9 → sigmoid ≈ 0.7%
+        # Classification bias initialization using Ultralytics formula:
+        # bias = log(5 / num_classes / (640 / stride)^2)
+        # IMPORTANT: Ultralytics uses 640 HARDCODED, not the actual image size!
+        # This ensures consistent bias values across different image sizes.
         import math
-        grid_cells = (img_size / stride) ** 2
-        bias_cls = math.log(5 / num_classes / grid_cells)
+        grid_cells_640 = (640 / stride) ** 2  # Always use 640, like ultralytics
+        bias_cls = math.log(5 / num_classes / grid_cells_640)
         self.class_conv[-1].bias.data.fill_(bias_cls)
 
     def forward(self, x: Tensor) -> Tuple[Tensor]:

@@ -1,5 +1,7 @@
 """
-YOLO Loss Functions - Clean implementation for Lightning training.
+Mock loss functions for debugging YOLO training.
+
+Each mock logs detailed statistics about inputs/outputs to help diagnose issues.
 """
 
 from typing import Any, Dict, List, Tuple
@@ -8,29 +10,74 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from yolo.utils.bounding_box_utils import BoxMatcher, Vec2Box, calculate_iou
+from .config import log_mock, should_log
 
 
-class BCELoss(nn.Module):
-    """Binary Cross Entropy loss for classification.
+class MockBCELoss(nn.Module):
+    """
+    Mock BCE Loss with detailed logging.
 
-    Args:
-        pos_weight: Weight for positive samples. YOLOv9 official uses 1.0.
-                    This helps balance the gradient between BG (many) and FG (few).
+    Logs:
+    - Input shapes
+    - Target statistics (min, max, mean, sum, non-zero count)
+    - Prediction statistics (logits and sigmoid)
+    - Loss value before and after normalization
     """
 
-    def __init__(self, pos_weight: float = 1.0) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        # Register pos_weight as buffer for proper state_dict handling with EMA
-        self.register_buffer("_pos_weight", torch.tensor([pos_weight]))
-        self.bce = nn.BCEWithLogitsLoss(reduction="none", pos_weight=self._pos_weight)
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        self._call_count = 0
 
     def forward(self, predicts_cls: Tensor, targets_cls: Tensor, cls_norm: Tensor) -> Tensor:
-        return self.bce(predicts_cls, targets_cls).sum() / cls_norm
+        self._call_count += 1
+
+        # Compute raw loss
+        loss_raw = self.bce(predicts_cls, targets_cls)
+        loss_normalized = loss_raw.sum() / cls_norm
+
+        # Log statistics
+        if should_log("BCELoss", self._call_count):
+            pred_sigmoid = predicts_cls.sigmoid()
+            targets_nonzero = targets_cls[targets_cls > 0]
+
+            log_mock("BCELoss", f"=== Call #{self._call_count} ===")
+            log_mock("BCELoss", f"  Shape: predicts={predicts_cls.shape}, targets={targets_cls.shape}")
+            log_mock("BCELoss", f"  Predicts logits: min={predicts_cls.min():.4f}, max={predicts_cls.max():.4f}, mean={predicts_cls.mean():.4f}")
+            log_mock("BCELoss", f"  Predicts sigmoid: min={pred_sigmoid.min():.4f}, max={pred_sigmoid.max():.4f}, mean={pred_sigmoid.mean():.4f}")
+            log_mock("BCELoss", f"  Targets: min={targets_cls.min():.4f}, max={targets_cls.max():.4f}, mean={targets_cls.mean():.4f}")
+            log_mock("BCELoss", f"  Targets sum: {targets_cls.sum():.4f}")
+            nz_mean = targets_nonzero.mean().item() if len(targets_nonzero) > 0 else 0.0
+            log_mock("BCELoss", f"  Targets non-zero: count={len(targets_nonzero)}, mean={nz_mean:.4f}")
+            log_mock("BCELoss", f"  cls_norm: {cls_norm:.4f}")
+            log_mock("BCELoss", f"  Loss raw sum: {loss_raw.sum():.4f}")
+            log_mock("BCELoss", f"  Loss normalized: {loss_normalized:.4f}")
+
+            # Alert on suspicious values
+            if targets_cls.max() > 1.0:
+                log_mock("BCELoss", f"  WARNING: targets_cls.max() > 1.0 ({targets_cls.max():.4f})", force=True)
+            if cls_norm < 1.0:
+                log_mock("BCELoss", f"  WARNING: cls_norm < 1.0 ({cls_norm:.4f})", force=True)
+            if predicts_cls.max() < -5.0:
+                log_mock("BCELoss", f"  WARNING: predicts very negative (max={predicts_cls.max():.4f})", force=True)
+
+        return loss_normalized
 
 
-class BoxLoss(nn.Module):
-    """Box regression loss using CIoU."""
+class MockBoxLoss(nn.Module):
+    """
+    Mock Box Loss with detailed logging.
+
+    Logs:
+    - Number of valid boxes
+    - IoU statistics
+    - box_norm statistics
+    - Loss value
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._call_count = 0
 
     def forward(
         self,
@@ -40,23 +87,49 @@ class BoxLoss(nn.Module):
         box_norm: Tensor,
         cls_norm: Tensor,
     ) -> Tensor:
+        from yolo.utils.bounding_box_utils import calculate_iou
+
+        self._call_count += 1
+
         valid_bbox = valid_masks[..., None].expand(-1, -1, 4)
         picked_predict = predicts_bbox[valid_bbox].view(-1, 4)
         picked_targets = targets_bbox[valid_bbox].view(-1, 4)
 
+        if len(picked_predict) == 0:
+            return torch.tensor(0.0, device=predicts_bbox.device)
+
         iou = calculate_iou(picked_predict, picked_targets, "ciou").diag()
         loss_iou = 1.0 - iou
-        loss_iou = (loss_iou * box_norm).sum() / cls_norm
-        return loss_iou
+        loss_weighted = (loss_iou * box_norm).sum() / cls_norm
+
+        # Log statistics
+        if should_log("BoxLoss", self._call_count):
+            log_mock("BoxLoss", f"=== Call #{self._call_count} ===")
+            log_mock("BoxLoss", f"  Valid boxes: {valid_masks.sum()}")
+            log_mock("BoxLoss", f"  IoU: min={iou.min():.4f}, max={iou.max():.4f}, mean={iou.mean():.4f}")
+            log_mock("BoxLoss", f"  box_norm: min={box_norm.min():.4f}, max={box_norm.max():.4f}, mean={box_norm.mean():.4f}")
+            log_mock("BoxLoss", f"  cls_norm: {cls_norm:.4f}")
+            log_mock("BoxLoss", f"  Loss (1-IoU) mean: {loss_iou.mean():.4f}")
+            log_mock("BoxLoss", f"  Loss weighted: {loss_weighted:.4f}")
+
+        return loss_weighted
 
 
-class DFLoss(nn.Module):
-    """Distribution Focal Loss for box regression."""
+class MockDFLoss(nn.Module):
+    """
+    Mock DFL Loss with detailed logging.
 
-    def __init__(self, vec2box: Vec2Box, reg_max: int) -> None:
+    Logs:
+    - Target distance statistics
+    - Prediction statistics
+    - Loss value
+    """
+
+    def __init__(self, vec2box, reg_max: int) -> None:
         super().__init__()
         self.anchors_norm = (vec2box.anchor_grid / vec2box.scaler[:, None])[None]
         self.reg_max = reg_max
+        self._call_count = 0
 
     def forward(
         self,
@@ -66,13 +139,25 @@ class DFLoss(nn.Module):
         box_norm: Tensor,
         cls_norm: Tensor,
     ) -> Tensor:
+        self._call_count += 1
+
+        # valid_masks: [B, num_anchors]
+        # predicts_anc: [B, num_anchors, 4, reg_max]
+        # targets_bbox: [B, num_anchors, 4]
+
+        # Expand valid_masks for both (shape [B, num_anchors, 4])
         valid_bbox = valid_masks[..., None].expand(-1, -1, 4)
+
         bbox_lt, bbox_rb = targets_bbox.chunk(2, -1)
         targets_dist = torch.cat(
             ((self.anchors_norm - bbox_lt), (bbox_rb - self.anchors_norm)), -1
         ).clamp(0, self.reg_max - 1.01)
         picked_targets = targets_dist[valid_bbox].view(-1)
+        # predicts_anc indexing: select valid [B, num_anchors, 4] -> then .view(-1, reg_max)
         picked_predict = predicts_anc[valid_bbox].view(-1, self.reg_max)
+
+        if len(picked_predict) == 0:
+            return torch.tensor(0.0, device=predicts_anc.device)
 
         label_left, label_right = picked_targets.floor(), picked_targets.floor() + 1
         weight_left, weight_right = label_right - picked_targets, picked_targets - label_left
@@ -81,35 +166,43 @@ class DFLoss(nn.Module):
         loss_right = F.cross_entropy(picked_predict, label_right.to(torch.long), reduction="none")
         loss_dfl = loss_left * weight_left + loss_right * weight_right
         loss_dfl = loss_dfl.view(-1, 4).mean(-1)
-        loss_dfl = (loss_dfl * box_norm).sum() / cls_norm
-        return loss_dfl
+        loss_weighted = (loss_dfl * box_norm).sum() / cls_norm
+
+        # Log statistics
+        if should_log("DFLoss", self._call_count):
+            log_mock("DFLoss", f"=== Call #{self._call_count} ===")
+            log_mock("DFLoss", f"  reg_max: {self.reg_max}")
+            log_mock("DFLoss", f"  Target dist: min={picked_targets.min():.4f}, max={picked_targets.max():.4f}, mean={picked_targets.mean():.4f}")
+            log_mock("DFLoss", f"  Valid count: {len(picked_predict)}")
+            log_mock("DFLoss", f"  DFL loss mean: {loss_dfl.mean():.4f}")
+            log_mock("DFLoss", f"  Loss weighted: {loss_weighted:.4f}")
+
+            # Check for out-of-range values
+            if picked_targets.max() >= self.reg_max - 1:
+                log_mock("DFLoss", f"  WARNING: targets near reg_max limit ({picked_targets.max():.4f})", force=True)
+
+        return loss_weighted
 
 
-class YOLOLoss(nn.Module):
+class MockYOLOLoss(nn.Module):
     """
-    YOLO Loss function combining classification, box regression and DFL losses.
+    Mock YOLO Loss that wraps all component losses with detailed logging.
 
-    Args:
-        vec2box: Vector to box converter
-        class_num: Number of classes
-        reg_max: Maximum regression value for DFL
-        box_weight: Weight for box loss
-        cls_weight: Weight for classification loss
-        dfl_weight: Weight for DFL loss
-        matcher_topk: Top-k for anchor matching
-        matcher_iou_weight: IoU weight in matching
-        matcher_cls_weight: Classification weight in matching
+    Logs:
+    - All input shapes
+    - Intermediate values (targets_cls, cls_norm, box_norm)
+    - Individual loss components
+    - Total loss
     """
 
     def __init__(
         self,
-        vec2box: Vec2Box,
+        vec2box,
         class_num: int = 80,
         reg_max: int = 16,
         box_weight: float = 7.5,
         cls_weight: float = 0.5,
         dfl_weight: float = 1.5,
-        cls_pos_weight: float = 1.0,
         matcher_topk: int = 10,
         matcher_iou_weight: float = 6.0,
         matcher_cls_weight: float = 0.5,
@@ -124,28 +217,13 @@ class YOLOLoss(nn.Module):
         self.cls_weight = cls_weight
         self.dfl_weight = dfl_weight
 
-        # Loss functions
-        # pos_weight balances gradient between BG (many) and FG (few) samples
-        # YOLOv9 official uses cls_pw=1.0 by default
-        self.cls_loss = BCELoss(pos_weight=cls_pos_weight)
-        self.dfl_loss = DFLoss(vec2box, reg_max)
-        self.box_loss = BoxLoss()
+        # Use mock losses
+        self.cls_loss = MockBCELoss()
+        self.dfl_loss = MockDFLoss(vec2box, reg_max)
+        self.box_loss = MockBoxLoss()
 
-        # Matcher config
-        self.matcher = self._create_matcher(
-            vec2box, class_num, reg_max, matcher_topk, matcher_iou_weight, matcher_cls_weight
-        )
-
-    def _create_matcher(
-        self,
-        vec2box: Vec2Box,
-        class_num: int,
-        reg_max: int,
-        topk: int,
-        iou_weight: float,
-        cls_weight: float,
-    ) -> BoxMatcher:
-        """Create box matcher with configuration."""
+        # Import original matcher (or use mock if configured)
+        from yolo.utils.bounding_box_utils import BoxMatcher
         from dataclasses import dataclass
 
         @dataclass
@@ -162,10 +240,12 @@ class YOLOLoss(nn.Module):
 
         cfg = MatcherConfig(
             iou="ciou",
-            topk=topk,
-            factor={"iou": iou_weight, "cls": cls_weight},
+            topk=matcher_topk,
+            factor={"iou": matcher_iou_weight, "cls": matcher_cls_weight},
         )
-        return BoxMatcher(cfg, class_num, vec2box, reg_max)
+        self.matcher = BoxMatcher(cfg, class_num, vec2box, reg_max)
+
+        self._call_count = 0
 
     def _separate_anchor(self, anchors: Tensor) -> Tuple[Tensor, Tensor]:
         """Separate anchor predictions into class and bbox components."""
@@ -178,17 +258,8 @@ class YOLOLoss(nn.Module):
         outputs: Dict[str, Any],
         targets: List,
     ) -> Tuple[Tensor, Dict[str, float]]:
-        """
-        Compute YOLO loss.
+        self._call_count += 1
 
-        Args:
-            outputs: Model outputs dict with "Main" and optionally "AUX" keys
-            targets: List of target annotations
-
-        Returns:
-            total_loss: Combined weighted loss
-            loss_dict: Dictionary of individual loss values
-        """
         # Convert targets to tensor format
         targets_tensor = self._prepare_targets(targets)
 
@@ -208,19 +279,22 @@ class YOLOLoss(nn.Module):
         cls_norm = max(targets_cls.sum(), 1)
         box_norm = targets_cls.sum(-1)[valid_masks]
 
-        # DEBUG: Log soft targets stats
-        if not hasattr(self, '_debug_step'):
-            self._debug_step = 0
-        self._debug_step += 1
-        if self._debug_step % 50 == 1:  # Log every 50 steps
-            nonzero_targets = targets_cls[targets_cls > 0]
-            print(f"[DEBUG SOFT] step={self._debug_step} cls_norm={cls_norm.item():.2f} "
-                  f"valid_anchors={valid_masks.sum().item()} "
-                  f"nonzero_targets={len(nonzero_targets)} "
-                  f"target_min={nonzero_targets.min().item():.4f} "
-                  f"target_max={nonzero_targets.max().item():.4f} "
-                  f"target_mean={nonzero_targets.mean().item():.4f}" if len(nonzero_targets) > 0 else
-                  f"[DEBUG SOFT] step={self._debug_step} cls_norm={cls_norm.item():.2f} NO TARGETS")
+        # Log before computing losses
+        if should_log("YOLOLoss", self._call_count):
+            log_mock("YOLOLoss", f"=== Call #{self._call_count} ===")
+            log_mock("YOLOLoss", f"  Batch size: {predicts_cls.shape[0]}")
+            log_mock("YOLOLoss", f"  Num anchors: {predicts_cls.shape[1]}")
+            log_mock("YOLOLoss", f"  Num targets: {targets_tensor.shape[1]}")
+            log_mock("YOLOLoss", f"  Valid anchors: {valid_masks.sum()}")
+            log_mock("YOLOLoss", f"  [CRITICAL] targets_cls sum: {targets_cls.sum():.4f}")
+            log_mock("YOLOLoss", f"  [CRITICAL] targets_cls non-zero count: {(targets_cls > 0).sum()}")
+            nz = targets_cls[targets_cls > 0]
+            if len(nz) > 0:
+                log_mock("YOLOLoss", f"  [CRITICAL] targets_cls non-zero: min={nz.min():.4f}, max={nz.max():.4f}, mean={nz.mean():.4f}")
+            log_mock("YOLOLoss", f"  cls_norm: {cls_norm:.4f}")
+            log_mock("YOLOLoss", f"  box_norm sum: {box_norm.sum():.4f}")
+            # Log predicts_cls stats
+            log_mock("YOLOLoss", f"  [CRITICAL] predicts_cls (logits): min={predicts_cls.min():.4f}, max={predicts_cls.max():.4f}, mean={predicts_cls.mean():.4f}")
 
         # Compute losses
         loss_cls = self.cls_loss(predicts_cls, targets_cls, cls_norm)
@@ -261,6 +335,12 @@ class YOLOLoss(nn.Module):
                 self.dfl_weight * aux_loss_dfl
             )
 
+        if should_log("YOLOLoss", self._call_count):
+            log_mock("YOLOLoss", f"  loss_cls (weighted): {loss_cls_weighted:.4f}")
+            log_mock("YOLOLoss", f"  loss_box (weighted): {loss_box_weighted:.4f}")
+            log_mock("YOLOLoss", f"  loss_dfl (weighted): {loss_dfl_weighted:.4f}")
+            log_mock("YOLOLoss", f"  total_loss: {total_loss:.4f}")
+
         loss_dict = {
             "box_loss": loss_box_weighted.detach(),
             "cls_loss": loss_cls_weighted.detach(),
@@ -270,15 +350,10 @@ class YOLOLoss(nn.Module):
         return total_loss, loss_dict
 
     def _prepare_targets(self, targets: List) -> Tensor:
-        """
-        Convert targets to tensor format [batch, max_targets, 5].
-
-        Expected format: [class, x1, y1, x2, y2]
-        """
+        """Convert targets to tensor format [batch, max_targets, 5]."""
         batch_size = len(targets)
         device = self.vec2box.anchor_grid.device
 
-        # Find max targets in batch
         max_targets = 0
         processed_targets = []
 
@@ -287,7 +362,6 @@ class YOLOLoss(nn.Module):
                 processed_targets.append(target)
                 max_targets = max(max_targets, len(target))
             elif isinstance(target, dict):
-                # Dict format from transforms v2
                 boxes = target.get("boxes", torch.zeros((0, 4)))
                 labels = target.get("labels", torch.zeros((0,)))
                 if len(boxes) > 0:
@@ -297,9 +371,7 @@ class YOLOLoss(nn.Module):
                 processed_targets.append(t)
                 max_targets = max(max_targets, len(t))
             elif isinstance(target, list):
-                # List of COCO annotations
                 boxes = []
-                labels = []
                 for ann in target:
                     if "bbox" in ann:
                         x, y, w, h = ann["bbox"]
@@ -313,7 +385,6 @@ class YOLOLoss(nn.Module):
             else:
                 processed_targets.append(torch.zeros((0, 5)))
 
-        # Pad to same size
         if max_targets == 0:
             return torch.zeros((batch_size, 0, 5), device=device)
 
