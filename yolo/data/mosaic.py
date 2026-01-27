@@ -9,7 +9,7 @@ Set probability to 0.0 to disable any augmentation.
 """
 
 import random
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -60,7 +60,7 @@ class MosaicMixupDataset(Dataset):
         # bbox_mosaic: specialized mosaic that crops to bounding box
         # Each image is cropped to its bbox, transformed individually, then placed in grid
         # Pass as dict: {"prob": 1.0, "degrees": 5.0, "translate": 0.05, ...}
-        bbox_mosaic: Optional[Dict[str, float]] = None,
+        bbox_mosaic: Optional[Dict[str, Union[float, str]]] = None,
     ):
         self.dataset = dataset
         self.image_size = image_size
@@ -88,6 +88,12 @@ class MosaicMixupDataset(Dataset):
         self.bbox_mosaic_hsv_s = bbox_cfg.get("hsv_s", 0.0)
         self.bbox_mosaic_hsv_v = bbox_cfg.get("hsv_v", 0.0)
         self.bbox_mosaic_jitter = bbox_cfg.get("jitter", 0.0)
+        # Filter pattern for bbox_mosaic: regexp to filter images by filename
+        self.bbox_mosaic_filter = bbox_cfg.get("filter", None)
+        self._bbox_mosaic_filter_re = None
+        if self.bbox_mosaic_filter:
+            import re
+            self._bbox_mosaic_filter_re = re.compile(self.bbox_mosaic_filter)
 
         # LRU buffer for caching recently accessed images
         # NOTE: This buffer is NOT shared between DataLoader workers (each worker
@@ -190,6 +196,38 @@ class MosaicMixupDataset(Dataset):
             self._buffer.put(index, (img_np, target))
 
         return img, target
+
+    def _get_filename(self, index: int) -> str:
+        """Get filename for an index from the underlying dataset."""
+        dataset = self.dataset
+        # YOLOFormatDataset
+        if hasattr(dataset, 'image_files'):
+            return dataset.image_files[index].name
+        # CocoDetectionWrapper with cached paths
+        if hasattr(dataset, '_image_paths'):
+            return dataset._image_paths[index].name
+        # CocoDetectionWrapper with COCO API
+        if hasattr(dataset, 'coco') and hasattr(dataset, 'ids'):
+            img_id = dataset.ids[index]
+            return dataset.coco.loadImgs(img_id)[0]["file_name"]
+        return ""
+
+    def _get_filtered_indices(self) -> List[int]:
+        """Get list of indices matching the bbox_mosaic filter pattern.
+
+        Returns cached list of valid indices. Built lazily on first call.
+        """
+        if not hasattr(self, '_filtered_indices_cache'):
+            if self._bbox_mosaic_filter_re is None:
+                # No filter: all indices valid
+                self._filtered_indices_cache = list(range(len(self.dataset)))
+            else:
+                # Filter by pattern
+                self._filtered_indices_cache = [
+                    i for i in range(len(self.dataset))
+                    if self._bbox_mosaic_filter_re.search(self._get_filename(i))
+                ]
+        return self._filtered_indices_cache
 
     def _load_and_resize(
         self, index: int, target_size: Tuple[int, int]
@@ -464,8 +502,21 @@ class MosaicMixupDataset(Dataset):
         s = self.image_size[0]  # Assume square
         half_s = s // 2
 
-        # Sample 4 indices
-        indices = [index] + [random.randint(0, len(self.dataset) - 1) for _ in range(3)]
+        # Sample 4 indices (from filtered pool if filter is set)
+        if self._bbox_mosaic_filter_re is not None:
+            filtered = self._get_filtered_indices()
+            if len(filtered) >= 4:
+                # Use index if it matches filter, otherwise pick random from filtered
+                if index in filtered:
+                    others = [i for i in filtered if i != index]
+                    indices = [index] + random.sample(others, min(3, len(others)))
+                else:
+                    indices = random.sample(filtered, min(4, len(filtered)))
+            else:
+                # Not enough filtered images, fall back to all
+                indices = [index] + [random.randint(0, len(self.dataset) - 1) for _ in range(3)]
+        else:
+            indices = [index] + [random.randint(0, len(self.dataset) - 1) for _ in range(3)]
 
         # Create canvas at target size (NOT 2x like standard mosaic)
         canvas = np.full((s, s, 3), self.fill_value, dtype=np.uint8)
@@ -485,12 +536,17 @@ class MosaicMixupDataset(Dataset):
             img, target = self._load_image_target(idx)
             img_np = np.array(img)
 
-            # Get first bbox (assuming one main object per image for document use case)
+            # Pick a bbox to crop (some datasets may have multiple objects per image)
             if len(target["boxes"]) == 0:
                 continue
 
-            box = target["boxes"][0]  # [x1, y1, x2, y2]
-            label = target["labels"][0]
+            if len(target["boxes"]) == 1:
+                bbox_idx = 0
+            else:
+                bbox_idx = random.randrange(len(target["boxes"]))
+
+            box = target["boxes"][bbox_idx]  # [x1, y1, x2, y2]
+            label = target["labels"][bbox_idx]
 
             # Crop to bbox with padding for transforms
             x1, y1, x2, y2 = box.int().tolist()

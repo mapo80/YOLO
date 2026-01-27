@@ -45,10 +45,12 @@ def load_model_from_checkpoint(
 
     # Load the Lightning module from checkpoint
     # Skip pretrained weight loading since checkpoint already has trained weights
+    # Use strict=False to ignore EMA keys (ema.*) and loss function keys (_loss_fn.*)
     module = YOLOModule.load_from_checkpoint(
         checkpoint_path,
         map_location=device,
         weight_path=None,  # Don't load pretrained weights, use checkpoint state_dict
+        strict=False,  # Ignore EMA and loss function keys
     )
     module.eval()
     module.to(device)

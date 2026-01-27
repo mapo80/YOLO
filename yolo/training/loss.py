@@ -2,6 +2,7 @@
 YOLO Loss Functions - Clean implementation for Lightning training.
 """
 
+import os
 from typing import Any, Dict, List, Tuple
 
 import torch
@@ -9,6 +10,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from yolo.utils.bounding_box_utils import BoxMatcher, Vec2Box, calculate_iou
+
+_YOLO_DEBUG = os.environ.get("YOLO_DEBUG", "0") == "1"
 
 
 class BCELoss(nn.Module):
@@ -252,18 +255,22 @@ class YOLOLoss(nn.Module):
         box_norm = targets_cls.sum(-1)[valid_masks]
 
         # DEBUG: Log soft targets stats
-        if not hasattr(self, '_debug_step'):
-            self._debug_step = 0
-        self._debug_step += 1
-        if self._debug_step % 50 == 1:  # Log every 50 steps
-            nonzero_targets = targets_cls[targets_cls > 0]
-            print(f"[DEBUG SOFT] step={self._debug_step} cls_norm={cls_norm.item():.2f} "
-                  f"valid_anchors={valid_masks.sum().item()} "
-                  f"nonzero_targets={len(nonzero_targets)} "
-                  f"target_min={nonzero_targets.min().item():.4f} "
-                  f"target_max={nonzero_targets.max().item():.4f} "
-                  f"target_mean={nonzero_targets.mean().item():.4f}" if len(nonzero_targets) > 0 else
-                  f"[DEBUG SOFT] step={self._debug_step} cls_norm={cls_norm.item():.2f} NO TARGETS")
+        if _YOLO_DEBUG:
+            if not hasattr(self, "_debug_step"):
+                self._debug_step = 0
+            self._debug_step += 1
+            if self._debug_step % 50 == 1:  # Log every 50 steps
+                nonzero_targets = targets_cls[targets_cls > 0]
+                print(
+                    f"[DEBUG SOFT] step={self._debug_step} cls_norm={cls_norm.item():.2f} "
+                    f"valid_anchors={valid_masks.sum().item()} "
+                    f"nonzero_targets={len(nonzero_targets)} "
+                    f"target_min={nonzero_targets.min().item():.4f} "
+                    f"target_max={nonzero_targets.max().item():.4f} "
+                    f"target_mean={nonzero_targets.mean().item():.4f}"
+                    if len(nonzero_targets) > 0
+                    else f"[DEBUG SOFT] step={self._debug_step} cls_norm={cls_norm.item():.2f} NO TARGETS"
+                )
 
         # Compute losses
         if self.cls_loss_type in {"varifocal", "vfl"}:

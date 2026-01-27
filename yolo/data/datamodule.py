@@ -233,7 +233,7 @@ class YOLODataModule(L.LightningDataModule):
         # Each image is cropped to its bbox, transformed individually, then placed in 2x2 grid
         # All objects remain fully visible (never cropped at quadrant boundaries)
         # Config as nested dict: {prob, degrees, translate, scale, shear, perspective, hsv_h, hsv_s, hsv_v}
-        bbox_mosaic: Optional[Dict[str, float]] = None,
+        bbox_mosaic: Optional[Dict[str, Union[float, str]]] = None,
         # Single-image augmentation parameters
         hsv_h: float = 0.015,
         hsv_s: float = 0.7,

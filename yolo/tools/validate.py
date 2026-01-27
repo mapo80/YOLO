@@ -334,10 +334,12 @@ def validate(
 
     # Load model
     # Skip pretrained weight loading since checkpoint already has trained weights
+    # Use strict=False to ignore EMA keys (ema.*) and loss function keys (_loss_fn.*)
     model = YOLOModule.load_from_checkpoint(
         checkpoint_path,
         map_location=device,
         weight_path=None,  # Don't load pretrained weights, use checkpoint state_dict
+        strict=False,  # Ignore EMA and loss function keys
     )
     model.eval()
     model.to(device)

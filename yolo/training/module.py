@@ -2,6 +2,7 @@
 YOLOModule - PyTorch Lightning module for YOLO training.
 """
 
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -16,6 +17,8 @@ from yolo.mock.integration import get_yolo_loss, get_vec2box
 from yolo.utils.bounding_box_utils import bbox_nms
 from yolo.utils.logger import logger
 from yolo.utils.metrics import DetMetrics
+
+_YOLO_DEBUG = os.environ.get("YOLO_DEBUG", "0") == "1"
 
 
 class YOLOModule(L.LightningModule):
@@ -239,7 +242,7 @@ class YOLOModule(L.LightningModule):
             self.log("lr", lr, prog_bar=True, sync_dist=True)
 
         # DEBUG: Check cls head weights/gradients
-        if batch_idx == 0 and self.current_epoch % 1 == 0:
+        if _YOLO_DEBUG and batch_idx == 0 and self.current_epoch % 1 == 0:
             for name, param in self.model.named_parameters():
                 if 'class_conv.2.weight' in name and '22.heads.0' in name:
                     grad_norm = param.grad.norm().item() if param.grad is not None else 0
@@ -265,7 +268,7 @@ class YOLOModule(L.LightningModule):
         pred_cls, pred_anc, pred_box = self._vec2box(outputs["Main"])
 
         # DEBUG: Check raw logits and sigmoid values
-        if batch_idx == 0:
+        if _YOLO_DEBUG and batch_idx == 0:
             logits = pred_cls  # Raw logits before sigmoid
             probs = logits.sigmoid()
             print(f"\n[DEBUG] Logits stats: min={logits.min().item():.3f}, max={logits.max().item():.3f}, mean={logits.mean().item():.3f}")
