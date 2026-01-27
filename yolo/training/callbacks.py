@@ -450,7 +450,11 @@ class ModelEMA:
         # lerp(model, ema, decay) = model + (ema - model) * decay
         if self.ema_state_dict is not None:
             for key, param in model.state_dict().items():
-                self.ema_state_dict[key] = _ema_lerp(param.detach(), self.ema_state_dict[key], decay_factor)
+                # Ensure EMA tensor is on same device as model param (fix resume from checkpoint)
+                ema_val = self.ema_state_dict[key]
+                if ema_val.device != param.device:
+                    ema_val = ema_val.to(param.device)
+                self.ema_state_dict[key] = _ema_lerp(param.detach(), ema_val, decay_factor)
 
     def state_dict(self) -> Dict[str, Any]:
         """Return state dict for checkpointing."""
