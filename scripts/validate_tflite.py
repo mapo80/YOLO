@@ -2,25 +2,33 @@
 """
 TFLite model validation script for YOLOv9.
 
-This script validates TFLite models (FP32, FP16, INT8) on COCO val2017 dataset
-and computes mAP metrics. It handles the different output formats between
-FP32/FP16 and INT8 TFLite models.
+This script validates TFLite models (FP32, FP16, INT8) on COCO or YOLO format
+datasets and computes mAP metrics. It handles the different output formats
+between FP32/FP16 and INT8 TFLite models.
+
+Supported dataset formats:
+- COCO: JSON annotations with images directory
+- YOLO: images/ + labels/ directories with .txt files (class x_center y_center w h)
 
 Output tensor structure for YOLOv9:
 - Main head (first 9 outputs for FP32/FP16):
-  - Identity_0: (1, 80, 80, 80) - cls scale P3
-  - Identity_1: (1, 16, 4, 80, 80) - anc scale P3 (ignored)
-  - Identity_2: (1, 4, 80, 80) - box scale P3
-  - Identity_3: (1, 40, 40, 80) - cls scale P4
-  - Identity_4: (1, 16, 4, 40, 40) - anc scale P4 (ignored)
-  - Identity_5: (1, 4, 40, 40) - box scale P4
-  - Identity_6: (1, 20, 20, 80) - cls scale P5
-  - Identity_7: (1, 16, 4, 20, 20) - anc scale P5 (ignored)
-  - Identity_8: (1, 4, 20, 20) - box scale P5
+  - Identity_0: (1, H, W, num_classes) - cls scale P3
+  - Identity_1: (1, 16, 4, H, W) - anc scale P3 (ignored)
+  - Identity_2: (1, 4, H, W) - box scale P3
+  - (repeat for P4, P5 scales)
 
 Usage:
-    python scripts/validate_tflite.py --model exports/v9-t_fp32.tflite
-    python scripts/validate_tflite.py --model exports/v9-t_int8.tflite
+    # COCO format
+    python scripts/validate_tflite.py --model model.tflite --coco-root /path/to/coco
+
+    # YOLO format
+    python scripts/validate_tflite.py --model model.tflite \\
+        --images-dir /path/to/images --labels-dir /path/to/labels --data-format yolo
+
+    # Custom num_classes
+    python scripts/validate_tflite.py --model custom.tflite \\
+        --images-dir /data/images --labels-dir /data/labels \\
+        --data-format yolo --num-classes 2
 """
 
 import argparse
@@ -410,6 +418,73 @@ def load_coco_annotations(ann_file: str, images_dir: str, num_images: int = None
     return dataset
 
 
+def load_yolo_annotations(images_dir: str, labels_dir: str, num_images: int = None):
+    """Load YOLO format annotations and return list of (image_path, targets) tuples.
+
+    YOLO format: one .txt file per image with lines: class x_center y_center width height
+    All coordinates are normalized [0, 1].
+
+    Args:
+        images_dir: Directory containing images
+        labels_dir: Directory containing label .txt files
+        num_images: Maximum number of images to load (None = all)
+
+    Returns:
+        List of (image_path, targets) tuples
+    """
+    # Find all images
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+    image_files = []
+    for ext in image_extensions:
+        image_files.extend(Path(images_dir).glob(f'*{ext}'))
+        image_files.extend(Path(images_dir).glob(f'*{ext.upper()}'))
+
+    image_files = sorted(set(image_files))
+    if num_images:
+        image_files = image_files[:num_images]
+
+    dataset = []
+    labels_path = Path(labels_dir)
+
+    for img_path in image_files:
+        # Find corresponding label file
+        label_file = labels_path / f"{img_path.stem}.txt"
+
+        # Get image size
+        with Image.open(img_path) as img:
+            img_w, img_h = img.size
+
+        boxes = []
+        labels = []
+
+        if label_file.exists():
+            with open(label_file) as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        cls_id = int(parts[0])
+                        x_center, y_center, w, h = map(float, parts[1:5])
+
+                        # Convert normalized xywh to pixel xyxy
+                        x1 = (x_center - w / 2) * img_w
+                        y1 = (y_center - h / 2) * img_h
+                        x2 = (x_center + w / 2) * img_w
+                        y2 = (y_center + h / 2) * img_h
+
+                        boxes.append([x1, y1, x2, y2])
+                        labels.append(cls_id)
+
+        targets = {
+            'boxes': np.array(boxes) if boxes else np.array([]).reshape(0, 4),
+            'labels': np.array(labels),
+            'image_size': (img_w, img_h),
+        }
+
+        dataset.append((str(img_path), targets))
+
+    return dataset
+
+
 def validate_tflite(
     model_path: str,
     coco_root: str = None,
@@ -420,6 +495,8 @@ def validate_tflite(
     num_classes: int = 80,
     ann_file: str = None,
     images_dir: str = None,
+    labels_dir: str = None,
+    data_format: str = "auto",
 ):
     """Run validation on TFLite model.
 
@@ -432,7 +509,9 @@ def validate_tflite(
         save_results: Whether to save results to JSON
         num_classes: Number of classes in the model (default: 80 for COCO)
         ann_file: Path to COCO-format annotations JSON (overrides coco_root)
-        images_dir: Path to images directory (overrides coco_root)
+        images_dir: Path to images directory
+        labels_dir: Path to YOLO labels directory (enables YOLO format)
+        data_format: Dataset format - "auto", "coco", or "yolo"
     """
     print(f"Loading model: {model_path}")
     interpreter, input_details, output_details = load_tflite_model(model_path)
@@ -455,15 +534,14 @@ def validate_tflite(
     print(f"Classification output indices: {cls_indices}")
     print(f"Box output indices: {box_indices}")
 
-    # Load dataset - use explicit paths if provided, otherwise derive from coco_root
-    if ann_file is None:
-        if coco_root is None:
-            raise ValueError("Either --coco-root or --ann-file must be specified")
-        ann_file = os.path.join(coco_root, "annotations/instances_val2017.json")
-    if images_dir is None:
-        if coco_root is None:
-            raise ValueError("Either --coco-root or --images-dir must be specified")
-        images_dir = os.path.join(coco_root, "val2017")
+    # Determine data format
+    if data_format == "auto":
+        if labels_dir is not None:
+            data_format = "yolo"
+        elif ann_file is not None or coco_root is not None:
+            data_format = "coco"
+        else:
+            raise ValueError("Cannot auto-detect format. Specify --data-format or provide appropriate paths.")
 
     # Get input size from model (NHWC format: [batch, height, width, channels])
     input_shape = input_details[0]['shape']
@@ -471,8 +549,24 @@ def validate_tflite(
     input_size = (input_w, input_h)  # (W, H) for preprocess_image
     print(f"Input size: {input_w}x{input_h}")
 
-    print(f"Loading COCO annotations from: {ann_file}")
-    dataset = load_coco_annotations(ann_file, images_dir, num_images)
+    # Load dataset based on format
+    if data_format == "yolo":
+        if images_dir is None or labels_dir is None:
+            raise ValueError("YOLO format requires both --images-dir and --labels-dir")
+        print(f"Loading YOLO dataset: images={images_dir}, labels={labels_dir}")
+        dataset = load_yolo_annotations(images_dir, labels_dir, num_images)
+    else:  # coco format
+        if ann_file is None:
+            if coco_root is None:
+                raise ValueError("COCO format requires --coco-root or --ann-file")
+            ann_file = os.path.join(coco_root, "annotations/instances_val2017.json")
+        if images_dir is None:
+            if coco_root is None:
+                raise ValueError("COCO format requires --coco-root or --images-dir")
+            images_dir = os.path.join(coco_root, "val2017")
+        print(f"Loading COCO annotations from: {ann_file}")
+        dataset = load_coco_annotations(ann_file, images_dir, num_images)
+
     print(f"Loaded {len(dataset)} images")
 
     # Initialize metrics
@@ -559,14 +653,39 @@ def validate_tflite(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Validate TFLite model on COCO-format dataset")
+    parser = argparse.ArgumentParser(
+        description="Validate TFLite model on COCO or YOLO format datasets",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # COCO format (standard structure)
+  python scripts/validate_tflite.py --model model.tflite --coco-root /path/to/coco
+
+  # COCO format (custom paths)
+  python scripts/validate_tflite.py --model model.tflite \\
+      --ann-file /path/to/annotations.json --images-dir /path/to/images
+
+  # YOLO format
+  python scripts/validate_tflite.py --model model.tflite \\
+      --images-dir /path/to/images --labels-dir /path/to/labels --data-format yolo
+
+  # Custom model with different num_classes
+  python scripts/validate_tflite.py --model custom_2class.tflite \\
+      --images-dir /data/images --labels-dir /data/labels \\
+      --data-format yolo --num-classes 2
+"""
+    )
     parser.add_argument("--model", type=str, required=True, help="Path to TFLite model")
     parser.add_argument("--coco-root", type=str, default=None,
                         help="Path to COCO dataset root (expects annotations/instances_val2017.json and val2017/)")
     parser.add_argument("--ann-file", type=str, default=None,
                         help="Path to COCO-format annotations JSON (overrides --coco-root)")
     parser.add_argument("--images-dir", type=str, default=None,
-                        help="Path to images directory (overrides --coco-root)")
+                        help="Path to images directory")
+    parser.add_argument("--labels-dir", type=str, default=None,
+                        help="Path to YOLO labels directory (enables YOLO format)")
+    parser.add_argument("--data-format", type=str, default="auto", choices=["auto", "coco", "yolo"],
+                        help="Dataset format: 'auto' (detect from args), 'coco', or 'yolo' (default: auto)")
     parser.add_argument("--num-images", type=int, default=500, help="Number of images to validate")
     parser.add_argument("--conf-threshold", type=float, default=0.001, help="Confidence threshold")
     parser.add_argument("--iou-threshold", type=float, default=0.65, help="IoU threshold for NMS")
@@ -575,9 +694,15 @@ def main():
 
     args = parser.parse_args()
 
-    # Validate that we have either coco_root or both ann_file and images_dir
-    if args.coco_root is None and (args.ann_file is None or args.images_dir is None):
-        parser.error("Either --coco-root or both --ann-file and --images-dir must be specified")
+    # Validate arguments based on data format
+    if args.data_format == "yolo" or (args.data_format == "auto" and args.labels_dir is not None):
+        # YOLO format requires images_dir and labels_dir
+        if args.images_dir is None or args.labels_dir is None:
+            parser.error("YOLO format requires both --images-dir and --labels-dir")
+    elif args.data_format == "coco" or args.data_format == "auto":
+        # COCO format requires coco_root or both ann_file and images_dir
+        if args.coco_root is None and (args.ann_file is None or args.images_dir is None):
+            parser.error("COCO format requires --coco-root or both --ann-file and --images-dir")
 
     validate_tflite(
         model_path=args.model,
@@ -588,6 +713,8 @@ def main():
         num_classes=args.num_classes,
         ann_file=args.ann_file,
         images_dir=args.images_dir,
+        labels_dir=args.labels_dir,
+        data_format=args.data_format,
     )
 
 

@@ -440,22 +440,46 @@ python -m yolo.cli validate --checkpoint exports/model.onnx \
 
 **Validate TFLite (using provided script):**
 
-The `validate_tflite.py` script computes mAP metrics for TFLite models (FP32, FP16, INT8) on COCO-format datasets. It automatically detects the model's input size and handles both standard COCO and custom datasets.
+The `validate_tflite.py` script computes mAP metrics for TFLite models (FP32, FP16, INT8). It supports both **COCO** and **YOLO** format datasets and automatically detects the model's input size.
+
+**COCO format examples:**
 
 ```shell
 # Standard COCO dataset structure
+# Expects: coco_root/annotations/instances_val2017.json and coco_root/val2017/
 python scripts/validate_tflite.py \
-    --model exports/model_fp32.tflite \
-    --coco-root path/to/coco \
-    --num-images 500
+    --model model.tflite \
+    --coco-root /path/to/coco
 
-# Custom dataset with explicit paths
+# Custom COCO paths (specify annotation file and images separately)
 python scripts/validate_tflite.py \
-    --model exports/model_fp16.tflite \
-    --ann-file path/to/annotations.json \
-    --images-dir path/to/images \
-    --num-classes 13 \
-    --num-images 100
+    --model model.tflite \
+    --ann-file /path/to/annotations.json \
+    --images-dir /path/to/images \
+    --num-classes 10
+```
+
+**YOLO format examples:**
+
+```shell
+# YOLO format dataset
+# Expects: images/ directory + labels/ directory with .txt files
+python scripts/validate_tflite.py \
+    --model model.tflite \
+    --images-dir /path/to/images \
+    --labels-dir /path/to/labels \
+    --data-format yolo \
+    --num-classes 5
+
+# Validate subset of images with custom thresholds
+python scripts/validate_tflite.py \
+    --model model.tflite \
+    --images-dir /path/to/images \
+    --labels-dir /path/to/labels \
+    --data-format yolo \
+    --num-classes 5 \
+    --num-images 100 \
+    --conf-threshold 0.25
 ```
 
 **Available options:**
@@ -465,15 +489,25 @@ python scripts/validate_tflite.py \
 | `--model` | required | Path to TFLite model |
 | `--coco-root` | - | Path to COCO dataset root (expects `annotations/instances_val2017.json` and `val2017/`) |
 | `--ann-file` | - | Path to COCO-format annotations JSON (overrides `--coco-root`) |
-| `--images-dir` | - | Path to images directory (overrides `--coco-root`) |
+| `--images-dir` | - | Path to images directory |
+| `--labels-dir` | - | Path to YOLO labels directory (enables YOLO format) |
+| `--data-format` | auto | Dataset format: `auto`, `coco`, or `yolo` |
 | `--num-images` | 500 | Number of images to validate |
 | `--num-classes` | 80 | Number of classes in the model (use for custom models) |
 | `--conf-threshold` | 0.001 | Confidence threshold for detections |
 | `--iou-threshold` | 0.65 | IoU threshold for NMS |
 
+**Dataset formats:**
+
+| Format | Structure | Annotation format |
+|--------|-----------|-------------------|
+| **COCO** | `annotations/*.json` + `images/` | JSON with `[x, y, width, height]` in pixels |
+| **YOLO** | `images/` + `labels/` | `.txt` files with `class x_center y_center width height` (normalized 0-1) |
+
 **Notes:**
-- The script auto-detects the model's input size (e.g., 320x320, 640x640)
+- The script auto-detects the model's input size from the TFLite file
 - For custom models with `num_classes != 80`, you **must** specify `--num-classes`
+- Format is auto-detected: `--labels-dir` triggers YOLO, `--ann-file` or `--coco-root` triggers COCO
 - Results are saved to `<model_name>_metrics.json` in the model's directory
 
 ##### Expected Output Files
