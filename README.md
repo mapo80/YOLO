@@ -439,12 +439,42 @@ python -m yolo.cli validate --checkpoint exports/model.onnx \
 ```
 
 **Validate TFLite (using provided script):**
+
+The `validate_tflite.py` script computes mAP metrics for TFLite models (FP32, FP16, INT8) on COCO-format datasets. It automatically detects the model's input size and handles both standard COCO and custom datasets.
+
 ```shell
+# Standard COCO dataset structure
 python scripts/validate_tflite.py \
     --model exports/model_fp32.tflite \
     --coco-root path/to/coco \
     --num-images 500
+
+# Custom dataset with explicit paths
+python scripts/validate_tflite.py \
+    --model exports/model_fp16.tflite \
+    --ann-file path/to/annotations.json \
+    --images-dir path/to/images \
+    --num-classes 13 \
+    --num-images 100
 ```
+
+**Available options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--model` | required | Path to TFLite model |
+| `--coco-root` | - | Path to COCO dataset root (expects `annotations/instances_val2017.json` and `val2017/`) |
+| `--ann-file` | - | Path to COCO-format annotations JSON (overrides `--coco-root`) |
+| `--images-dir` | - | Path to images directory (overrides `--coco-root`) |
+| `--num-images` | 500 | Number of images to validate |
+| `--num-classes` | 80 | Number of classes in the model (use for custom models) |
+| `--conf-threshold` | 0.001 | Confidence threshold for detections |
+| `--iou-threshold` | 0.65 | IoU threshold for NMS |
+
+**Notes:**
+- The script auto-detects the model's input size (e.g., 320x320, 640x640)
+- For custom models with `num_classes != 80`, you **must** specify `--num-classes`
+- Results are saved to `<model_name>_metrics.json` in the model's directory
 
 ##### Expected Output Files
 

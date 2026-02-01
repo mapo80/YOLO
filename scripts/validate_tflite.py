@@ -98,13 +98,13 @@ def identify_outputs_fp32(output_details):
     return cls_indices, box_indices
 
 
-def identify_outputs_int8(output_details):
+def identify_outputs_int8(output_details, num_classes: int = 80):
     """
     Identify cls and box outputs for INT8 models.
     INT8 has different ordering, need to identify by shape.
 
-    For YOLOv9-t:
-    - cls outputs: shape (1, H, W, 80) - 80 is num_classes
+    For YOLOv9:
+    - cls outputs: shape (1, H, W, num_classes)
     - box outputs: shape (1, 4, H, W) - 4 is LTRB
     - anc outputs: shape (1, 16, 4, H, W) - 5D tensors, ignored
 
@@ -113,6 +113,10 @@ def identify_outputs_int8(output_details):
     Note: There are 6 cls and 6 box outputs (main + aux heads).
     We need to select only 3 (one per scale) from the main head.
     We use the fact that outputs are grouped: take only one per scale.
+
+    Args:
+        output_details: TFLite interpreter output details
+        num_classes: Number of classes in the model (default: 80 for COCO)
     """
     cls_by_scale = {}  # grid_size -> list of (index, name)
     box_by_scale = {}  # grid_size -> list of (index, name)
@@ -128,8 +132,8 @@ def identify_outputs_int8(output_details):
         if len(shape) != 4:
             continue
 
-        # Check for cls output: (1, H, W, 80) - 80 classes
-        if shape[3] == 80 and shape[1] == shape[2]:
+        # Check for cls output: (1, H, W, num_classes)
+        if shape[3] == num_classes and shape[1] == shape[2]:
             grid_size = shape[1]
             if grid_size not in cls_by_scale:
                 cls_by_scale[grid_size] = []
@@ -142,18 +146,7 @@ def identify_outputs_int8(output_details):
                 box_by_scale[grid_size] = []
             box_by_scale[grid_size].append((i, name))
 
-    # For INT8, we need to select the correct outputs based on valid data ranges
-    # Main head outputs have meaningful values, aux head outputs are often constant
-    # Hardcoded indices based on analysis for YOLOv9-t INT8 model
-    # cls: idx=10 (80x80), idx=7 (40x40), idx=17 (20x20)
-    # box: idx=11 (80x80), idx=6 (40x40), idx=13 (20x20)
-
-    # Check if we have the expected structure
-    if 80 in cls_by_scale and 40 in cls_by_scale and 20 in cls_by_scale:
-        # Use hardcoded indices for YOLOv9-t INT8
-        return [10, 7, 17], [11, 6, 13]
-
-    # Fallback: Sort scales descending: 80, 40, 20
+    # Sort scales descending (e.g., 80, 40, 20 for 640x640 input)
     scales = sorted(cls_by_scale.keys(), reverse=True)
 
     cls_indices = []
@@ -161,6 +154,7 @@ def identify_outputs_int8(output_details):
 
     for scale in scales:
         # Take second cls and second box for this scale (index 1 if available, else 0)
+        # This heuristic selects main head outputs over aux head outputs
         if scale in cls_by_scale and cls_by_scale[scale]:
             idx = 1 if len(cls_by_scale[scale]) > 1 else 0
             cls_indices.append(cls_by_scale[scale][idx][0])
@@ -216,12 +210,21 @@ def dequantize_output(interpreter, output_details, index):
     return tensor
 
 
-def decode_outputs(interpreter, output_details, cls_indices, box_indices, image_size=(640, 640)):
+def decode_outputs(interpreter, output_details, cls_indices, box_indices,
+                   image_size=(640, 640), num_classes: int = 80):
     """
     Decode TFLite outputs to predictions using Vec2Box logic.
 
+    Args:
+        interpreter: TFLite interpreter
+        output_details: TFLite output details
+        cls_indices: Indices of classification outputs
+        box_indices: Indices of box outputs
+        image_size: Input image size (W, H)
+        num_classes: Number of classes in the model
+
     Returns:
-        cls_pred: (N, 80) class logits
+        cls_pred: (N, num_classes) class logits
         box_pred: (N, 4) boxes in xyxy format
     """
     strides = [8, 16, 32]  # P3, P4, P5
@@ -240,14 +243,14 @@ def decode_outputs(interpreter, output_details, cls_indices, box_indices, image_
         box_shape = output_details[box_idx]['shape']
 
         # Handle different formats
-        # FP32/FP16 cls: (1, H, W, 80) - already NHWC
-        # INT8 cls: (1, H, W, 80) - same
+        # FP32/FP16 cls: (1, H, W, num_classes) - already NHWC
+        # INT8 cls: (1, H, W, num_classes) - same
         # FP32/FP16 box: (1, 4, H, W) - NCHW
         # INT8 box: (1, 4, H, W) - same
 
-        # cls is already NHWC, reshape to (H*W, 80)
+        # cls is already NHWC, reshape to (H*W, num_classes)
         H_cls, W_cls = cls_shape[1], cls_shape[2]
-        cls_flat = cls_out.reshape(-1, 80)  # (H*W, 80)
+        cls_flat = cls_out.reshape(-1, num_classes)  # (H*W, num_classes)
 
         # box is NCHW, convert to NHWC then reshape
         # (1, 4, H, W) -> (1, H, W, 4) -> (H*W, 4)
@@ -259,7 +262,7 @@ def decode_outputs(interpreter, output_details, cls_indices, box_indices, image_
         all_box.append(box_flat)
 
     # Concatenate all scales
-    cls_pred = np.concatenate(all_cls, axis=0)  # (8400, 80)
+    cls_pred = np.concatenate(all_cls, axis=0)  # (8400, num_classes)
     box_pred = np.concatenate(all_box, axis=0)  # (8400, 4)
 
     # Decode boxes using Vec2Box logic: LTRB -> xyxy
@@ -409,13 +412,28 @@ def load_coco_annotations(ann_file: str, images_dir: str, num_images: int = None
 
 def validate_tflite(
     model_path: str,
-    coco_root: str,
+    coco_root: str = None,
     num_images: int = 500,
     conf_threshold: float = 0.001,
     iou_threshold: float = 0.65,
     save_results: bool = True,
+    num_classes: int = 80,
+    ann_file: str = None,
+    images_dir: str = None,
 ):
-    """Run validation on TFLite model."""
+    """Run validation on TFLite model.
+
+    Args:
+        model_path: Path to TFLite model
+        coco_root: Path to COCO dataset root (used if ann_file/images_dir not specified)
+        num_images: Number of images to validate
+        conf_threshold: Confidence threshold for detections
+        iou_threshold: IoU threshold for NMS
+        save_results: Whether to save results to JSON
+        num_classes: Number of classes in the model (default: 80 for COCO)
+        ann_file: Path to COCO-format annotations JSON (overrides coco_root)
+        images_dir: Path to images directory (overrides coco_root)
+    """
     print(f"Loading model: {model_path}")
     interpreter, input_details, output_details = load_tflite_model(model_path)
 
@@ -426,19 +444,32 @@ def validate_tflite(
     print(f"Input dtype: {input_dtype}")
     print(f"Number of outputs: {len(output_details)}")
     print(f"Model type: {'INT8' if is_int8 else 'FP32/FP16'}")
+    print(f"Number of classes: {num_classes}")
 
     # Identify outputs based on model type
     if is_int8:
-        cls_indices, box_indices = identify_outputs_int8(output_details)
+        cls_indices, box_indices = identify_outputs_int8(output_details, num_classes)
     else:
         cls_indices, box_indices = identify_outputs_fp32(output_details)
 
     print(f"Classification output indices: {cls_indices}")
     print(f"Box output indices: {box_indices}")
 
-    # Load dataset
-    ann_file = os.path.join(coco_root, "annotations/instances_val2017.json")
-    images_dir = os.path.join(coco_root, "val2017")
+    # Load dataset - use explicit paths if provided, otherwise derive from coco_root
+    if ann_file is None:
+        if coco_root is None:
+            raise ValueError("Either --coco-root or --ann-file must be specified")
+        ann_file = os.path.join(coco_root, "annotations/instances_val2017.json")
+    if images_dir is None:
+        if coco_root is None:
+            raise ValueError("Either --coco-root or --images-dir must be specified")
+        images_dir = os.path.join(coco_root, "val2017")
+
+    # Get input size from model (NHWC format: [batch, height, width, channels])
+    input_shape = input_details[0]['shape']
+    input_h, input_w = input_shape[1], input_shape[2]
+    input_size = (input_w, input_h)  # (W, H) for preprocess_image
+    print(f"Input size: {input_w}x{input_h}")
 
     print(f"Loading COCO annotations from: {ann_file}")
     dataset = load_coco_annotations(ann_file, images_dir, num_images)
@@ -449,8 +480,8 @@ def validate_tflite(
 
     # Run validation
     for img_path, targets in tqdm(dataset, desc="Validating"):
-        # Preprocess
-        img, preprocess_info = preprocess_image(img_path)
+        # Preprocess with model's input size
+        img, preprocess_info = preprocess_image(img_path, input_size=input_size)
 
         # Handle INT8 input quantization
         if is_int8:
@@ -464,7 +495,8 @@ def validate_tflite(
 
         # Decode outputs
         cls_pred, box_pred = decode_outputs(
-            interpreter, output_details, cls_indices, box_indices
+            interpreter, output_details, cls_indices, box_indices,
+            image_size=input_size, num_classes=num_classes
         )
 
         # Postprocess
@@ -472,10 +504,11 @@ def validate_tflite(
             cls_pred, box_pred,
             conf_threshold=conf_threshold,
             iou_threshold=iou_threshold,
+            input_size=input_size,
         )
 
         # Scale boxes to original image size
-        boxes = scale_boxes_to_original(boxes, preprocess_info)
+        boxes = scale_boxes_to_original(boxes, preprocess_info, input_size=input_size)
 
         preds = [{
             'boxes': torch.from_numpy(boxes).float(),
@@ -526,14 +559,25 @@ def validate_tflite(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Validate TFLite model on COCO")
+    parser = argparse.ArgumentParser(description="Validate TFLite model on COCO-format dataset")
     parser.add_argument("--model", type=str, required=True, help="Path to TFLite model")
-    parser.add_argument("--coco-root", type=str, default="coco", help="Path to COCO dataset root")
+    parser.add_argument("--coco-root", type=str, default=None,
+                        help="Path to COCO dataset root (expects annotations/instances_val2017.json and val2017/)")
+    parser.add_argument("--ann-file", type=str, default=None,
+                        help="Path to COCO-format annotations JSON (overrides --coco-root)")
+    parser.add_argument("--images-dir", type=str, default=None,
+                        help="Path to images directory (overrides --coco-root)")
     parser.add_argument("--num-images", type=int, default=500, help="Number of images to validate")
     parser.add_argument("--conf-threshold", type=float, default=0.001, help="Confidence threshold")
     parser.add_argument("--iou-threshold", type=float, default=0.65, help="IoU threshold for NMS")
+    parser.add_argument("--num-classes", type=int, default=80,
+                        help="Number of classes in the model (default: 80 for COCO)")
 
     args = parser.parse_args()
+
+    # Validate that we have either coco_root or both ann_file and images_dir
+    if args.coco_root is None and (args.ann_file is None or args.images_dir is None):
+        parser.error("Either --coco-root or both --ann-file and --images-dir must be specified")
 
     validate_tflite(
         model_path=args.model,
@@ -541,6 +585,9 @@ def main():
         num_images=args.num_images,
         conf_threshold=args.conf_threshold,
         iou_threshold=args.iou_threshold,
+        num_classes=args.num_classes,
+        ann_file=args.ann_file,
+        images_dir=args.images_dir,
     )
 
 
