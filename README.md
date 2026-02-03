@@ -288,6 +288,16 @@ python -m yolo.cli validate --checkpoint best.ckpt \
 # Save plots and JSON results
 python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml \
     --output results/ --save-plots --save-json
+
+# Validate on specific split (e.g., test set)
+python -m yolo.cli validate --checkpoint best.ckpt \
+    --data.root dataset/ --data.format yolo \
+    --data.val_images images --data.val_labels labels \
+    --data.val_split test.txt
+
+# Or use split file via config
+python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml
+# With config containing: data.val_split: test.txt
 ```
 
 #### Validation Options
@@ -301,7 +311,7 @@ python -m yolo.cli validate --checkpoint best.ckpt --config config.yaml \
 | `--data.val_images` | - | Path to validation images |
 | `--data.val_labels` | - | Path to validation labels (YOLO format) |
 | `--data.train_split` | - | Path to train split file (YOLO format) |
-| `--data.val_split` | - | Path to validation split file (YOLO format) |
+| `--data.val_split` | - | Path to split file (filters images by filename list) |
 | `--data.val_ann` | - | Path to validation annotations (COCO format) |
 | `--batch-size` | 16 | Batch size for validation |
 | `--conf` | 0.001 | Confidence threshold |

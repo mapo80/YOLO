@@ -957,6 +957,13 @@ Examples:
         help="Path to validation annotations for COCO format (relative to root)",
     )
     parser.add_argument(
+        "--data.val_split",
+        type=str,
+        default=None,
+        dest="val_split",
+        help="Path to split file (text file with image filenames, one per line)",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=16,
@@ -1064,6 +1071,7 @@ Examples:
     val_images = args.val_images
     val_labels = args.val_labels
     val_ann = args.val_ann
+    val_split = args.val_split
 
     if args.config:
         from omegaconf import OmegaConf
@@ -1075,6 +1083,7 @@ Examples:
             val_images = val_images or getattr(data_cfg, "val_images", None)
             val_labels = val_labels or getattr(data_cfg, "val_labels", None)
             val_ann = val_ann or getattr(data_cfg, "val_ann", None)
+            val_split = val_split or getattr(data_cfg, "val_split", None)
 
     # Validate required parameters
     if data_root is None:
@@ -1106,6 +1115,7 @@ Examples:
         val_images=val_images,
         val_labels=val_labels,
         val_ann=val_ann,
+        val_split=val_split,
         batch_size=args.batch_size,
         num_workers=args.workers,
         image_size=image_size,

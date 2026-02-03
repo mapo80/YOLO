@@ -179,6 +179,7 @@ def create_validation_dataloader(
     val_images: str = "val2017",
     val_labels: Optional[str] = None,
     val_ann: Optional[str] = None,
+    val_split: Optional[str] = None,
     batch_size: int = 16,
     num_workers: int = 4,
     image_size: Tuple[int, int] = (640, 640),
@@ -192,6 +193,7 @@ def create_validation_dataloader(
         val_images: Path to validation images (relative to root)
         val_labels: Path to validation labels for YOLO format (relative to root)
         val_ann: Path to validation annotations for COCO format (relative to root)
+        val_split: Path to split file (text file with image filenames to include)
         batch_size: Batch size for validation
         num_workers: Number of data loading workers
         image_size: Target image size (width, height)
@@ -210,6 +212,7 @@ def create_validation_dataloader(
             labels_dir=str(root / val_labels),
             transforms=val_transforms,
             image_size=image_size,
+            split_file=val_split,
         )
     else:  # coco format
         if val_ann is None:
@@ -275,6 +278,7 @@ def validate(
     val_images: str = "val2017",
     val_labels: Optional[str] = None,
     val_ann: Optional[str] = None,
+    val_split: Optional[str] = None,
     batch_size: int = 16,
     num_workers: int = 4,
     image_size: Tuple[int, int] = (640, 640),
@@ -302,6 +306,7 @@ def validate(
         val_images: Path to validation images (relative to root)
         val_labels: Path to validation labels for YOLO format
         val_ann: Path to validation annotations for COCO format
+        val_split: Path to split file (text file with image filenames to include)
         batch_size: Batch size for validation
         num_workers: Number of data loading workers
         image_size: Target image size (width, height)
@@ -394,6 +399,7 @@ def validate(
         val_images=val_images,
         val_labels=val_labels,
         val_ann=val_ann,
+        val_split=val_split,
         batch_size=batch_size,
         num_workers=num_workers,
         image_size=image_size,
