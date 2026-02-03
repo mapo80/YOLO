@@ -325,7 +325,10 @@ class YOLOLoss(nn.Module):
             "dfl_loss": loss_dfl_weighted.detach(),
         }
 
-        return total_loss, loss_dict
+        # Scale loss by batch_size to match yolov9-official gradient magnitude
+        # yolov9-official: return loss.sum() * batch_size (loss_tal.py:215)
+        batch_size = predicts_cls.shape[0]
+        return total_loss * batch_size, loss_dict
 
     def _prepare_targets(self, targets: List) -> Tensor:
         """
