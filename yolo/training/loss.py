@@ -104,7 +104,7 @@ class DFLoss(nn.Module):
         bbox_lt, bbox_rb = targets_bbox.chunk(2, -1)
         targets_dist = torch.cat(
             ((self.anchors_norm - bbox_lt), (bbox_rb - self.anchors_norm)), -1
-        ).clamp(0, self.reg_max - 1.01)
+        ).clamp(0, self.reg_max - 1.01)  # yolov9 passes reg_max-1 then clamps to -0.01, equivalent to -1.01 here
         picked_targets = targets_dist[valid_bbox].view(-1)
         picked_predict = predicts_anc[valid_bbox].view(-1, self.reg_max)
 
@@ -325,7 +325,10 @@ class YOLOLoss(nn.Module):
             "dfl_loss": loss_dfl_weighted.detach(),
         }
 
-        return total_loss, loss_dict
+        # Scale loss by batch_size (yolov9-official does: loss.sum() * batch_size)
+        # Without this, gradients are ~batch_size times smaller than expected
+        batch_size = predicts_cls.shape[0]
+        return total_loss * batch_size, loss_dict
 
     def _prepare_targets(self, targets: List) -> Tensor:
         """

@@ -61,7 +61,7 @@ class NMSConfig:
     """Non-Maximum Suppression configuration."""
 
     min_confidence: float = 0.25
-    min_iou: float = 0.65
+    min_iou: float = 0.45  # yolov9-official uses 0.45 (was 0.65)
     max_bbox: int = 300
 
 
