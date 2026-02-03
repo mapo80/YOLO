@@ -59,8 +59,10 @@ class Concat(nn.Module):
 class Detection(nn.Module):
     """A single YOLO Detection head for detection models"""
 
-    def __init__(self, in_channels: Tuple[int], num_classes: int, *, reg_max: int = 16, use_group: bool = True,
+    def __init__(self, in_channels: Tuple[int], num_classes: int, *, reg_max: int = 16, use_group: bool = False,
                  stride: int = 32, img_size: int = 640):
+        # NOTE: use_group=False aligned with yolov9-official Detect class (no grouped convs)
+        # Grouped convs reduce model capacity, hurting performance on smaller datasets
         super().__init__()
 
         groups = 4 if use_group else 1
