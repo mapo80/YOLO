@@ -173,11 +173,9 @@ class BoxMatcher:
         anchors = self.vec2box.anchor_grid[None, None]
         anchors_x, anchors_y = anchors.unbind(dim=3)
 
-        # Check if anchor center is STRICTLY inside the target bbox (exclusive)
-        # yolov9-official uses: bbox_deltas.amin(3).gt_(eps) which excludes borders
-        eps = 1e-9
-        inside_x = (anchors_x > x_min + eps) & (anchors_x < x_max - eps)
-        inside_y = (anchors_y > y_min + eps) & (anchors_y < y_max - eps)
+        # Check if anchor center is inside the target bbox
+        inside_x = (anchors_x >= x_min) & (anchors_x <= x_max)
+        inside_y = (anchors_y >= y_min) & (anchors_y <= y_max)
 
         return inside_x & inside_y
 
@@ -332,18 +330,14 @@ class BoxMatcher:
         align_cls = torch.zeros_like(align_cls_indices, dtype=torch.bool).repeat(1, 1, self.class_num)
         align_cls.scatter_(-1, index=align_cls_indices, src=~align_cls)
 
-        # normalize class distribution - SOFT TARGETS (aligned to yolov9-official)
-        # yolov9-official: norm_align_metric = (align_metric * pos_overlaps / pos_align_metrics).amax(-2)
-        # Key difference: .amax(-2) takes MAX across all targets for each anchor
+        # normalize class distribution - SOFT TARGETS (original YOLOv9 design)
         iou_mat *= topk_mask
         target_matrix *= topk_mask
-        pos_align_metrics = target_matrix.amax(dim=-1, keepdim=True)  # [B, T, 1]
-        pos_overlaps = iou_mat.amax(dim=-1, keepdim=True)  # [B, T, 1]
-        # Compute normalized metric and take max across targets (dim=1) for each anchor
-        norm_align_metric = (target_matrix * pos_overlaps / (pos_align_metrics + 1e-9)).amax(dim=1, keepdim=True)  # [B, 1, A]
-        # Transpose to [B, A, 1] for broadcasting with align_cls [B, A, C]
-        norm_align_metric = norm_align_metric.permute(0, 2, 1)  # [B, A, 1]
-        align_cls = align_cls.float() * norm_align_metric * valid_mask[:, :, None]
+        max_target = target_matrix.amax(dim=-1, keepdim=True)
+        max_iou = iou_mat.amax(dim=-1, keepdim=True)
+        normalize_term = (target_matrix / (max_target + 1e-9)) * max_iou
+        normalize_term = normalize_term.permute(0, 2, 1).gather(2, unique_indices)
+        align_cls = align_cls * normalize_term * valid_mask[:, :, None]
         anchor_matched_targets = torch.cat([align_cls, align_bbox], dim=-1)
         return anchor_matched_targets, valid_mask
 
