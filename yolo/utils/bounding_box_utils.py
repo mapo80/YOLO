@@ -330,14 +330,17 @@ class BoxMatcher:
         align_cls = torch.zeros_like(align_cls_indices, dtype=torch.bool).repeat(1, 1, self.class_num)
         align_cls.scatter_(-1, index=align_cls_indices, src=~align_cls)
 
-        # normalize class distribution - SOFT TARGETS (original YOLOv9 design)
+        # normalize class distribution - SOFT TARGETS (aligned to yolov9-official)
+        # yolov9-official (assigner.py:101):
+        #   norm_align_metric = (align_metric * pos_overlaps / pos_align_metrics).amax(-2).unsqueeze(-1)
+        # Key: .amax(-2) takes MAX across all targets, not .gather() for specific target
         iou_mat *= topk_mask
         target_matrix *= topk_mask
-        max_target = target_matrix.amax(dim=-1, keepdim=True)
-        max_iou = iou_mat.amax(dim=-1, keepdim=True)
-        normalize_term = (target_matrix / (max_target + 1e-9)) * max_iou
-        normalize_term = normalize_term.permute(0, 2, 1).gather(2, unique_indices)
-        align_cls = align_cls * normalize_term * valid_mask[:, :, None]
+        pos_align_metrics = target_matrix.amax(dim=-1, keepdim=True)  # [B, T, 1]
+        pos_overlaps = iou_mat.amax(dim=-1, keepdim=True)  # [B, T, 1]
+        norm_align_metric = (target_matrix * pos_overlaps / (pos_align_metrics + 1e-9)).amax(dim=1, keepdim=True)  # [B, 1, A]
+        norm_align_metric = norm_align_metric.permute(0, 2, 1)  # [B, A, 1]
+        align_cls = align_cls.float() * norm_align_metric * valid_mask[:, :, None]
         anchor_matched_targets = torch.cat([align_cls, align_bbox], dim=-1)
         return anchor_matched_targets, valid_mask
 
