@@ -147,7 +147,7 @@ class YOLOLoss(nn.Module):
         cls_loss_type: str = "bce",
         cls_vfl_alpha: float = 0.75,
         cls_vfl_gamma: float = 2.0,
-        matcher_topk: int = 10,
+        matcher_topk: int = 13,  # Aligned with yolov9-official (was 10)
         matcher_iou_weight: float = 6.0,
         matcher_cls_weight: float = 0.5,
     ) -> None:
@@ -254,6 +254,16 @@ class YOLOLoss(nn.Module):
         cls_norm = targets_cls.sum().clamp(min=1.0)
         box_norm = targets_cls.sum(-1)[valid_masks]
 
+        # === DEBUG LOGGING START ===
+        if os.environ.get('DEBUG_LOSS', '0') == '1':
+            print(f"\n=== YOLO-MIT BATCH DEBUG ===")
+            print(f"predicts_cls: shape={predicts_cls.shape}, min={predicts_cls.min():.4f}, max={predicts_cls.max():.4f}, mean={predicts_cls.mean():.6f}")
+            print(f"predicts_box: shape={predicts_box.shape}, min={predicts_box.min():.4f}, max={predicts_box.max():.4f}")
+            print(f"targets_cls: shape={targets_cls.shape}, min={targets_cls.min():.6f}, max={targets_cls.max():.6f}, mean={targets_cls.mean():.6f}, sum={targets_cls.sum():.4f}")
+            print(f"cls_norm: {cls_norm.item():.4f}")
+            print(f"valid_masks sum: {valid_masks.sum().item()}")
+        # === DEBUG LOGGING END ===
+
         # DEBUG: Log soft targets stats
         if _YOLO_DEBUG:
             if not hasattr(self, "_debug_step"):
@@ -278,8 +288,21 @@ class YOLOLoss(nn.Module):
             loss_cls = self._vfl_loss(predicts_cls, targets_cls, target_labels) / cls_norm
         else:
             loss_cls = self._bce_loss(predicts_cls, targets_cls, cls_norm)
-        loss_box = self.box_loss(predicts_box, targets_bbox, valid_masks, box_norm, cls_norm)
-        loss_dfl = self.dfl_loss(predicts_anc, targets_bbox, valid_masks, box_norm, cls_norm)
+
+        # Guard: only compute box/dfl loss if there are positive anchors (like yolov9-official)
+        if valid_masks.sum() > 0:
+            loss_box = self.box_loss(predicts_box, targets_bbox, valid_masks, box_norm, cls_norm)
+            loss_dfl = self.dfl_loss(predicts_anc, targets_bbox, valid_masks, box_norm, cls_norm)
+        else:
+            loss_box = torch.tensor(0.0, device=predicts_box.device)
+            loss_dfl = torch.tensor(0.0, device=predicts_box.device)
+
+        # === DEBUG LOSS COMPONENTS START ===
+        if os.environ.get('DEBUG_LOSS', '0') == '1':
+            print(f"loss_cls (raw, before gain): {loss_cls.item():.6f}")
+            print(f"loss_box (raw, before gain): {loss_box.item():.6f}")
+            print(f"loss_dfl (raw, before gain): {loss_dfl.item():.6f}")
+        # === DEBUG LOSS COMPONENTS END ===
 
         # Apply weights
         loss_cls_weighted = self.cls_weight * loss_cls
@@ -308,8 +331,14 @@ class YOLOLoss(nn.Module):
                 aux_loss_cls = self._vfl_loss(aux_cls, aux_targets_cls, aux_target_labels) / aux_cls_norm
             else:
                 aux_loss_cls = self._bce_loss(aux_cls, aux_targets_cls, aux_cls_norm)
-            aux_loss_box = self.box_loss(aux_box, aux_targets_bbox, aux_valid_masks, aux_box_norm, aux_cls_norm)
-            aux_loss_dfl = self.dfl_loss(aux_anc, aux_targets_bbox, aux_valid_masks, aux_box_norm, aux_cls_norm)
+
+            # Guard: only compute box/dfl loss if there are positive anchors (like yolov9-official)
+            if aux_valid_masks.sum() > 0:
+                aux_loss_box = self.box_loss(aux_box, aux_targets_bbox, aux_valid_masks, aux_box_norm, aux_cls_norm)
+                aux_loss_dfl = self.dfl_loss(aux_anc, aux_targets_bbox, aux_valid_masks, aux_box_norm, aux_cls_norm)
+            else:
+                aux_loss_box = torch.tensor(0.0, device=aux_box.device)
+                aux_loss_dfl = torch.tensor(0.0, device=aux_box.device)
 
             # Auxiliary loss with 0.25 weight
             aux_weight = 0.25
