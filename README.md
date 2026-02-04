@@ -1,9 +1,18 @@
-# YOLO: Training CLI for YOLOv9
+# YOLOv9-MIT: Training Framework
 
 ![GitHub License](https://img.shields.io/github/license/WongKinYiu/YOLO)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch Lightning](https://img.shields.io/badge/PyTorch-Lightning-792ee5.svg)](https://lightning.ai/)
 [![Tests](https://img.shields.io/badge/tests-405%20passed-brightgreen.svg)](tests/)
+
+> A complete training framework for YOLOv9 built on PyTorch Lightning,
+> with comprehensive metrics and export to ONNX/TFLite.
+
+**Key Features:**
+- **Task-Aligned Learning** - Soft target assignment aligned with yolov9-official
+- **Full COCO Metrics** - mAP, AR, size-based metrics + EvalDashboard
+- **Export** - ONNX, TFLite (FP32/FP16/INT8), Quantization-Aware Training
+- **Data Pipeline** - Encrypted datasets, LMDB caching, BBox Mosaic augmentation
 
 > **Fork Notice**: This is a fork of [WongKinYiu/YOLO](https://github.com/WongKinYiu/YOLO) with extensive additions for production training.
 
@@ -45,6 +54,10 @@ This repository extends the official YOLOv7[^1], YOLOv9[^2], and YOLO-RD[^3] imp
 - [Checkpoints](#checkpoints)
 - [Early Stopping](#early-stopping)
 - [Performance](#performance)
+- [Task-Aligned Learning (TAL)](#task-aligned-learning-tal)
+- [Loss Functions](#loss-functions)
+- [Custom Callbacks](#custom-callbacks)
+- [Troubleshooting](#troubleshooting)
 - [Project Structure](#project-structure)
 - [Citations](#citations)
 - [License](#license)
@@ -63,6 +76,21 @@ The original repository focuses on model architecture and research contributions
 - **Model export** - ONNX, TFLite (FP32/FP16/INT8), SavedModel
 
 All additions are built on **PyTorch Lightning** for clean, scalable training.
+
+### Comparison with yolov9-official
+
+| Feature | yolov9-official | **yolo-mit** |
+|---------|-----------------|--------------|
+| Training CLI | ❌ Manual scripts | ✅ YAML config + CLI overrides |
+| PyTorch Lightning | ❌ | ✅ Multi-GPU, checkpoints, callbacks |
+| EMA | ❌ | ✅ Configurable with tau warmup |
+| COCO Metrics | Basic print | ✅ Full 12 metrics + EvalDashboard |
+| TFLite Export | ❌ | ✅ FP32/FP16/INT8 + QAT |
+| BBox Mosaic | ❌ | ✅ Document-optimized augmentation |
+| Encrypted Datasets | ❌ | ✅ AES-256 image encryption |
+| Image Caching | ❌ | ✅ LMDB RAM/disk with encryption |
+| Early Stopping | ❌ | ✅ Configurable patience |
+| LR Schedulers | Step only | ✅ Cosine, OneCycle, Linear, Step |
 
 ## Features
 
@@ -3862,6 +3890,199 @@ MS COCO Object Detection
 | GELAN-C | 640 | **52.3%** | 69.8% | 57.1% | 25.3M | 102.1G | [download](https://github.com/WongKinYiu/yolov9/releases/download/v0.1/gelan-c.pt) |
 | GELAN-E | 640 | **53.7%** | 71.0% | 58.5% | 57.3M | 189.0G | [download](https://github.com/WongKinYiu/yolov9/releases/download/v0.1/gelan-e.pt) |
 
+## Task-Aligned Learning (TAL)
+
+This framework implements **Task-Aligned Learning** for anchor-target assignment, matching the yolov9-official implementation for optimal detection performance.
+
+### How It Works
+
+1. **Alignment Metric**: For each anchor-target pair, compute alignment score:
+   ```
+   align = cls_score^α × IoU^β
+   ```
+   where `α=0.5` (classification weight) and `β=6.0` (localization weight)
+
+2. **TopK Selection**: Select the top-K anchors with highest alignment scores for each target (default K=13)
+
+3. **Soft Targets**: Normalize alignment scores to create soft classification targets:
+   ```
+   soft_target = align / max_align_per_target
+   ```
+
+4. **Loss Normalization**: Scale gradients by `cls_norm = sum(soft_targets)` for stable training
+
+### Configuration
+
+```yaml
+model:
+  # Loss weights (aligned with yolov9-official)
+  box_loss_weight: 7.5
+  cls_loss_weight: 0.5
+  dfl_loss_weight: 1.5
+
+# Matcher parameters (in loss.py defaults)
+# matcher_topk: 13      # Anchors per target
+# matcher_alpha: 0.5    # Classification weight
+# matcher_beta: 6.0     # IoU weight
+```
+
+### Why Task-Aligned Learning?
+
+| Approach | Description | mAP Impact |
+|----------|-------------|------------|
+| **Fixed Assignment** | One anchor per target | Lower recall |
+| **IoU-based** | Assign by IoU only | Misses good classification anchors |
+| **Task-Aligned** | Balance cls + IoU | Best mAP, matches detection task |
+
+## Loss Functions
+
+The framework uses three loss components, each optimized for detection:
+
+### Box Loss (CIoU)
+
+Complete IoU loss that considers overlap, distance, and aspect ratio:
+
+```
+CIoU = 1 - IoU + distance²/diagonal² + αv
+```
+
+- **Weight**: `box_loss_weight: 7.5`
+- **Purpose**: Precise bounding box regression
+
+### Classification Loss (BCE)
+
+Binary Cross-Entropy with **soft targets** from Task-Aligned Learning:
+
+```
+BCE = -Σ (soft_target × log(pred) + (1 - soft_target) × log(1 - pred))
+```
+
+- **Weight**: `cls_loss_weight: 0.5`
+- **Normalization**: Divided by `cls_norm` (sum of soft targets)
+
+### Distribution Focal Loss (DFL)
+
+Predicts box coordinates as a discrete probability distribution over 16 bins:
+
+```
+DFL = -((ceil - x) × log(P_floor) + (x - floor) × log(P_ceil))
+```
+
+- **Weight**: `dfl_loss_weight: 1.5`
+- **Purpose**: Sub-pixel coordinate precision
+
+### Loss Configuration
+
+```yaml
+model:
+  box_loss_weight: 7.5    # Box regression importance
+  cls_loss_weight: 0.5    # Classification importance
+  dfl_loss_weight: 1.5    # Coordinate distribution importance
+
+  # Alternative classification losses
+  cls_loss_type: bce      # Options: bce, vfl (Varifocal)
+  cls_vfl_alpha: 0.75     # VFL alpha (if using vfl)
+  cls_vfl_gamma: 2.0      # VFL gamma (if using vfl)
+```
+
+## Custom Callbacks
+
+The framework includes specialized PyTorch Lightning callbacks for YOLO training:
+
+| Callback | Description |
+|----------|-------------|
+| `EMACallback` | Exponential Moving Average with configurable decay and tau warmup |
+| `YOLOProgressBar` | Rich progress bar with 1-indexed epochs and loss components |
+| `TrainingSummaryCallback` | End-of-epoch summary with best model tracking |
+| `EvalDashboardCallback` | Comprehensive metrics dashboard with trends and threshold sweep |
+
+### EMACallback
+
+Maintains a smoothed copy of model weights that often achieves better accuracy:
+
+```yaml
+trainer:
+  callbacks:
+    - class_path: yolo.training.callbacks.EMACallback
+      init_args:
+        decay: 0.9999       # EMA decay factor
+        tau: 2000.0         # Warmup steps (ramps decay from 0.5 to target)
+        enabled: true       # Set false to disable
+```
+
+### EvalDashboardCallback
+
+Rich terminal dashboard showing comprehensive metrics during validation:
+
+```yaml
+trainer:
+  callbacks:
+    - class_path: yolo.training.callbacks.EvalDashboardCallback
+      init_args:
+        conf_prod: 0.25     # Production confidence for operative metrics
+        show_trends: true   # Show sparkline trends
+        top_n_classes: 5    # Classes to show in per-class section
+```
+
+### YOLOProgressBar
+
+Custom progress bar with 1-indexed epochs and compact metrics display:
+
+```yaml
+trainer:
+  callbacks:
+    - class_path: yolo.training.callbacks.YOLOProgressBar
+```
+
+## Troubleshooting
+
+### Low mAP During Training
+
+**Symptoms**: mAP stays below 50% even after many epochs
+
+**Solutions**:
+1. Ensure DataLoader shuffle is enabled (default: `True`)
+2. Check that background/negative images are distributed across batches
+3. Verify `matcher_topk >= 10` for sufficient anchor assignment
+4. Use pretrained weights: `--model.weight_path=true`
+
+### Loss Spikes
+
+**Symptoms**: Sudden large increases in loss values
+
+**Causes & Solutions**:
+- **Early training**: Normal with soft targets, usually stabilizes
+- **Batch with no targets**: Framework handles this automatically
+- **Corrupted images**: Check dataset integrity
+
+### CUDA Out of Memory
+
+**Solutions**:
+1. Reduce `batch_size`
+2. Enable gradient accumulation: `--trainer.accumulate_grad_batches=2`
+3. Use mixed precision: `--trainer.precision=16-mixed`
+4. Reduce `image_size`
+
+### Validation Takes Too Long
+
+**Solutions**:
+1. Reduce `nms_max_detections` (default: 300)
+2. Increase `nms_val_conf_threshold` (default: 0.001)
+3. Use smaller validation split for debugging
+
+### Training Won't Resume
+
+**Symptoms**: Resuming from checkpoint starts from epoch 0
+
+**Solution**: Use `--ckpt_path` not `--model.weight_path`:
+```shell
+# Correct: Full training state restored
+python -m yolo fit --config config.yaml --ckpt_path=last.ckpt
+
+# Wrong: Only weights loaded, training restarts
+python -m yolo fit --config config.yaml --model.weight_path=last.ckpt
+```
+
 ## Project Structure
 
 ```
@@ -3871,21 +4092,26 @@ yolo/
 │   ├── experiment/           # Training configs (default.yaml, debug.yaml)
 │   └── model/                # Model architectures (v9-c.yaml, v9-s.yaml, ...)
 ├── data/
-│   ├── datamodule.py         # LightningDataModule
-│   └── transforms.py         # Data augmentations
+│   ├── datamodule.py         # LightningDataModule with caching
+│   ├── transforms.py         # Data augmentations (Mosaic, BBox Mosaic, etc.)
+│   ├── loaders.py            # Image loaders (Default, Fast, TurboJPEG)
+│   └── encrypted_loader.py   # AES-256 encrypted image loader
 ├── model/
 │   ├── yolo.py               # Model builder from DSL
 │   └── module.py             # Layer definitions
 ├── training/
 │   ├── module.py             # LightningModule (training, schedulers, freezing)
-│   ├── loss.py               # Loss functions
-│   └── callbacks.py          # Custom callbacks (EMA, metrics display)
+│   ├── loss.py               # Loss functions (Box, Cls, DFL) with TAL
+│   └── callbacks.py          # EMA, ProgressBar, Summary, EvalDashboard
 ├── tools/
 │   ├── export.py             # Model export (ONNX, TFLite, SavedModel)
+│   ├── qat.py                # Quantization-Aware Training
 │   └── inference.py          # Inference utilities
 └── utils/
-    ├── bounding_box_utils.py # BBox utilities
-    ├── metrics.py            # Detection metrics (mAP, P/R, confusion matrix)
+    ├── bounding_box_utils.py # BBox utilities + BoxMatcher (TAL)
+    ├── metrics.py            # COCO metrics, PR curves, confusion matrix
+    ├── eval_dashboard.py     # Rich terminal metrics dashboard
+    ├── progress.py           # Spinner and progress utilities
     └── logger.py             # Logging
 ```
 
