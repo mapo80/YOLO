@@ -192,7 +192,9 @@ class COCOFormatConverter:
             json.dump(gt_dict, f)
             temp_path = f.name
 
-        coco_gt = COCO(temp_path)
+        # Suppress verbose "loading annotations into memory..." message
+        with suppress_stdout():
+            coco_gt = COCO(temp_path)
         Path(temp_path).unlink()  # Clean up
         return coco_gt
 
@@ -922,14 +924,13 @@ class DetMetrics:
                 logger.debug(f"[Metrics] COCO conversion done in {_time.time() - _t0:.2f}s")
 
                 _t0 = _time.time()
-                coco_eval = COCOeval(coco_gt, coco_dt, 'bbox')
-                coco_eval.evaluate()
-                coco_eval.accumulate()
-                logger.debug(f"[Metrics] COCO eval done in {_time.time() - _t0:.2f}s")
-
-                # Suppress verbose COCO output - metrics are shown in EvalDashboard
+                # Suppress all verbose pycocotools output
                 with suppress_stdout():
+                    coco_eval = COCOeval(coco_gt, coco_dt, 'bbox')
+                    coco_eval.evaluate()
+                    coco_eval.accumulate()
                     coco_eval.summarize()
+                logger.debug(f"[Metrics] COCO eval done in {_time.time() - _t0:.2f}s")
 
             # Extract all 12 metrics from COCO evaluation
             # stats order: AP, AP50, AP75, APs, APm, APl, AR1, AR10, AR100, ARs, ARm, ARl

@@ -251,21 +251,6 @@ class EvalDashboard:
                 trend_str = f"{spark}  (min: {min_v:.3f}, max: {max_v:.3f})"
                 table.add_row(f"  {label}", trend_str)
 
-        # === Info Section ===
-        table.add_row("", "")
-        table.add_row("[bold yellow]Info[/]", "")
-
-        info_parts = []
-        if run_id:
-            info_parts.append(f"run: {run_id}")
-        if num_images:
-            info_parts.append(f"images: {num_images}")
-        info_parts.append(f"size: {image_size[0]}x{image_size[1]}")
-        table.add_row("  ", "  ".join(info_parts))
-
-        conf_info = f"conf: {self.config.conf_prod}  iou: {self.config.nms_iou}"
-        table.add_row("  ", conf_info)
-
         # Print the table
         self.console.print()
         self.console.print(table)
