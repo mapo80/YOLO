@@ -20,7 +20,7 @@ class EvalConfig:
     """Configuration for eval dashboard."""
 
     conf_prod: float = 0.25
-    nms_iou: float = 0.65
+    nms_iou: float = 0.45  # yolov9-official uses 0.45
     max_det: int = 300
     top_n_classes: int = 3
     show_trends: bool = True

@@ -60,7 +60,7 @@ class QATModule(L.LightningModule):
         freeze_bn_after_epoch: int = 5,
         disable_observer_after_epoch: Optional[int] = None,
         nms_conf_threshold: float = 0.25,
-        nms_iou_threshold: float = 0.65,
+        nms_iou_threshold: float = 0.45,  # yolov9-official uses 0.45
         nms_max_detections: int = 300,
         # Loss weights (inherit from base model if not specified)
         box_loss_weight: Optional[float] = None,

@@ -70,7 +70,7 @@ class MatcherConfig:
     """Box matcher configuration for loss computation."""
 
     iou: str = "ciou"
-    topk: int = 10
+    topk: int = 13  # Aligned with yolov9-official (was 10)
     factor: Dict[str, float] = field(default_factory=lambda: {"iou": 6.0, "cls": 0.5})
 
 

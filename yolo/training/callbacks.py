@@ -981,6 +981,10 @@ class EvalDashboardCallback(Callback):
                 elif isinstance(img_sz, (list, tuple)) and len(img_sz) >= 2:
                     image_size = (img_sz[0], img_sz[1])
 
+            # Update dashboard config with nms_iou from module hparams
+            if hasattr(pl_module.hparams, "nms_iou_threshold"):
+                self.dashboard.config.nms_iou = pl_module.hparams.nms_iou_threshold
+
         # Get run ID from logger
         run_id = ""
         if trainer.logger is not None:

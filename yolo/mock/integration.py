@@ -104,7 +104,7 @@ def get_yolo_loss(
     cls_loss_type: str = "bce",
     cls_vfl_alpha: float = 0.75,
     cls_vfl_gamma: float = 2.0,
-    matcher_topk: int = 10,
+    matcher_topk: int = 13,  # Aligned with yolov9-official (was 10)
     matcher_iou_weight: float = 6.0,
     matcher_cls_weight: float = 0.5,
 ):

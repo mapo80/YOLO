@@ -80,7 +80,7 @@ class YOLOModule(L.LightningModule):
         # NMS
         nms_conf_threshold: float = 0.25,
         nms_val_conf_threshold: float = 0.001,  # Lower threshold for validation to capture all predictions for mAP
-        nms_iou_threshold: float = 0.65,
+        nms_iou_threshold: float = 0.45,  # yolov9-official uses 0.45
         nms_max_detections: int = 300,
         # Class names for metrics (None = use indices)
         # Can be a dict {0: "name0", 1: "name1"} or list ["name0", "name1"]
