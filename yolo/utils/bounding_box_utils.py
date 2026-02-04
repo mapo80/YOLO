@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -227,24 +228,36 @@ class BoxMatcher:
         topk_mask = topk_targets > 0
         return topk_targets, topk_mask
 
-    def ensure_one_anchor(self, target_matrix: Tensor, topk_mask: tensor) -> Tensor:
+    def ensure_one_anchor(self, target_matrix: Tensor, topk_mask: Tensor, target_bbox: Tensor) -> Tensor:
         """
         Ensures each valid target gets at least one anchor matched based on the unmasked target matrix,
         which enables an otherwise invalid match. This enables too small or too large targets to be
         learned as well, even if they can't be predicted perfectly.
 
+        Unlike the original yolo-mit implementation which required (values > 0) to assign anchors,
+        this version follows yolov9-official behavior: valid targets (non-zero bbox) ALWAYS get
+        at least one anchor assigned, even if IoU and cls scores are 0 at early training.
+
         Args:
             target_matrix [batch x targets x anchors]: The suitability for each targets-anchors
             topk_mask [batch x targets x anchors]: A boolean mask indicating the top-k scores' positions.
+            target_bbox [batch x targets x 4]: Target bounding boxes to identify valid (non-padded) targets.
 
         Returns:
             topk_mask [batch x targets x anchors]: A boolean mask indicating the updated top-k scores' positions.
         """
+        # Identify valid targets (non-padded) - same logic as yolov9-official's mask_gt
+        # A target is valid if its bbox coordinates sum > 0
+        valid_targets = target_bbox.sum(dim=-1) > 0  # [batch, targets]
+
         values, indices = target_matrix.max(dim=-1)
         best_anchor_mask = torch.zeros_like(target_matrix, dtype=torch.bool)
         best_anchor_mask.scatter_(-1, index=indices[..., None], src=~best_anchor_mask)
         matched_anchor_num = torch.sum(topk_mask, dim=-1)
-        target_without_anchor = (matched_anchor_num == 0) & (values > 0)
+
+        # Assign anchor to valid targets without matches, regardless of metric values
+        # This matches yolov9-official behavior where mask_gt forces anchor assignment
+        target_without_anchor = (matched_anchor_num == 0) & valid_targets
         topk_mask = torch.where(target_without_anchor[..., None], best_anchor_mask, topk_mask)
         return topk_mask
 
@@ -320,7 +333,7 @@ class BoxMatcher:
         topk_targets, topk_mask = self.filter_topk(target_matrix, grid_mask, topk=self.topk)
 
         # match best anchor to valid targets without valid anchors
-        topk_mask = self.ensure_one_anchor(target_matrix, topk_mask)
+        topk_mask = self.ensure_one_anchor(target_matrix, topk_mask, target_bbox)
 
         # delete one anchor pred assign to mutliple gts
         unique_indices, valid_mask, topk_mask = self.filter_duplicates(iou_mat, topk_mask)
@@ -338,6 +351,29 @@ class BoxMatcher:
         normalize_term = (target_matrix / (max_target + 1e-9)) * max_iou
         normalize_term = normalize_term.permute(0, 2, 1).gather(2, unique_indices)
         align_cls = align_cls * normalize_term * valid_mask[:, :, None]
+
+        # === DEBUG MATCHER START ===
+        if os.environ.get('DEBUG_MATCHER', '0') == '1':
+            print(f"\n--- YOLO-MIT MATCHER INTERNALS ---")
+            print(f"topk: {self.topk}, iou_factor: {self.factor['iou']}, cls_factor: {self.factor['cls']}")
+            print(f"target_matrix (before mask): min={target_matrix.min():.6f}, max={target_matrix.max():.6f}, mean={target_matrix.mean():.6f}")
+            print(f"iou_mat: min={iou_mat.min():.4f}, max={iou_mat.max():.4f}, mean={iou_mat.mean():.6f}")
+            print(f"max_target (per GT): {max_target.squeeze().tolist()}")
+            print(f"max_iou (per GT): {max_iou.squeeze().tolist()}")
+            print(f"normalize_term: min={normalize_term.min():.6f}, max={normalize_term.max():.6f}, mean={normalize_term.mean():.6f}")
+            print(f"valid_mask count: {valid_mask.sum().item()}")
+            # Show actual coordinate values
+            print(f"--- COORDINATE DEBUG ---")
+            print(f"predict_bbox: shape={predict_bbox.shape}, min={predict_bbox.min():.2f}, max={predict_bbox.max():.2f}")
+            print(f"target_bbox: shape={target_bbox.shape}, min={target_bbox.min():.2f}, max={target_bbox.max():.2f}")
+            if target_bbox.shape[1] > 0:
+                print(f"First target bbox: {target_bbox[0, 0].tolist()}")
+                # Find best matching pred for first target
+                best_pred_idx = iou_mat[0, 0].argmax()
+                print(f"Best pred bbox for first target (idx={best_pred_idx}): {predict_bbox[0, best_pred_idx].tolist()}")
+                print(f"IoU for best match: {iou_mat[0, 0, best_pred_idx]:.4f}")
+        # === DEBUG MATCHER END ===
+
         anchor_matched_targets = torch.cat([align_cls, align_bbox], dim=-1)
         return anchor_matched_targets, valid_mask
 

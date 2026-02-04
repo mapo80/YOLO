@@ -538,7 +538,7 @@ class YOLODataModule(L.LightningDataModule):
         train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.hparams.batch_size,
-            shuffle=False,
+            shuffle=True,  # Must shuffle to spread background images across batches
             drop_last=True,
             **self._get_dataloader_kwargs(),
         )
@@ -2121,8 +2121,12 @@ class YOLOFormatDataset(Dataset):
         from yolo.utils.progress import console
 
         if cache.is_valid(label_files):
-            self._labels_cache = cache.load()["labels"]
-            console.print(f"[green]✓[/green] Labels cache: {len(self._labels_cache)} labels loaded ({cache.cache_path})")
+            cache_data = cache.load()
+            self._labels_cache = cache_data["labels"]
+            stats = cache_data.get("stats", {})
+            n_bg = stats.get("backgrounds", sum(1 for l in self._labels_cache if len(l["boxes_norm"]) == 0))
+            n_boxes = stats.get("total_boxes", sum(len(l["boxes_norm"]) for l in self._labels_cache))
+            console.print(f"[green]✓[/green] Labels: {len(self._labels_cache)} images, {n_bg} backgrounds, {n_boxes} boxes ({cache.cache_path})")
         else:
             console.print(f"[bold]📝 Parsing {len(self.image_files)} labels[/bold] (first run or files changed)")
             self._labels_cache = []
@@ -2131,13 +2135,16 @@ class YOLOFormatDataset(Dataset):
                 label_data = self._parse_label_file(image_path)
                 self._labels_cache.append(label_data)
 
-            # Save cache
+            # Save cache with stats (like yolov9-official)
+            n_boxes = sum(len(l["boxes_norm"]) for l in self._labels_cache)
+            n_bg = sum(1 for l in self._labels_cache if len(l["boxes_norm"]) == 0)
             stats = {
                 "count": len(self._labels_cache),
-                "total_boxes": sum(len(l["boxes_norm"]) for l in self._labels_cache),
+                "total_boxes": n_boxes,
+                "backgrounds": n_bg,
             }
             cache.save(self._labels_cache, label_files, stats)
-            console.print(f"[green]✓[/green] Labels cached to {cache.cache_path}")
+            console.print(f"[green]✓[/green] Labels: {len(self._labels_cache)} images, {n_bg} backgrounds, {n_boxes} boxes ({cache.cache_path})")
 
     def _parse_label_file(self, image_path: Path) -> Dict[str, Any]:
         """
